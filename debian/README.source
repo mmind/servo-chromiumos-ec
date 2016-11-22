@@ -1,0 +1,8 @@
+chromiumos-ec for Debian
+------------------
+
+We only need the ec3po python from here. So we build only that
+but keep the source intact to keep merging from upstream easy.
+
+ -- Heiko Stuebner <mmind@debian.org>  Thu, 09 Jun 2016 22:43:55 +0200
+
