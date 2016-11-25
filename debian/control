@@ -5,8 +5,6 @@ Maintainer: Heiko Stuebner <mmind@debian.org>
 Build-Depends: debhelper (>=9), dh-python, python-all, python-setuptools
 Standards-Version: 3.9.6
 Homepage: https://chromium.googlesource.com/chromiumos/platform/ec
-Vcs-Git: git://anonscm.debian.org/collab-maint/hdctools.git
-Vcs-Browser: https://anonscm.debian.org/cgit/collab-maint/hdctools.git
 
 Package: python-ec3po
 Architecture: any
