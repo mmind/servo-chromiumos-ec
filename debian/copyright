@@ -1,22 +1,87 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: hdctools
-Source: <url://example.com>
+Source: https://chromium.googlesource.com/chromiumos/platform/ec
 
 Files: *
-Copyright: <years> <put author's name and email here>
-           <years> <likewise for another author>
-License: <special license>
- <Put the license of the package here indented by 1 space>
- <This follows the format of Description: lines in control file>
- .
- <Including paragraphs>
+Copyright: 2010-2016 The Chromium OS Authors <chromium-os-dev@chromium.org>
+License: BSD-3-clause
 
-# If you want to use GPL v2 or later for the /debian/* files use 
-# the following clauses, or change it to suit. Delete these two lines
+Files: common/sha256.c
+Copyright: 2005, 2007 Olivier Gay <olivier.gay@a3.epfl.ch>
+License: BSD-3-clause
+
+Files: driver/baro_bmp280.c
+       driver/baro_bmp280.h
+Copyright: 2016 The Chromium OS Authors. / 2012-2015 Bosch Sensortec GmbH
+License: BSD-3-clause
+
+Files: core/cortex-m/ldivmod.S
+       core/cortex-m/uldivmod.S
+       core/cortex-m0/div.S
+       core/cortex-m0/ldivmod.S
+       core/cortex-m0/lmul.S
+       core/cortex-m0/uldivmod.S
+Copyright: 2012-2013 Jörg Mische <bobbl@gmx.de>
+License: ISC
+
+Files: extra/usb_serial/raiden.c
+Copyright: 2014 The Chromium OS Authors <chromium-os-dev@chromium.org>
+License: GPL-2
+
+Files: util/lock/android.c
+       util/lock/android.h
+       util/lock/file_lock.c
+Copyright: 2016 Google Inc
+License: BSD-3-clause GPL-2
+
+Files: util/lock/gec_lock.c
+       util/lock/gec_lock.h
+       util/lock/ipc_lock.h
+       util/lock/locks.h
+Copyright: 2012 Google Inc
+License: BSD-3-clause
+
 Files: debian/*
-Copyright: 2016 Heiko Stuebner <hstuebner@diego.sntech
->
-License: GPL-2+
+Copyright: 2016 Heiko Stuebner <mmind@debian.org>
+License: BSD-3-clause
+
+License: BSD-3-clause
+    * Redistributions of source code must retain the above copyright
+ notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+ copyright notice, this list of conditions and the following disclaimer
+ in the documentation and/or other materials provided with the
+ distribution.
+    * Neither the name of Google Inc. nor the names of its
+ contributors may be used to endorse or promote products derived from
+ this software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+License: ISC
+ Permission to use, copy, modify, and/or distribute this software for any
+ purpose with or without fee is hereby granted, provided that the above
+ copyright notice and this permission notice appear in all copies.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+ OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+License: GPL-2 GPL-2+
  This package is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation; either version 2 of the License, or
@@ -32,8 +97,3 @@ License: GPL-2+
  .
  On Debian systems, the complete text of the GNU General
  Public License version 2 can be found in "/usr/share/common-licenses/GPL-2".
-
-# Please also look if there are files or directories which have a
-# different copyright/license attached and list them here.
-# Please avoid picking licenses with terms that are more restrictive than the
-# packaged work, as it may make Debian's contributions unacceptable upstream.
