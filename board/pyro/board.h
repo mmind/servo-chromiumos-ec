@@ -128,6 +128,7 @@
 #define CONFIG_I2C_MASTER
 #define CONFIG_KEYBOARD_PROTOCOL_8042
 #define CONFIG_KEYBOARD_COL2_INVERTED
+#define CONFIG_KEYBOARD_FACTORY_TEST
 #define CONFIG_KEYBOARD_PWRBTN_ASSERTS_KSI2
 #define CONFIG_LED_COMMON
 #define CONFIG_LID_SWITCH
@@ -180,6 +181,8 @@
 #define CONFIG_MKBP_EVENT
 #define CONFIG_MKBP_USE_HOST_EVENT
 #define CONFIG_ACCELGYRO_BMI160
+#define CONFIG_ACCEL_INTERRUPTS
+#define CONFIG_ACCELGYRO_BMI160_INT_EVENT TASK_EVENT_CUSTOM(4)
 #define CONFIG_MAG_BMI160_BMM150
 #define BMM150_I2C_ADDRESS BMM150_ADDR0	/* 8-bit address */
 #define CONFIG_MAG_CALIBRATE
@@ -297,6 +300,11 @@ enum pyro_board_version {
 
 /* The higher the input voltage, the higher the power efficiency. */
 #define PD_PREFER_HIGH_VOLTAGE
+
+#ifdef CONFIG_KEYBOARD_FACTORY_TEST
+extern const int keyboard_factory_scan_pins[][2];
+extern const int keyboard_factory_scan_pins_used;
+#endif
 
 /* Reset PD MCU */
 void board_reset_pd_mcu(void);

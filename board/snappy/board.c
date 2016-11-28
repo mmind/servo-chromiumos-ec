@@ -494,6 +494,9 @@ static void board_init(void)
 
 	/* Enable charger interrupts */
 	gpio_enable_interrupt(GPIO_CHARGER_INT_L);
+
+	/* Enable Gyro interrupts */
+	gpio_enable_interrupt(GPIO_BASE_SIXAXIS_INT_L);
 }
 /* PP3300 needs to be enabled before TCPC init hooks */
 DECLARE_HOOK(HOOK_INIT, board_init, HOOK_PRIO_FIRST);
@@ -724,8 +727,10 @@ void board_hibernate_late(void)
 	 * while hibernating we want to enable GPIO_PULL_UP as well.
 	 */
 	gpio_set_flags_by_mask(0x2, 0x03, GPIO_INPUT | GPIO_PULL_UP);
-	gpio_set_flags_by_mask(0x1, 0xFF, GPIO_INPUT | GPIO_PULL_UP);
+	gpio_set_flags_by_mask(0x1, 0x7F, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_set_flags_by_mask(0x0, 0xE0, GPIO_INPUT | GPIO_PULL_UP);
+	/* KBD_KSO2 needs to have a pull-down enabled instead of pull-up */
+	gpio_set_flags_by_mask(0x1, 0x80, GPIO_INPUT | GPIO_PULL_DOWN);
 }
 
 /* Motion sensors */
@@ -1002,3 +1007,21 @@ int board_get_version(void)
 	CPRINTS("Board version: %d\n", version);
 	return version;
 }
+
+#ifdef CONFIG_KEYBOARD_FACTORY_TEST
+/*
+ * We have total 21 pins for keyboard connecter, {-1, -1} mean
+ * the N/A pin that don't consider it and reserve index 0 area
+ * that we don't have pin 0.
+ */
+const int keyboard_factory_scan_pins[][2] = {
+		{-1, -1}, {0, 5}, {1, 1}, {1, 0}, {0, 6},
+		{0, 7}, {1, 4}, {1, 3}, {1, 6}, {-1, -1},
+		{3, 1}, {2, 0}, {1, 5}, {2, 6}, {-1, -1},
+		{2, 1}, {2, 4}, {2, 5}, {1, 2}, {2, 3},
+		{2, 2}, {3, 0},
+};
+
+const int keyboard_factory_scan_pins_used =
+			ARRAY_SIZE(keyboard_factory_scan_pins);
+#endif
