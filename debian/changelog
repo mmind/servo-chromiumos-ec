@@ -1,5 +1,5 @@
-chromiumos-ec (20161122-1) unstable; urgency=medium
+chromiumos-ec (20161128-1) unstable; urgency=medium
 
   * Initial release
 
- -- Heiko Stuebner <mmind@debian.org>  Thu, 24 Nov 2016 19:43:55 +0100
+ -- Heiko Stuebner <mmind@debian.org>  Thu, 28 Nov 2016 13:43:55 +0100
