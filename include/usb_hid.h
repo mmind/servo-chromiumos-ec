@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -24,6 +24,11 @@
 #define USB_HID_DT_HID            (USB_TYPE_CLASS | 0x01)
 #define USB_HID_DT_REPORT         (USB_TYPE_CLASS | 0x02)
 #define USB_HID_DT_PHYSICAL       (USB_TYPE_CLASS | 0x03)
+
+/* Pre-defined report types */
+#define REPORT_TYPE_INPUT         0x01
+#define REPORT_TYPE_OUTPUT        0x02
+#define REPORT_TYPE_FEATURE       0x03
 
 struct usb_hid_class_descriptor {
 	uint8_t  bDescriptorType;

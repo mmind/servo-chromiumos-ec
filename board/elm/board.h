@@ -19,8 +19,8 @@
 #define CONFIG_CMD_ACCELS
 #define CONFIG_CMD_ACCEL_INFO
 #define CONFIG_LID_ANGLE
-#define CONFIG_LID_ANGLE_SENSOR_BASE 0
-#define CONFIG_LID_ANGLE_SENSOR_LID 1
+#define CONFIG_LID_ANGLE_SENSOR_BASE BASE_ACCEL
+#define CONFIG_LID_ANGLE_SENSOR_LID LID_ACCEL
 #define CONFIG_LID_ANGLE_UPDATE
 
 #define CONFIG_ADC
@@ -38,12 +38,10 @@
 #define CONFIG_CHARGE_RAMP_HW
 #define CONFIG_CHARGER_ISL9237
 #define CONFIG_CHARGER_MAX_INPUT_CURRENT 3000
-#define CONFIG_CHARGER_NARROW_VDC
 #define CONFIG_CHARGER_SENSE_RESISTOR 10
 #define CONFIG_CHARGER_SENSE_RESISTOR_AC 20
 #define CONFIG_CHARGER_DISCHARGE_ON_AC
-#define CONFIG_CHARGER_V2
-#define CONFIG_CHIPSET_MEDIATEK
+#define CONFIG_CHIPSET_MT817X
 #define CONFIG_CMD_TYPEC
 #define CONFIG_EXTPOWER_GPIO
 
@@ -59,13 +57,14 @@
 /* Other configs */
 #define CONFIG_HOST_COMMAND_STATUS
 #define CONFIG_I2C
-#define CONFIG_I2C_MASTER
+#define CONFIG_I2C_CONTROLLER
 #define CONFIG_KEYBOARD_COL2_INVERTED
 #define CONFIG_KEYBOARD_PROTOCOL_MKBP
 #define CONFIG_LED_COMMON
 #define CONFIG_LID_SWITCH
 #define CONFIG_LOW_POWER_IDLE
 #define CONFIG_MKBP_EVENT
+#define CONFIG_MKBP_USE_GPIO
 #define CONFIG_POWER_BUTTON
 #define CONFIG_POWER_COMMON
 #define CONFIG_USB_CHARGER
@@ -75,7 +74,7 @@
 #define CONFIG_VBOOT_HASH
 #undef  CONFIG_WATCHDOG_HELP
 #define CONFIG_SWITCH
-#define CONFIG_BOARD_VERSION
+#define CONFIG_BOARD_VERSION_GPIO
 #undef  CONFIG_UART_CONSOLE
 #define CONFIG_UART_CONSOLE 1
 #define CONFIG_TEMP_SENSOR
@@ -87,22 +86,21 @@
 #define CONFIG_USBC_VCONN
 #define CONFIG_USBC_VCONN_SWAP
 #define CONFIG_USB_POWER_DELIVERY
+#define CONFIG_USB_PD_TCPMV1
 #define CONFIG_USB_PD_ALT_MODE
 #define CONFIG_USB_PD_ALT_MODE_DFP
-#define CONFIG_USB_PD_CUSTOM_VDM
 #define CONFIG_USB_PD_DUAL_ROLE
 
 #define CONFIG_USB_PD_LOGGING
-#define CONFIG_USB_PD_LOG_SIZE 512
 
-#define CONFIG_USB_PD_PORT_COUNT 1
+#define CONFIG_USB_PD_PORT_MAX_COUNT 1
 #define CONFIG_USB_PD_TCPM_MUX
 #define CONFIG_USB_PD_TCPM_ANX7688
 #define CONFIG_USB_PD_TCPM_TCPCI
 #define CONFIG_USB_PD_TRY_SRC
 #define CONFIG_USB_PD_VBUS_DETECT_TCPC
-#undef  CONFIG_TCPC_I2C_BASE_ADDR
-#define CONFIG_TCPC_I2C_BASE_ADDR 0x58
+#undef  CONFIG_TCPC_I2C_BASE_ADDR_FLAGS
+#define CONFIG_TCPC_I2C_BASE_ADDR_FLAGS 0x2C
 #define CONFIG_USB_PD_ANX7688
 
 /* UART DMA */
@@ -110,19 +108,42 @@
 #undef CONFIG_UART_RX_DMA
 
 /* BC 1.2 charger */
-#define CONFIG_USB_SWITCH_PI3USB9281
-#define CONFIG_USB_SWITCH_PI3USB9281_CHIP_COUNT 1
+#define CONFIG_BC12_DETECT_PI3USB9281
+#define CONFIG_BC12_DETECT_PI3USB9281_CHIP_COUNT 1
 
 /* Optional features */
 #define CONFIG_CMD_CHARGER_ADC_AMON_BMON
-#define CONFIG_CMD_HOSTCMD
 /* Mark host command structs as aligned */
 #define CONFIG_HOSTCMD_ALIGNED
 /* By default, set hcdebug to off */
 #undef CONFIG_HOSTCMD_DEBUG_MODE
 #define CONFIG_HOSTCMD_DEBUG_MODE HCDEBUG_OFF
 #define CONFIG_CMD_I2C_PROTECT
-#define CONFIG_CMD_PD_CONTROL
+#define CONFIG_HOSTCMD_PD_CONTROL
+
+/*
+ * Flash layout:
+ *                            PSTATE(4KB)
+ *                              |
+ *          (124KB)             v            (132KB)
+ * |<-----Protected Region------>|<------Unprotected Region----->|
+ * |<--------RO image--------->| | |<--------RW image----------->|
+ * 0        (120KB)            ^ ^           (128KB)
+ *                             | |
+ *                             | sector 31(132KB sector)
+ *                             |
+ *                             sector 30(4KB sector)
+ */
+#undef CONFIG_RW_MEM_OFF
+#undef CONFIG_RW_SIZE
+#undef CONFIG_EC_WRITABLE_STORAGE_OFF
+#undef CONFIG_EC_WRITABLE_STORAGE_SIZE
+#undef CONFIG_WP_STORAGE_SIZE
+#define CONFIG_RW_MEM_OFF                (128 * 1024)
+#define CONFIG_RW_SIZE                   (128 * 1024)
+#define CONFIG_EC_WRITABLE_STORAGE_OFF   (128 * 1024)
+#define CONFIG_EC_WRITABLE_STORAGE_SIZE  (128 * 1024)
+#define CONFIG_WP_STORAGE_SIZE           (128 * 1024)
 
 /* Drivers */
 #ifndef __ASSEMBLER__
@@ -151,8 +172,8 @@
 #define TIM_CLOCK32 2
 #define TIM_WATCHDOG 4
 
-/* Define the MKBP events which are allowed to wakeup AP in S3. */
-#define CONFIG_MKBP_WAKEUP_MASK \
+/* Define the host events which are allowed to wakeup AP in S3. */
+#define CONFIG_MKBP_HOST_EVENT_WAKEUP_MASK \
 		(EC_HOST_EVENT_MASK(EC_HOST_EVENT_LID_OPEN) |\
 		 EC_HOST_EVENT_MASK(EC_HOST_EVENT_POWER_BUTTON) |\
 		 EC_HOST_EVENT_MASK(EC_HOST_EVENT_KEY_PRESSED) |\
@@ -194,8 +215,11 @@ enum temp_sensor_id {
 	TEMP_SENSOR_COUNT
 };
 
-/* start as a sink in case we have no other power supply/battery */
-#define PD_DEFAULT_STATE PD_STATE_SNK_DISCONNECTED
+enum sensor_id {
+	BASE_ACCEL,
+	LID_ACCEL,
+	SENSOR_COUNT,
+};
 
 /* TODO: determine the following board specific type-C power constants */
 /*

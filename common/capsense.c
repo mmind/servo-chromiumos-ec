@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -24,10 +24,8 @@ static int capsense_read_bitmask(void)
 	int rv;
 	uint8_t val = 0;
 
-	i2c_lock(I2C_PORT_CAPSENSE, 1);
 	rv = i2c_xfer(I2C_PORT_CAPSENSE, CAPSENSE_I2C_ADDR,
-		      0, 0, &val, 1, I2C_XFER_SINGLE);
-	i2c_lock(I2C_PORT_CAPSENSE, 0);
+		      0, 0, &val, 1);
 
 	if (rv)
 		CPRINTS("%s failed: error %d", __func__, rv);
@@ -54,7 +52,8 @@ static void capsense_change_deferred(void)
 
 	new_val = capsense_read_bitmask();
 	if (new_val != cur_val) {
-		CPRINTF("[%T capsense 0x%02x: ", new_val);
+		CPRINTF("[%pT capsense 0x%02x: ",
+			PRINTF_TIMESTAMP_NOW, new_val);
 		for (i = 0; i < CAPSENSE_MASK_BITS; i++) {
 			/* See what changed */
 			n = (new_val >> i) & 0x01;

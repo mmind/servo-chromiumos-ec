@@ -11,19 +11,25 @@
 #include "timer.h"
 #include "usb_mux.h"
 
-#define ANX7688_VENDOR_ALERT    (1 << 15)
+#if defined(CONFIG_USB_PD_DUAL_ROLE_AUTO_TOGGLE) || \
+	defined(CONFIG_USB_PD_TCPC_LOW_POWER) || \
+	defined(CONFIG_USB_PD_DISCHARGE_TCPC)
+#error "Unsupported config options of anx7688 PD driver"
+#endif
+
+#define ANX7688_VENDOR_ALERT    BIT(15)
 
 #define ANX7688_REG_STATUS      0x82
-#define ANX7688_REG_STATUS_LINK (1 << 0)
+#define ANX7688_REG_STATUS_LINK BIT(0)
 
 #define ANX7688_REG_HPD         0x83
-#define ANX7688_REG_HPD_HIGH    (1 << 0)
-#define ANX7688_REG_HPD_IRQ     (1 << 1)
-#define ANX7688_REG_HPD_ENABLE  (1 << 2)
+#define ANX7688_REG_HPD_HIGH    BIT(0)
+#define ANX7688_REG_HPD_IRQ     BIT(1)
+#define ANX7688_REG_HPD_ENABLE  BIT(2)
 
-#define ANX7688_USBC_ADDR		0x50
+#define ANX7688_USBC_ADDR_FLAGS		0x28
 #define ANX7688_REG_RAMCTRL		0xe7
-#define ANX7688_REG_RAMCTRL_BOOT_DONE	(1 << 6)
+#define ANX7688_REG_RAMCTRL_BOOT_DONE	BIT(6)
 
 static int anx7688_init(int port)
 {
@@ -39,7 +45,7 @@ static int anx7688_init(int port)
 	 * 100ms to follow cts.
 	 */
 	while (1) {
-		rv = i2c_read8(I2C_PORT_TCPC, ANX7688_USBC_ADDR,
+		rv = i2c_read8(I2C_PORT_TCPC, ANX7688_USBC_ADDR_FLAGS,
 			       ANX7688_REG_RAMCTRL, &mask);
 
 		if (rv == EC_SUCCESS && (mask & ANX7688_REG_RAMCTRL_BOOT_DONE))
@@ -59,6 +65,11 @@ static int anx7688_init(int port)
 	mask |= ANX7688_VENDOR_ALERT;
 	rv = tcpc_write16(port, TCPC_REG_ALERT_MASK, mask);
 	return rv;
+}
+
+static int anx7688_release(int port)
+{
+	return EC_ERROR_UNIMPLEMENTED;
 }
 
 static void anx7688_update_hpd_enable(int port)
@@ -127,41 +138,40 @@ static void anx7688_tcpc_alert(int port)
 
 	rv = tcpc_read16(port, TCPC_REG_ALERT, &alert);
 	/* process and clear alert status */
-	tcpci_tcpm_drv.tcpc_alert(port);
+	tcpci_tcpc_alert(port);
 
 	if (!rv && (alert & ANX7688_VENDOR_ALERT))
 		anx7688_update_hpd_enable(port);
 }
 
-static int anx7688_mux_set(int i2c_addr, mux_state_t mux_state)
+static int anx7688_mux_set(const struct usb_mux *me, mux_state_t mux_state)
 {
 	int reg = 0;
 	int rv, polarity;
-	int port = i2c_addr; /* use port index in port_addr field */
 
-	rv = tcpc_read(port, TCPC_REG_CONFIG_STD_OUTPUT, &reg);
+	rv = mux_read(me, TCPC_REG_CONFIG_STD_OUTPUT, &reg);
 	if (rv != EC_SUCCESS)
 		return rv;
 
 	reg &= ~TCPC_REG_CONFIG_STD_OUTPUT_MUX_MASK;
-	if (mux_state & MUX_USB_ENABLED)
+	if (mux_state & USB_PD_MUX_USB_ENABLED)
 		reg |= TCPC_REG_CONFIG_STD_OUTPUT_MUX_USB;
-	if (mux_state & MUX_DP_ENABLED)
+	if (mux_state & USB_PD_MUX_DP_ENABLED)
 		reg |= TCPC_REG_CONFIG_STD_OUTPUT_MUX_DP;
 
 	/* ANX7688 needs to set bit0 */
-	rv = tcpc_read(port, TCPC_REG_TCPC_CTRL, &polarity);
+	rv = mux_read(me, TCPC_REG_TCPC_CTRL, &polarity);
 	if (rv != EC_SUCCESS)
 		return rv;
 
 	/* copy the polarity from TCPC_CTRL[0], take care clear then set */
 	reg &= ~TCPC_REG_TCPC_CTRL_POLARITY(1);
 	reg |= TCPC_REG_TCPC_CTRL_POLARITY(polarity);
-	return tcpc_write(port, TCPC_REG_CONFIG_STD_OUTPUT, reg);
+	return mux_write(me, TCPC_REG_CONFIG_STD_OUTPUT, reg);
 }
 
 #ifdef CONFIG_USB_PD_VBUS_DETECT_TCPC
-static int anx7688_tcpm_get_vbus_level(int port)
+static bool anx7688_tcpm_check_vbus_level(int port, enum vbus_level level)
 {
 	int reg = 0;
 
@@ -170,25 +180,33 @@ static int anx7688_tcpm_get_vbus_level(int port)
 	 * Therefore, we use a proprietary register to read the unfiltered VBus
 	 * value. See crosbug.com/p/55221 .
 	 */
-	i2c_read8(I2C_PORT_TCPC, 0x50, 0x40, &reg);
-	return ((reg & 0x10) ? 1 : 0);
+	i2c_read8(I2C_PORT_TCPC, 0x28, 0x40, &reg);
+
+	if (level == VBUS_PRESENT)
+		return ((reg & 0x10) ? 1 : 0);
+	else
+		return ((reg & 0x10) ? 0 : 1);
 }
 #endif
 
 /* ANX7688 is a TCPCI compatible port controller */
 const struct tcpm_drv anx7688_tcpm_drv = {
 	.init			= &anx7688_init,
+	.release		= &anx7688_release,
 	.get_cc			= &tcpci_tcpm_get_cc,
 #ifdef CONFIG_USB_PD_VBUS_DETECT_TCPC
-	.get_vbus_level		= &anx7688_tcpm_get_vbus_level,
+	.check_vbus_level	= &anx7688_tcpm_check_vbus_level,
 #endif
 	.select_rp_value	= &tcpci_tcpm_select_rp_value,
 	.set_cc			= &tcpci_tcpm_set_cc,
 	.set_polarity		= &tcpci_tcpm_set_polarity,
+#ifdef CONFIG_USB_PD_DECODE_SOP
+	.sop_prime_enable	= &tcpci_tcpm_sop_prime_enable,
+#endif
 	.set_vconn		= &tcpci_tcpm_set_vconn,
 	.set_msg_header		= &tcpci_tcpm_set_msg_header,
 	.set_rx_enable		= &tcpci_tcpm_set_rx_enable,
-	.get_message		= &tcpci_tcpm_get_message,
+	.get_message_raw	= &tcpci_tcpm_get_message_raw,
 	.transmit		= &tcpci_tcpm_transmit,
 	.tcpc_alert		= &anx7688_tcpc_alert,
 };
@@ -200,4 +218,3 @@ const struct usb_mux_driver anx7688_usb_mux_driver = {
 	.get = tcpci_tcpm_mux_get,
 };
 #endif /* CONFIG_USB_PD_TCPM_MUX */
-

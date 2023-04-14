@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -22,6 +22,7 @@
 #define CONFIG_HW_CRC
 #define CONFIG_RSA
 #define CONFIG_RWSIG
+#define CONFIG_RWSIG_TYPE_USBPD1
 #define CONFIG_SHA256
 /* TODO(tbroch) Re-enable once STM spi master can be inhibited at boot so it
    doesn't interfere with HDMI loading its f/w */
@@ -32,18 +33,20 @@
 #define CONFIG_USB_BOS
 #define CONFIG_USB_INHIBIT_CONNECT
 #define CONFIG_USB_POWER_DELIVERY
+#define CONFIG_USB_PD_TCPMV1
 #define CONFIG_USB_PD_ALT_MODE
+#define CONFIG_USB_PD_CUSTOM_PDO
 #define CONFIG_USB_PD_HW_DEV_ID_BOARD_MAJOR USB_PD_HW_DEV_ID_HOHO
 #define CONFIG_USB_PD_HW_DEV_ID_BOARD_MINOR 2
 #define CONFIG_USB_PD_DUAL_ROLE
-#define CONFIG_USB_PD_CUSTOM_VDM
 #define CONFIG_USB_PD_FLASH
 #define CONFIG_USB_PD_INTERNAL_COMP
 #define CONFIG_USB_PD_IDENTITY_HW_VERS 1
 #define CONFIG_USB_PD_IDENTITY_SW_VERS 1
 #define CONFIG_USB_PD_LOGGING
-#define CONFIG_USB_PD_LOG_SIZE 256
-#define CONFIG_USB_PD_PORT_COUNT 1
+#undef  CONFIG_EVENT_LOG_SIZE
+#define CONFIG_EVENT_LOG_SIZE 256
+#define CONFIG_USB_PD_PORT_MAX_COUNT 1
 #define CONFIG_USB_PD_TCPC
 #define CONFIG_USB_PD_TCPM_STUB
 #define CONFIG_USB_PD_VBUS_DETECT_NONE
@@ -61,6 +64,10 @@
 
 /* No Write-protect GPIO, force the write-protection */
 #define CONFIG_WP_ALWAYS
+#define CONFIG_FLASH_READOUT_PROTECTION
+
+/* Inform VIF generator that this board is an Alt Mode Adapter */
+#define CONFIG_USB_ALT_MODE_ADAPTER
 
 #ifndef __ASSEMBLER__
 
@@ -87,9 +94,6 @@ enum usb_strings {
 
 	USB_STR_COUNT
 };
-
-/* we are acting only as a sink */
-#define PD_DEFAULT_STATE PD_STATE_SNK_DISCONNECTED
 
 /* we are never a source : don't care about power supply */
 #define PD_POWER_SUPPLY_TURN_ON_DELAY  0 /* us */

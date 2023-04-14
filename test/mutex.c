@@ -1,4 +1,4 @@
-/* Copyright (c) 2011 The Chromium OS Authors. All rights reserved.
+/* Copyright 2011 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  * Copyright 2011 Google Inc.
@@ -83,7 +83,8 @@ int mutex_main_task(void *unused)
 	/* --- Serialization to test simple contention --- */
 	ccprintf("Simple contention :\n");
 	/* lock the mutex from the other task */
-	task_set_event(TASK_ID_MTX2, TASK_EVENT_WAKE, 1);
+	task_set_event(TASK_ID_MTX2, TASK_EVENT_WAKE);
+	task_wait_event(0);
 	/* block on the mutex */
 	ccprintf("MTX1: blocking...\n");
 	mutex_lock(&mtx);
@@ -109,7 +110,7 @@ int mutex_main_task(void *unused)
 	return EC_SUCCESS;
 }
 
-void run_test(void)
+void run_test(int argc, char **argv)
 {
 	wait_for_task_started();
 	task_wake(TASK_ID_MTX1);

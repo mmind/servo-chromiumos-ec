@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -17,6 +17,7 @@
 #include "system.h"
 #include "task.h"
 #include "timer.h"
+#include "uart.h"
 #include "util.h"
 
 /* Console output macros */
@@ -38,12 +39,19 @@ static int dsleep_recovery_margin_us = 1000000;
 
 /*
  * minimum delay to enter stop mode
+ *
  * STOP_MODE_LATENCY: max time to wake up from STOP mode with regulator in low
  * power mode is 5 us + PLL locking time is 200us.
- * SET_RTC_MATCH_DELAY: max time to set RTC match alarm. if we set the alarm
+ *
+ * SET_RTC_MATCH_DELAY: max time to set RTC match alarm. If we set the alarm
  * in the past, it will never wake up and cause a watchdog.
  * For STM32F3, we are using HSE, which requires additional time to start up.
  * Therefore, the latency for STM32F3 is set longer.
+ *
+ * RESTORE_HOST_ALARM_LATENCY: max latency between the deferred routine is
+ * called and the host alarm is actually restored. In practice, the max latency
+ * is measured as ~600us. 1000us should be conservative enough to guarantee
+ * we won't miss the host alarm.
  */
 #ifdef CHIP_VARIANT_STM32F373
 #define STOP_MODE_LATENCY 500  /* us */
@@ -56,48 +64,56 @@ static int dsleep_recovery_margin_us = 1000000;
 #endif
 #define SET_RTC_MATCH_DELAY 200 /* us */
 
+#ifdef CONFIG_HOSTCMD_RTC
+#define RESTORE_HOST_ALARM_LATENCY 1000 /* us */
+#endif
+
 #endif /* CONFIG_LOW_POWER_IDLE */
 
 /*
- * RTC clock frequency (connected to LSI clock)
+ * RTC clock frequency (By default connected to LSI clock)
  *
- * TODO(crosbug.com/p/12281): Calibrate LSI frequency on a per-chip basis.  The
- * LSI on any given chip can be between 30 kHz to 60 kHz.  Without calibration,
- * LSI frequency may be off by as much as 50%.  Fortunately, we don't do any
- * high-precision delays based solely on LSI.
+ * The LSI on any given chip can be between 30 kHz to 60 kHz.
+ * Without calibration, LSI frequency may be off by as much as 50%.
+ *
+ * Set synchronous clock freq to (RTC clock source / 2) to maximize
+ * subsecond resolution. Set asynchronous clock to 1 Hz.
  */
-/*
- * Set synchronous clock freq to LSI/2 (20kHz) to maximize subsecond
- * resolution. Set asynchronous clock to 1 Hz.
- */
-#define RTC_FREQ (40000 / 2) /* Hz */
-#define RTC_PREDIV_S (RTC_FREQ - 1)
-#define RTC_PREDIV_A 1
-#define US_PER_RTC_TICK (1000000 / RTC_FREQ)
 
+#define RTC_PREDIV_A 1
+#ifdef CONFIG_STM32_CLOCK_LSE
+#define RTC_FREQ (32768 / (RTC_PREDIV_A + 1)) /* Hz */
+/* GCD(RTC_FREQ, 1000000) */
+#define RTC_GCD 64
+#else /* LSI clock, 40kHz-ish */
+#define RTC_FREQ (40000 / (RTC_PREDIV_A + 1)) /* Hz */
+/* GCD(RTC_FREQ, 1000000) */
+#define RTC_GCD 20000
+#endif
+#define RTC_PREDIV_S (RTC_FREQ - 1)
+
+/*
+ * There are (1000000 / RTC_FREQ) us per RTC tick, take GCD of both terms
+ * for conversion calculations to fit in 32 bits.
+ */
+#define US_GCD (1000000 / RTC_GCD)
+#define RTC_FREQ_GCD (RTC_FREQ / RTC_GCD)
 
 int32_t rtcss_to_us(uint32_t rtcss)
 {
-	return ((RTC_PREDIV_S - rtcss) * US_PER_RTC_TICK);
+	return ((RTC_PREDIV_S - (rtcss & 0x7fff)) * US_GCD) / RTC_FREQ_GCD;
 }
 
 uint32_t us_to_rtcss(int32_t us)
 {
-	return (RTC_PREDIV_S - (us / US_PER_RTC_TICK));
+	return RTC_PREDIV_S - us * RTC_FREQ_GCD / US_GCD;
 }
-
 
 void config_hispeed_clock(void)
 {
 #ifdef CHIP_FAMILY_STM32F3
 	/* Ensure that HSE is ON */
-	if (!(STM32_RCC_CR & (1 << 17))) {
-		/* Enable HSE */
-		STM32_RCC_CR |= 1 << 16;
-		/* Wait for HSE to be ready */
-		while (!(STM32_RCC_CR & (1 << 17)))
-			;
-	}
+	wait_for_ready(&STM32_RCC_CR, BIT(16), BIT(17));
 
 	/*
 	 * HSE = 24MHz, no prescalar, no MCO, with PLL *2 => 48MHz SYSCLK
@@ -129,13 +145,7 @@ defined(CHIP_VARIANT_STM32F070)
 		return;
 
 	/* Ensure that HSI is ON */
-	if (!(STM32_RCC_CR & (1<<1))) {
-		/* Enable HSI */
-		STM32_RCC_CR |= (1<<0);
-		/* Wait for HSI to be ready */
-		while (!(STM32_RCC_CR & (1<<1)))
-			;
-	}
+	wait_for_ready(&STM32_RCC_CR, BIT(0), BIT(1));
 
 	/*
 	 * HSI = 8MHz, HSI/2 with PLL *12 = ~48 MHz
@@ -164,13 +174,7 @@ defined(CHIP_VARIANT_STM32F070)
 		;
 #else
 	/* Ensure that HSI48 is ON */
-	if (!(STM32_RCC_CR2 & (1 << 17))) {
-		/* Enable HSI */
-		STM32_RCC_CR2 |= 1 << 16;
-		/* Wait for HSI to be ready */
-		while (!(STM32_RCC_CR2 & (1 << 17)))
-			;
-	}
+	wait_for_ready(&STM32_RCC_CR2, BIT(16), BIT(17));
 
 #if (CPU_CLOCK == HSI48_CLOCK)
 	/*
@@ -178,6 +182,28 @@ defined(CHIP_VARIANT_STM32F070)
 	 * therefore PCLK = FCLK = SYSCLK = 48MHz
 	 * USB uses HSI48 = 48MHz
 	 */
+
+#ifdef CONFIG_USB
+	/*
+	 * Configure and enable Clock Recovery System
+	 *
+	 * Since we are running from the internal RC HSI48 clock, the CSR
+	 * is needed to guarantee an accurate 48MHz clock for USB.
+	 *
+	 * The default values configure the CRS to use the periodic USB SOF
+	 * as the SYNC signal for calibrating the HSI48.
+	 *
+	 */
+
+	/* Enable Clock Recovery System */
+	STM32_RCC_APB1ENR |= STM32_RCC_PB1_CRS;
+
+	/* Enable automatic trimming */
+	STM32_CRS_CR |= STM32_CRS_CR_AUTOTRIMEN;
+
+	/* Enable oscillator clock for the frequency error counter */
+	STM32_CRS_CR |= STM32_CRS_CR_CEN;
+#endif
 
 	/* switch SYSCLK to HSI48 */
 	STM32_RCC_CFGR = 0x00000003;
@@ -227,10 +253,10 @@ defined(CHIP_VARIANT_STM32F070)
 #ifdef CONFIG_HIBERNATE
 void __enter_hibernate(uint32_t seconds, uint32_t microseconds)
 {
-	uint32_t rtc, rtcss;
+	struct rtc_time_reg rtc;
 
 	if (seconds || microseconds)
-		set_rtc_alarm(seconds, microseconds, &rtc, &rtcss);
+		set_rtc_alarm(seconds, microseconds, &rtc, 0);
 
 	/* interrupts off now */
 	asm volatile("cpsid i");
@@ -250,39 +276,26 @@ void __enter_hibernate(uint32_t seconds, uint32_t microseconds)
 }
 #endif
 
+#ifdef CONFIG_HOSTCMD_RTC
+static void restore_host_wake_alarm_deferred(void)
+{
+	restore_host_wake_alarm();
+}
+DECLARE_DEFERRED(restore_host_wake_alarm_deferred);
+#endif
+
 #ifdef CONFIG_LOW_POWER_IDLE
 
 void clock_refresh_console_in_use(void)
 {
 }
 
-#ifdef CONFIG_FORCE_CONSOLE_RESUME
-#define UARTN_BASE STM32_USART_BASE(CONFIG_UART_CONSOLE)
-static void enable_serial_wakeup(int enable)
-{
-	if (enable) {
-		/*
-		 * Allow UART wake up from STOP mode. Note, UART clock must
-		 * be HSI(8MHz) for wakeup to work.
-		 */
-		STM32_USART_CR1(UARTN_BASE) |= STM32_USART_CR1_UESM;
-		STM32_USART_CR3(UARTN_BASE) |= STM32_USART_CR3_WUFIE;
-	} else {
-		/* Disable wake up from STOP mode. */
-		STM32_USART_CR1(UARTN_BASE) &= ~STM32_USART_CR1_UESM;
-	}
-}
-#else
-static void enable_serial_wakeup(int enable)
-{
-}
-#endif
-
 void __idle(void)
 {
 	timestamp_t t0;
-	int next_delay, margin_us, rtc_diff;
-	uint32_t rtc0, rtc0ss, rtc1, rtc1ss;
+	uint32_t rtc_diff;
+	int next_delay, margin_us;
+	struct rtc_time_reg rtc0, rtc1;
 
 	while (1) {
 		asm volatile("cpsid i");
@@ -290,23 +303,41 @@ void __idle(void)
 		t0 = get_time();
 		next_delay = __hw_clock_event_get() - t0.le.lo;
 
+#ifdef CONFIG_LOW_POWER_IDLE_LIMITED
+		if (idle_is_disabled())
+			goto en_int;
+#endif
+
 		if (DEEP_SLEEP_ALLOWED &&
+#ifdef CONFIG_HOSTCMD_RTC
+		    /*
+		     * Don't go to deep sleep mode if we might miss the
+		     * wake alarm that the host requested. Note that the
+		     * host alarm always aligns to second. Considering the
+		     * worst case, we have to ensure alarm won't go off
+		     * within RESTORE_HOST_ALARM_LATENCY + 1 second after
+		     * EC exits deep sleep mode.
+		     */
+		    !is_host_wake_alarm_expired(
+			(timestamp_t)(next_delay + t0.val + SECOND +
+				      RESTORE_HOST_ALARM_LATENCY)) &&
+#endif
 		    (next_delay > (STOP_MODE_LATENCY + SET_RTC_MATCH_DELAY))) {
-			/* deep-sleep in STOP mode */
+			/* Deep-sleep in STOP mode */
 			idle_dsleep_cnt++;
 
-			enable_serial_wakeup(1);
+			uart_enable_wakeup(1);
 
-			/* set deep sleep bit */
+			/* Set deep sleep bit */
 			CPU_SCB_SYSCTRL |= 0x4;
 
 			set_rtc_alarm(0, next_delay - STOP_MODE_LATENCY,
-				      &rtc0, &rtc0ss);
+				      &rtc0, 0);
 			asm("wfi");
 
 			CPU_SCB_SYSCTRL &= ~0x4;
 
-			enable_serial_wakeup(0);
+			uart_enable_wakeup(0);
 
 			/*
 			 * By default only HSI 8MHz is enabled here. Re-enable
@@ -314,12 +345,16 @@ void __idle(void)
 			 */
 			config_hispeed_clock();
 
-			/* fast forward timer according to RTC counter */
-			reset_rtc_alarm(&rtc1, &rtc1ss);
-			rtc_diff = get_rtc_diff(rtc0, rtc0ss, rtc1, rtc1ss);
+			/* Fast forward timer according to RTC counter */
+			reset_rtc_alarm(&rtc1);
+			rtc_diff = get_rtc_diff(&rtc0, &rtc1);
 			t0.val = t0.val + rtc_diff;
 			force_time(t0);
 
+#ifdef CONFIG_HOSTCMD_RTC
+			hook_call_deferred(
+				&restore_host_wake_alarm_deferred_data, 0);
+#endif
 			/* Record time spent in deep sleep. */
 			idle_dsleep_time_us += rtc_diff;
 
@@ -335,9 +370,12 @@ void __idle(void)
 		} else {
 			idle_sleep_cnt++;
 
-			/* normal idle : only CPU clock stopped */
+			/* Normal idle : only CPU clock stopped */
 			asm("wfi");
 		}
+#ifdef CONFIG_LOW_POWER_IDLE_LIMITED
+en_int:
+#endif
 		asm volatile("cpsie i");
 	}
 }
@@ -350,19 +388,26 @@ int clock_get_freq(void)
 
 void clock_wait_bus_cycles(enum bus_type bus, uint32_t cycles)
 {
-	volatile uint32_t dummy __attribute__((unused));
+	volatile uint32_t unused __attribute__((unused));
 
 	if (bus == BUS_AHB) {
 		while (cycles--)
-			dummy = STM32_DMA1_REGS->isr;
+			unused = STM32_DMA1_REGS->isr;
 	} else { /* APB */
 		while (cycles--)
-			dummy = STM32_USART_BRR(STM32_USART1_BASE);
+			unused = STM32_USART_BRR(STM32_USART1_BASE);
 	}
 }
 
 void clock_enable_module(enum module_id module, int enable)
 {
+	if (module == MODULE_ADC) {
+		if (enable)
+			STM32_RCC_APB2ENR |= STM32_RCC_APB2ENR_ADCEN;
+		else
+			STM32_RCC_APB2ENR &= ~STM32_RCC_APB2ENR_ADCEN;
+		return;
+	}
 }
 
 void rtc_init(void)
@@ -390,6 +435,33 @@ void rtc_init(void)
 	rtc_lock_regs();
 }
 
+#if defined(CONFIG_CMD_RTC) || defined(CONFIG_HOSTCMD_RTC)
+void rtc_set(uint32_t sec)
+{
+	struct rtc_time_reg rtc;
+
+	sec_to_rtc(sec, &rtc);
+	rtc_unlock_regs();
+
+	/* Disable alarm */
+	STM32_RTC_CR &= ~STM32_RTC_CR_ALRAE;
+
+	/* Enter RTC initialize mode */
+	STM32_RTC_ISR |= STM32_RTC_ISR_INIT;
+	while (!(STM32_RTC_ISR & STM32_RTC_ISR_INITF))
+		;
+
+	/* Set clock prescalars */
+	STM32_RTC_PRER = (RTC_PREDIV_A << 16) | RTC_PREDIV_S;
+
+	STM32_RTC_TR = rtc.rtc_tr;
+	STM32_RTC_DR = rtc.rtc_dr;
+	/* Start RTC timer */
+	STM32_RTC_ISR &= ~STM32_RTC_ISR_INIT;
+
+	rtc_lock_regs();
+}
+#endif
 
 #if defined(CONFIG_LOW_POWER_IDLE) && defined(CONFIG_COMMON_RUNTIME)
 #ifdef CONFIG_CMD_IDLE_STATS
@@ -402,9 +474,9 @@ static int command_idle_stats(int argc, char **argv)
 
 	ccprintf("Num idle calls that sleep:           %d\n", idle_sleep_cnt);
 	ccprintf("Num idle calls that deep-sleep:      %d\n", idle_dsleep_cnt);
-	ccprintf("Time spent in deep-sleep:            %.6lds\n",
+	ccprintf("Time spent in deep-sleep:            %.6llds\n",
 			idle_dsleep_time_us);
-	ccprintf("Total time on:                       %.6lds\n", ts.val);
+	ccprintf("Total time on:                       %.6llds\n", ts.val);
 	ccprintf("Deep-sleep closest to wake deadline: %dus\n",
 			dsleep_recovery_margin_us);
 

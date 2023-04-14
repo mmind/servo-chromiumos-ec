@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -32,7 +32,7 @@ typedef union {
 #define STACK_UNUSED_VALUE 0xdeadd00d
 
 /* declare task routine prototypes */
-#define TASK(n, r, d, s) int r(void *);
+#define TASK(n, r, d, s) void r(void *);
 void __idle(void);
 CONFIG_TASK_LIST
 CONFIG_TEST_TASK_LIST
@@ -51,8 +51,12 @@ static const char * const task_names[] = {
 
 #ifdef CONFIG_TASK_PROFILING
 static uint64_t task_start_time; /* Time task scheduling started */
-static uint64_t exc_start_time;  /* Time of task->exception transition */
-static uint64_t exc_end_time;    /* Time of exception->task transition */
+/*
+ * We only keep 32-bit values for exception start/end time, to avoid
+ * accounting errors when we service interrupt when the timer wraps around.
+ */
+static uint32_t exc_start_time;  /* Time of task->exception transition */
+static uint32_t exc_end_time;    /* Time of exception->task transition */
 static uint64_t exc_total_time;  /* Total time in exceptions */
 static uint32_t svc_calls;       /* Number of service calls */
 static uint32_t task_switches;   /* Number of times active task changed */
@@ -68,6 +72,18 @@ void __idle(void)
 {
 	while (1) {
 #ifdef CHIP_NPCX
+
+		/*
+		 * Using host access to make sure M4 core clock will
+		 * return when the eSPI accesses the Host modules if
+		 * CSAE bit is set. Please notice this symptom only
+		 * occurs at npcx5.
+		 */
+#if defined(CHIP_FAMILY_NPCX5) && defined(CONFIG_HOSTCMD_ESPI)
+		/* Enable Host access wakeup */
+		SET_BIT(NPCX_WKEN(MIWU_TABLE_0, MIWU_GROUP_5), 6);
+#endif
+
 		/*
 		 * TODO (ML): A interrupt that occurs shortly before entering
 		 * idle mode starts getting services while the Core transitions
@@ -78,12 +94,11 @@ void __idle(void)
 		asm (
 			"cpsid i\n"             /* Disable interrupt */
 			"push {r0-r5}\n"        /* Save needed registers */
-			"ldr r0, =0x100A8000\n" /* Set r0 to a valid RAM addr */
 			"wfi\n"                 /* Wait for int to enter idle */
-			"ldm r0, {r0-r5}\n"     /* Add a delay after WFI */
+			"ldm %0, {r0-r5}\n"     /* Add a delay after WFI */
 			"pop {r0-r5}\n" /* Restore regs before enabling ints */
 			"isb\n"                 /* Flush the cpu pipeline */
-			"cpsie i\n"             /* Enable interrupts */
+			"cpsie i\n" :: "r" (0x100A8000)  /* Enable interrupts */
 		);
 #else
 		/*
@@ -115,7 +130,7 @@ static const struct {
 	uint32_t r0;
 	uint32_t pc;
 	uint16_t stack_size;
-} const tasks_init[] = {
+} tasks_init[] = {
 	TASK(IDLE, __idle, 0, IDLE_TASK_STACK_SIZE)
 	CONFIG_TASK_LIST
 	CONFIG_TEST_TASK_LIST
@@ -125,10 +140,31 @@ static const struct {
 
 /* Contexts for all tasks */
 static task_ tasks[TASK_ID_COUNT];
-/* Sanity checks about static task invariants */
+
+/* Reset constants and state for all tasks */
+#define TASK_RESET_SUPPORTED		BIT(31)
+#define TASK_RESET_LOCK			BIT(30)
+#define TASK_RESET_STATE_MASK		(TASK_RESET_SUPPORTED | TASK_RESET_LOCK)
+#define TASK_RESET_WAITERS_MASK		~TASK_RESET_STATE_MASK
+#define TASK_RESET_UNSUPPORTED		0
+#define TASK_RESET_STATE_LOCKED		(TASK_RESET_SUPPORTED | TASK_RESET_LOCK)
+#define TASK_RESET_STATE_UNLOCKED	TASK_RESET_SUPPORTED
+
+#ifdef CONFIG_TASK_RESET_LIST
+#define ENABLE_RESET(n) \
+	[TASK_ID_##n] = TASK_RESET_SUPPORTED,
+static uint32_t task_reset_state[TASK_ID_COUNT] = {
+#ifdef CONFIG_TASK_RESET_LIST
+	CONFIG_TASK_RESET_LIST
+#endif
+};
+#undef ENABLE_RESET
+#endif /* CONFIG_TASK_RESET_LIST */
+
+/* Validity checks about static task invariants */
 BUILD_ASSERT(TASK_ID_COUNT <= sizeof(unsigned) * 8);
 BUILD_ASSERT(TASK_ID_COUNT < (1 << (sizeof(task_id_t) * 8)));
-
+BUILD_ASSERT(BIT(TASK_ID_COUNT) < TASK_RESET_LOCK);
 
 /* Stacks for all tasks */
 #define TASK(n, r, d, s)  + s
@@ -166,7 +202,13 @@ static int need_resched_or_profiling;
  * can do their init within a task switching context.  The hooks task will then
  * make a call to enable all tasks.
  */
-static uint32_t tasks_ready = (1 << TASK_ID_HOOKS);
+static uint32_t tasks_ready = BIT(TASK_ID_HOOKS);
+/*
+ * Initially allow only the HOOKS and IDLE task to run, regardless of ready
+ * status, in order for HOOK_INIT to complete before other tasks.
+ * task_enable_all_tasks() will open the flood gates.
+ */
+static uint32_t tasks_enabled = BIT(TASK_ID_HOOKS) | BIT(TASK_ID_IDLE);
 
 static int start_called;  /* Has task swapping started */
 
@@ -193,12 +235,14 @@ inline int in_interrupt_context(void)
 	return ret;
 }
 
-inline int get_interrupt_context(void)
+#ifdef CONFIG_TASK_PROFILING
+static inline int get_interrupt_context(void)
 {
 	int ret;
 	asm("mrs %0, ipsr \n":"=r"(ret)); /* read exception number */
 	return ret & 0x1ff;               /* exception bits are the 9 LSB */
 }
+#endif
 
 task_id_t task_get_current(void)
 {
@@ -228,7 +272,7 @@ void svc_handler(int desched, task_id_t resched)
 	task_ *current, *next;
 #ifdef CONFIG_TASK_PROFILING
 	int exc = get_interrupt_context();
-	uint64_t t;
+	uint32_t t;
 #endif
 
 	/*
@@ -244,7 +288,7 @@ void svc_handler(int desched, task_id_t resched)
 	 * start time explicitly.
 	 */
 	if (exc == 0xb) {
-		exc_start_time = get_time().val;
+		exc_start_time = get_time().le.lo;
 		svc_calls++;
 	}
 #endif
@@ -271,12 +315,12 @@ void svc_handler(int desched, task_id_t resched)
 	ASSERT(resched <= TASK_ID_COUNT);
 	tasks_ready |= 1 << resched;
 
-	ASSERT(tasks_ready);
-	next = __task_id_to_ptr(__fls(tasks_ready));
+	ASSERT(tasks_ready & tasks_enabled);
+	next = __task_id_to_ptr(__fls(tasks_ready & tasks_enabled));
 
 #ifdef CONFIG_TASK_PROFILING
 	/* Track time in interrupts */
-	t = get_time().val;
+	t = get_time().le.lo;
 	exc_total_time += (t - exc_start_time);
 
 	/*
@@ -320,7 +364,7 @@ void __keep task_start_irq_handler(void *excep_return)
 	 * Get time before checking depth, in case this handler is
 	 * pre-empted.
 	 */
-	uint64_t t = get_time().val;
+	uint32_t t = get_time().le.lo;
 	int irq = get_interrupt_context() - 16;
 
 	/*
@@ -369,7 +413,7 @@ static uint32_t __wait_evt(int timeout_us, task_id_t resched)
 		ret = timer_arm(deadline, me);
 		ASSERT(ret == EC_SUCCESS);
 	}
-	while (!(evt = atomic_read_clear(&tsk->events))) {
+	while (!(evt = atomic_clear(&tsk->events))) {
 		/* Remove ourself and get the next task in the scheduler */
 		__schedule(1, resched);
 		resched = TASK_ID_IDLE;
@@ -377,12 +421,12 @@ static uint32_t __wait_evt(int timeout_us, task_id_t resched)
 	if (timeout_us > 0) {
 		timer_cancel(me);
 		/* Ensure timer event is clear, we no longer care about it */
-		atomic_clear(&tsk->events, TASK_EVENT_TIMER);
+		atomic_clear_bits(&tsk->events, TASK_EVENT_TIMER);
 	}
 	return evt;
 }
 
-uint32_t task_set_event(task_id_t tskid, uint32_t event, int wait)
+uint32_t task_set_event(task_id_t tskid, uint32_t event)
 {
 	task_ *receiver = __task_id_to_ptr(tskid);
 	ASSERT(receiver);
@@ -399,10 +443,7 @@ uint32_t task_set_event(task_id_t tskid, uint32_t event, int wait)
 			need_resched_or_profiling = 1;
 #endif
 	} else {
-		if (wait)
-			return __wait_evt(-1, tskid);
-		else
-			__schedule(0, tskid);
+		__schedule(0, tskid);
 	}
 
 	return 0;
@@ -443,10 +484,23 @@ uint32_t task_wait_event_mask(uint32_t event_mask, int timeout_us)
 
 void task_enable_all_tasks(void)
 {
-	/* Mark all tasks as ready to run. */
-	tasks_ready = (1 << TASK_ID_COUNT) - 1;
+	/* Mark all tasks as ready and able to run. */
+	tasks_ready = tasks_enabled = BIT(TASK_ID_COUNT) - 1;
 	/* Reschedule the highest priority task. */
 	__schedule(0, 0);
+}
+
+void task_enable_task(task_id_t tskid)
+{
+	atomic_or(&tasks_enabled, BIT(tskid));
+}
+
+void task_disable_task(task_id_t tskid)
+{
+	atomic_clear_bits(&tasks_enabled, BIT(tskid));
+
+	if (!in_interrupt_context() && tskid == task_get_current())
+		__schedule(0, 0);
 }
 
 void task_enable_irq(int irq)
@@ -468,6 +522,304 @@ void task_trigger_irq(int irq)
 {
 	CPU_NVIC_SWTRIG = irq;
 }
+
+static uint32_t init_task_context(task_id_t id)
+{
+	uint32_t *sp;
+	/* Stack size in words */
+	uint32_t ssize = tasks_init[id].stack_size / 4;
+
+	/*
+	 * Update stack used by first frame: 8 words for the normal
+	 * stack, plus 8 for R4-R11. Even if using FPU, the first frame
+	 * does not store FP regs.
+	 */
+	sp = tasks[id].stack + ssize - 16;
+	tasks[id].sp = (uint32_t)sp;
+
+	/* Initial context on stack (see __switchto()) */
+	sp[8] = tasks_init[id].r0;          /* r0 */
+	sp[13] = (uint32_t)task_exit_trap;  /* lr */
+	sp[14] = tasks_init[id].pc;         /* pc */
+	sp[15] = 0x01000000;                /* psr */
+
+	/* Fill unused stack; also used to detect stack overflow. */
+	for (sp = tasks[id].stack; sp < (uint32_t *)tasks[id].sp; sp++)
+		*sp = STACK_UNUSED_VALUE;
+
+	return ssize;
+}
+
+#ifdef CONFIG_TASK_RESET_LIST
+
+/*
+ * Re-initializes a task stack to its initial state, and marks it ready.
+ * The task reset lock must be held prior to calling this function.
+ */
+static void do_task_reset(task_id_t id)
+{
+	interrupt_disable();
+	init_task_context(id);
+	tasks_ready |= 1 << id;
+	/* TODO: Clear all pending events? */
+	interrupt_enable();
+}
+
+/* We can't pass a parameter to a deferred call. Use this instead. */
+/* Mask of task IDs waiting to be reset. */
+static uint32_t deferred_reset_task_ids;
+
+/* Tasks may call this function if they want to reset themselves. */
+static void deferred_task_reset(void)
+{
+	while (deferred_reset_task_ids) {
+		task_id_t reset_id = __fls(deferred_reset_task_ids);
+
+		atomic_clear_bits(&deferred_reset_task_ids, 1 << reset_id);
+		do_task_reset(reset_id);
+	}
+}
+DECLARE_DEFERRED(deferred_task_reset);
+
+/*
+ * Helper for updating task_reset state atomically. Checks the current state,
+ * and if it matches if_value, updates the state to new_value, and returns
+ * TRUE.
+ */
+static int update_reset_state(uint32_t *state,
+			      uint32_t if_value,
+			      uint32_t to_value)
+{
+	int update;
+
+	interrupt_disable();
+	update = *state == if_value;
+	if (update)
+		*state = to_value;
+	interrupt_enable();
+
+	return update;
+}
+
+/*
+ * Helper that acquires the reset lock iff it is not currently held.
+ * Returns TRUE if the lock was acquired.
+ */
+static inline int try_acquire_reset_lock(uint32_t *state)
+{
+	return update_reset_state(state,
+				  /* if the lock is not held */
+				  TASK_RESET_STATE_UNLOCKED,
+				  /* acquire it */
+				  TASK_RESET_STATE_LOCKED);
+}
+
+/*
+ * Helper that releases the reset lock iff it is currently held, and there
+ * are no pending resets. Returns TRUE if the lock was released.
+ */
+static inline int try_release_reset_lock(uint32_t *state)
+{
+	return update_reset_state(state,
+				  /* if the lock is held, with no waiters */
+				  TASK_RESET_STATE_LOCKED,
+				  /* release it */
+				  TASK_RESET_STATE_UNLOCKED);
+}
+
+/*
+ * Helper to cause the current task to sleep indefinitely; useful if the
+ * calling task just needs to block until it is reset.
+ */
+static inline void sleep_forever(void)
+{
+	while (1)
+		usleep(-1);
+}
+
+void task_enable_resets(void)
+{
+	task_id_t id = task_get_current();
+	uint32_t *state = &task_reset_state[id];
+
+	if (*state == TASK_RESET_UNSUPPORTED) {
+		cprints(CC_TASK,
+			"%s called from non-resettable task, id: %d",
+			__func__, id);
+		return;
+	}
+
+	/*
+	 * A correctly written resettable task will only call this function
+	 * if resets are currently disabled; this implies that this task
+	 * holds the reset lock.
+	 */
+
+	if (*state == TASK_RESET_STATE_UNLOCKED) {
+		cprints(CC_TASK,
+			"%s called, but resets already enabled, id: %d",
+			__func__, id);
+		return;
+	}
+
+	/*
+	 * Attempt to release the lock. If we cannot, it means there are tasks
+	 * waiting for a reset.
+	 */
+	if (try_release_reset_lock(state))
+		return;
+
+	/* People are waiting for us to reset; schedule a reset. */
+	atomic_or(&deferred_reset_task_ids, 1 << id);
+	/*
+	 * This will always trigger a deferred call after our new ID was
+	 * written. If the hook call is currently executing, it will run
+	 * again.
+	 */
+	hook_call_deferred(&deferred_task_reset_data, 0);
+	/* Wait to be reset. */
+	sleep_forever();
+}
+
+void task_disable_resets(void)
+{
+	task_id_t id = task_get_current();
+	uint32_t *state = &task_reset_state[id];
+
+	if (*state == TASK_RESET_UNSUPPORTED) {
+		cprints(CC_TASK,
+			"%s called from non-resettable task, id %d",
+			__func__, id);
+		return;
+	}
+
+	/*
+	 * A correctly written resettable task will only call this function
+	 * if resets are currently enabled; this implies that this task does
+	 * not hold the reset lock.
+	 */
+
+	if (try_acquire_reset_lock(state))
+		return;
+
+	/*
+	 * If we can't acquire the lock, we are about to be reset by another
+	 * task.
+	 */
+	sleep_forever();
+}
+
+int task_reset_cleanup(void)
+{
+	task_id_t id = task_get_current();
+	uint32_t *state = &task_reset_state[id];
+
+	/*
+	 * If the task has never started before, state will be
+	 * TASK_RESET_ENABLED.
+	 *
+	 * If the task was reset, the TASK_RESET_LOCK bit will be set, and
+	 * there may additionally be bits representing tasks we must notify
+	 * that we have reset.
+	 */
+
+	/*
+	 * Only this task can unset the lock bit so we can read this safely,
+	 * even though other tasks may be modifying the state to add themselves
+	 * as waiters.
+	 */
+	int cleanup_req = *state & TASK_RESET_LOCK;
+
+	/*
+	 * Attempt to release the lock. We can only do this when there are no
+	 * tasks waiting to be notified that we have been reset, so we loop
+	 * until no tasks are waiting.
+	 *
+	 * Other tasks may still be trying to reset us at this point; if they
+	 * do, they will add themselves to the list of tasks we must notify. We
+	 * will simply notify them (multiple times if necessary) until we are
+	 * free to unlock.
+	 */
+	if (cleanup_req) {
+		while (!try_release_reset_lock(state)) {
+			/* Find the first waiter to notify. */
+			task_id_t notify_id = __fls(
+			    *state & TASK_RESET_WAITERS_MASK);
+			/*
+			 * Remove the task from waiters first, so that
+			 * when it wakes after being notified, it is in
+			 * a consistent state (it should not be waiting
+			 * to be notified and running).
+			 * After being notified, the task may try to
+			 * reset us again; if it does, it will just add
+			 * itself back to the list of tasks to notify,
+			 * and we will notify it again.
+			 */
+			atomic_clear_bits(state, 1 << notify_id);
+			/*
+			 * Skip any invalid ids set by tasks that
+			 * requested a non-blocking reset.
+			 */
+			if (notify_id < TASK_ID_COUNT)
+				task_set_event(notify_id,
+					       TASK_EVENT_RESET_DONE);
+		}
+	}
+
+	return cleanup_req;
+}
+
+int task_reset(task_id_t id, int wait)
+{
+	task_id_t current = task_get_current();
+	uint32_t *state = &task_reset_state[id];
+	uint32_t waiter_id;
+	int resets_disabled;
+
+	if (id == current)
+		return EC_ERROR_INVAL;
+
+	/*
+	 * This value is only set at compile time, and will never be modified.
+	 */
+	if (*state == TASK_RESET_UNSUPPORTED)
+		return EC_ERROR_INVAL;
+
+	/*
+	 * If we are not blocking for reset, we use an invalid task id to notify
+	 * the task that _someone_ wanted it to reset, but didn't want to be
+	 * notified when the reset is complete.
+	 */
+	waiter_id = 1 << (wait ? current : TASK_ID_COUNT);
+
+	/*
+	 * Try and take the lock. If we can't have it, just notify the task we
+	 * tried; it will reset itself when it next tries to release the lock.
+	 */
+	interrupt_disable();
+	resets_disabled = *state & TASK_RESET_LOCK;
+	if (resets_disabled)
+		*state |= waiter_id;
+	else
+		*state |= TASK_RESET_LOCK;
+	interrupt_enable();
+
+	if (!resets_disabled) {
+		/* We got the lock, do the reset immediately. */
+		do_task_reset(id);
+	} else if (wait) {
+		/*
+		 * We couldn't get the lock, and have been asked to block for
+		 * reset. We have asked the task to reset itself; it will notify
+		 * us when it has.
+		 */
+		task_wait_event_mask(TASK_EVENT_RESET_DONE, -1);
+	}
+
+	return EC_SUCCESS;
+}
+
+#endif /* CONFIG_TASK_RESET_LIST */
 
 /*
  * Initialize IRQs in the NVIC and set their priorities as defined by the
@@ -494,24 +846,32 @@ static void __nvic_init_irqs(void)
 
 	/* Set priorities */
 	for (i = 0; i < exc_calls; i++) {
-		uint8_t irq = __irqprio[i].irq;
-		uint8_t prio = __irqprio[i].priority;
-		uint32_t prio_shift = irq % 4 * 8 + 5;
-		if (prio > 0x7)
-			prio = 0x7;
-		CPU_NVIC_PRI(irq / 4) =
-				(CPU_NVIC_PRI(irq / 4) &
-				 ~(0x7 << prio_shift)) |
-				(prio << prio_shift);
+		cpu_set_interrupt_priority(__irqprio[i].irq,
+					   __irqprio[i].priority);
 	}
 }
 
 void mutex_lock(struct mutex *mtx)
 {
 	uint32_t value;
-	uint32_t id = 1 << task_get_current();
+	uint32_t id;
 
-	ASSERT(id != TASK_ID_INVALID);
+	/*
+	 * mutex_lock() must not be used in interrupt context (because we wait
+	 * if there is contention).
+	 */
+	ASSERT(!in_interrupt_context());
+
+	/*
+	 * Task ID is not valid before task_start() (since current_task is
+	 * scratchpad), and no need for mutex locking before task switching has
+	 * begun.
+	 */
+	if (!task_start_called())
+		return;
+
+	id = 1 << task_get_current();
+
 	atomic_or(&mtx->waiters, id);
 
 	do {
@@ -531,7 +891,7 @@ void mutex_lock(struct mutex *mtx)
 			task_wait_event_mask(TASK_EVENT_MUTEX, 0);
 	} while (value);
 
-	atomic_clear(&mtx->waiters, id);
+	atomic_clear_bits(&mtx->waiters, id);
 }
 
 void mutex_unlock(struct mutex *mtx)
@@ -539,21 +899,25 @@ void mutex_unlock(struct mutex *mtx)
 	uint32_t waiters;
 	task_ *tsk = current_task;
 
-	__asm__ __volatile__("   ldr     %0, [%2]\n"
-			     "   str     %3, [%1]\n"
-			     : "=&r" (waiters)
-			     : "r" (&mtx->lock), "r" (&mtx->waiters), "r" (0)
-			     : "cc");
+	/*
+	 * Add a critical section to keep the unlock and the snapshotting of
+	 * waiters atomic in case a task switching occurs between them.
+	 */
+	interrupt_disable();
+	waiters = mtx->waiters;
+	mtx->lock = 0;
+	interrupt_enable();
+
 	while (waiters) {
 		task_id_t id = __fls(waiters);
-		waiters &= ~(1 << id);
+		waiters &= ~BIT(id);
 
 		/* Somebody is waiting on the mutex */
-		task_set_event(id, TASK_EVENT_MUTEX, 0);
+		task_set_event(id, TASK_EVENT_MUTEX);
 	}
 
 	/* Ensure no event is remaining from mutex wake-up */
-	atomic_clear(&tsk->events, TASK_EVENT_MUTEX);
+	atomic_clear_bits(&tsk->events, TASK_EVENT_MUTEX);
 }
 
 void task_print_list(void)
@@ -573,7 +937,7 @@ void task_print_list(void)
 		     sp++)
 			stackused -= sizeof(uint32_t);
 
-		ccprintf("%4d %c %-16s %08x %11.6ld  %3d/%3d\n", i, is_ready,
+		ccprintf("%4d %c %-16s %08x %11.6lld  %3d/%3d\n", i, is_ready,
 			 task_names[i], tasks[i].events, tasks[i].runtime,
 			 stackused, tasks_init[i].stack_size);
 		cflush();
@@ -601,10 +965,10 @@ int command_task_info(int argc, char **argv)
 	ccprintf("Service calls:          %11d\n", svc_calls);
 	ccprintf("Total exceptions:       %11d\n", total + svc_calls);
 	ccprintf("Task switches:          %11d\n", task_switches);
-	ccprintf("Task switching started: %11.6ld s\n", task_start_time);
-	ccprintf("Time in tasks:          %11.6ld s\n",
+	ccprintf("Task switching started: %11.6lld s\n", task_start_time);
+	ccprintf("Time in tasks:          %11.6lld s\n",
 		 get_time().val - task_start_time);
-	ccprintf("Time in exceptions:     %11.6ld s\n", exc_total_time);
+	ccprintf("Time in exceptions:     %11.6lld s\n", exc_total_time);
 #endif
 
 	return EC_SUCCESS;
@@ -638,31 +1002,8 @@ void task_pre_init(void)
 
 	/* Fill the task memory with initial values */
 	for (i = 0; i < TASK_ID_COUNT; i++) {
-		uint32_t *sp;
-		/* Stack size in words */
-		uint32_t ssize = tasks_init[i].stack_size / 4;
-
 		tasks[i].stack = stack_next;
-
-		/*
-		 * Update stack used by first frame: 8 words for the normal
-		 * stack, plus 8 for R4-R11. Even if using FPU, the first frame
-		 * does not store FP regs.
-		 */
-		sp = stack_next + ssize - 16;
-		tasks[i].sp = (uint32_t)sp;
-
-		/* Initial context on stack (see __switchto()) */
-		sp[8] = tasks_init[i].r0;           /* r0 */
-		sp[13] = (uint32_t)task_exit_trap;  /* lr */
-		sp[14] = tasks_init[i].pc;          /* pc */
-		sp[15] = 0x01000000;                /* psr */
-
-		/* Fill unused stack; also used to detect stack overflow. */
-		for (sp = stack_next; sp < (uint32_t *)tasks[i].sp; sp++)
-			*sp = STACK_UNUSED_VALUE;
-
-		stack_next += ssize;
+		stack_next += init_task_context(i);
 	}
 
 	/*
@@ -694,9 +1035,33 @@ void task_clear_fp_used(void)
 int task_start(void)
 {
 #ifdef CONFIG_TASK_PROFILING
-	task_start_time = exc_end_time = get_time().val;
+	timestamp_t t = get_time();
+
+	task_start_time = t.val;
+	exc_end_time = t.le.lo;
 #endif
 	start_called = 1;
 
 	return __task_start(&need_resched_or_profiling);
 }
+
+#ifdef CONFIG_CMD_TASK_RESET
+static int command_task_reset(int argc, char **argv)
+{
+	task_id_t id;
+	char *e;
+
+	if (argc == 2) {
+		id = strtoi(argv[1], &e, 10);
+		if (*e)
+			return EC_ERROR_PARAM1;
+		ccprintf("Resetting task %d\n", id);
+		return task_reset(id, 1);
+	}
+
+	return EC_ERROR_PARAM_COUNT;
+}
+DECLARE_CONSOLE_COMMAND(taskreset, command_task_reset,
+			"task_id",
+			"Reset a task");
+#endif  /* CONFIG_CMD_TASK_RESET */

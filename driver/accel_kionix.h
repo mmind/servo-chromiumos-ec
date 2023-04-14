@@ -9,6 +9,7 @@
 #define __CROS_EC_ACCEL_KIONIX_H
 
 #include "common.h"
+#include "accelgyro.h"
 #include "driver/accel_kx022.h"
 #include "driver/accel_kxcj9.h"
 
@@ -22,14 +23,15 @@ struct accel_param_pair {
 };
 
 struct kionix_accel_data {
-	/* Note, the following are indicies into their respective tables. */
-	/* Current range of accelerometer. */
-	int sensor_range;
-	/* Current output data rate of accelerometer. */
-	int sensor_datarate;
+	struct accelgyro_saved_data_t base;
 	/* Current resolution of accelerometer. */
 	int sensor_resolution;
 	int16_t offset[3];
+#ifdef CONFIG_KX022_ORIENTATION_SENSOR
+	int8_t raw_orientation;
+	enum motionsensor_orientation orientation;
+	enum motionsensor_orientation last_orientation;
+#endif
 };
 
 extern const struct accelgyro_drv kionix_accel_drv;
@@ -45,9 +47,6 @@ extern const struct accelgyro_drv kionix_accel_drv;
  * |    SPI device ID              | 1 |
  * +-------------------------------+---+
  */
-#define KIONIX_IS_SPI(_addr)        ((_addr) & 1)
-#define KIONIX_SPI_ADDRESS(_addr)   ((_addr) >> 1)
-
 #define KIONIX_CTRL1_REG(v) (KX022_CNTL1 +	\
 			     (v) * (KXCJ9_CTRL1 - KX022_CNTL1))
 #define KIONIX_CTRL2_REG(v) (KX022_CNTL2 +	\

@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -67,8 +67,8 @@ static void temp_sensor_init(void)
 
 	/*
 	 * Initialize memory-mapped data so that if a temperature value is read
-	 * before we actually poll the sensors, we don't end up with an insane
-	 * value.
+	 * before we actually poll the sensors, we don't return an impossible
+	 * or out-of-range value.
 	 */
 	base = host_get_memmap(EC_MEMMAP_TEMP_SENSOR);
 	base_b = host_get_memmap(EC_MEMMAP_TEMP_SENSOR_B);
@@ -142,7 +142,7 @@ DECLARE_CONSOLE_COMMAND(temps, command_temps,
 /*****************************************************************************/
 /* Host commands */
 
-int temp_sensor_command_get_info(struct host_cmd_handler_args *args)
+enum ec_status temp_sensor_command_get_info(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_temp_sensor_get_info *p = args->params;
 	struct ec_response_temp_sensor_get_info *r = args->response;

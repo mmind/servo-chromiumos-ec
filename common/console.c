@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -149,7 +149,7 @@ static const struct console_command *find_command(char *name)
 }
 
 
-static const char const *errmsgs[] = {
+static const char *const errmsgs[] = {
 	"OK",
 	"Unknown error",
 	"Unimplemented",
@@ -217,7 +217,7 @@ static int handle_command(char *input)
 	/* Lastly, verify the CRC8 of the command. */
 	if (i+command_len > input_len)
 		goto command_has_error;
-	if (packed_crc8 != crc8(&input[i], command_len)) {
+	if (packed_crc8 != cros_crc8(&input[i], command_len)) {
 command_has_error:
 		/* Send back the error string. */
 		ccprintf("&&EE\n");
@@ -645,11 +645,10 @@ void console_has_input(void)
 #endif
 
 	/* Wake up the console task */
-	if (task_start_called())
-		task_wake(TASK_ID_CONSOLE);
+	task_wake(TASK_ID_CONSOLE);
 }
 
-void console_task(void)
+void console_task(void *u)
 {
 	console_init();
 

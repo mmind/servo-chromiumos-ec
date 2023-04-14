@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -111,7 +111,7 @@
 /* Since there's absolutely nothing we can do about it if an I2C access
  * isn't working, we're completely ignoring any failures. */
 
-static const uint8_t i2c_addr[] = { 0x54, 0x56 };
+static const uint16_t i2c_addr_flags[] = { 0x2A, 0x2B };
 
 static inline void controller_write(int ctrl_num, uint8_t reg, uint8_t val)
 {
@@ -119,9 +119,10 @@ static inline void controller_write(int ctrl_num, uint8_t reg, uint8_t val)
 
 	buf[0] = reg;
 	buf[1] = val;
-	ctrl_num = ctrl_num % ARRAY_SIZE(i2c_addr);
-	i2c_xfer(I2C_PORT_LIGHTBAR, i2c_addr[ctrl_num], buf, 2, 0, 0,
-		 I2C_XFER_SINGLE);
+	ctrl_num = ctrl_num % ARRAY_SIZE(i2c_addr_flags);
+	i2c_xfer_unlocked(I2C_PORT_LIGHTBAR, i2c_addr_flags[ctrl_num],
+			buf, 2, 0, 0,
+			I2C_XFER_SINGLE);
 }
 
 static inline uint8_t controller_read(int ctrl_num, uint8_t reg)
@@ -129,9 +130,9 @@ static inline uint8_t controller_read(int ctrl_num, uint8_t reg)
 	uint8_t buf[1];
 	int rv;
 
-	ctrl_num = ctrl_num % ARRAY_SIZE(i2c_addr);
-	rv = i2c_xfer(I2C_PORT_LIGHTBAR, i2c_addr[ctrl_num], &reg, 1, buf, 1,
-		      I2C_XFER_SINGLE);
+	ctrl_num = ctrl_num % ARRAY_SIZE(i2c_addr_flags);
+	rv = i2c_xfer_unlocked(I2C_PORT_LIGHTBAR, i2c_addr_flags[ctrl_num],
+			&reg, 1, buf, 1, I2C_XFER_SINGLE);
 	return rv ? 0 : buf[0];
 }
 
@@ -152,7 +153,7 @@ static inline uint8_t controller_read(int ctrl_num, uint8_t reg)
 #define MAX_GREEN 0x30
 #define MAX_BLUE  0x67
 #endif
-#if defined(BOARD_SAMUS) || defined(BOARD_RYU)
+#if defined(BOARD_SAMUS)
 /* Samus uses completely different LEDs, so the numbers are different. The
  * Samus LEDs can handle much higher currents, but these constants were
  * calibrated to provide uniform intensity at the level used by Link.
@@ -200,9 +201,6 @@ static const uint8_t led_to_isc[] = { 0x18, 0x15, 0x18, 0x15 };
 #endif
 #ifdef BOARD_SAMUS
 static const uint8_t led_to_isc[] = { 0x15, 0x18, 0x15, 0x18 };
-#endif
-#if defined(BOARD_RYU)
-static const uint8_t led_to_isc[] = { 0x18, 0x15, 0x18, 0x15 };
 #endif
 #ifdef BOARD_HOST
 /* For testing only */
@@ -290,7 +288,7 @@ void lb_init(int use_lock)
 {
 	int i;
 
-	CPRINTF("[%T LB_init_vals ");
+	CPRINTF("[%pT LB_init_vals ", PRINTF_TIMESTAMP_NOW);
 	for (i = 0; i < ARRAY_SIZE(init_vals); i++) {
 		CPRINTF("%c", '0' + i % 10);
 		if (use_lock)

@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -8,7 +8,7 @@
 #ifndef __CROS_EC_USB_CONSOLE_H
 #define __CROS_EC_USB_CONSOLE_H
 
-#ifdef CONFIG_USB_CONSOLE
+#if defined(CONFIG_USB_CONSOLE) || defined(CONFIG_USB_CONSOLE_STREAM)
 
 #include <stdarg.h>
 
@@ -44,6 +44,16 @@ int usb_putc(int c);
 int usb_getc(void);
 
 /**
+ * Reset the usb console output crc32 accumulator.
+ */
+void usb_console_crc_init(void);
+
+/**
+ * Get the current usb console output crc32 accumulator.
+ */
+uint32_t usb_console_crc(void);
+
+/**
  * Enable and Disable the USB console.
  *
  * By default the console is enabled, this should not be a problem since it
@@ -51,6 +61,15 @@ int usb_getc(void);
  * be delayed.
  */
 void usb_console_enable(int enabled, int readonly);
+
+/**
+ * Is USB TX queue blocked?
+ *
+ * Return 1, if USB console is enabled and USB TX Queue does not have enough
+ *           space for the next packet.
+ *        0, otherwise.
+ */
+int usb_console_tx_blocked(void);
 
 #define usb_va_start va_start
 #define usb_va_end va_end
@@ -61,6 +80,7 @@ void usb_console_enable(int enabled, int readonly);
 #define usb_getc(x) (-1)
 #define usb_va_start(x, y)
 #define usb_va_end(x)
+#define usb_console_tx_blocked()	(0)
 #endif
 
 #endif /* __CROS_EC_USB_CONSOLE_H */

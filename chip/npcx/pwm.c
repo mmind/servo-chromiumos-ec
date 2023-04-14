@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -13,7 +13,6 @@
 #include "clock_chip.h"
 #include "console.h"
 #include "ec_commands.h"
-#include "fan.h"
 #include "gpio.h"
 #include "hooks.h"
 #include "pwm.h"
@@ -78,11 +77,11 @@ static void pwm_set_freq(enum pwm_channel ch, uint32_t freq)
 	/* Calculate prescaler */
 	pre = DIV_ROUND_UP(clock, (0xffff * freq));
 
-	/* Calculate maximum resolution for the given freq. and prescaler */
-	pwm_res[ch] = (clock / pre) / freq;
-
-	/* Make sure we have at least 1% resolution */
-	assert(pwm_res[ch] >= 100);
+	/*
+	 * Calculate maximum resolution for the given freq. and prescaler. And
+	 * prevent it exceed the resolution of CTR/DCR registers.
+	 */
+	pwm_res[ch] = MIN((clock / pre) / freq, NPCX_PWM_MAX_RAW_DUTY);
 
 	/* Set PWM prescaler. */
 	NPCX_PRSC(mdl) = pre - 1;
@@ -99,7 +98,6 @@ static void pwm_set_freq(enum pwm_channel ch, uint32_t freq)
  *
  * @param   ch      operation channel
  * @param   enabled enabled flag
- * @return  none
  */
 void pwm_enable(enum pwm_channel ch, int enabled)
 {
@@ -126,7 +124,6 @@ int pwm_get_enabled(enum pwm_channel ch)
  *
  * @param   ch      operation channel
  * @param   percent duty cycle percent
- * @return  none
  */
 void pwm_set_duty(enum pwm_channel ch, int percent)
 {
@@ -139,7 +136,6 @@ void pwm_set_duty(enum pwm_channel ch, int percent)
  *
  * @param   ch      operation channel
  * @param   duty    cycle duty
- * @return  none
  */
 void pwm_set_raw_duty(enum pwm_channel ch, uint16_t duty)
 {
@@ -152,16 +148,14 @@ void pwm_set_raw_duty(enum pwm_channel ch, uint16_t duty)
 	UPDATE_BIT(NPCX_PWMCTL(mdl), NPCX_PWMCTL_INVP,
 			(pwm_channels[ch].flags & PWM_CONFIG_ACTIVE_LOW));
 
-	CPRINTS("freq=0x%x", pwm_channels[ch].freq);
+	CPRINTS("initial freq=0x%x", pwm_channels[ch].freq);
 	CPRINTS("duty_cycle_cnt=%d", duty);
 
 	/* duty ranges from 0 - 0xffff, so scale down to 0 - pwm_res[ch] */
 	sd = DIV_ROUND_NEAREST(duty * pwm_res[ch], EC_PWM_MAX_DUTY);
 
-	/* Set the duty cycle */
-	NPCX_DCR(mdl) = (uint16_t)sd;
-
-	pwm_enable(ch, !!duty);
+	/* Set the duty cycle. If it is zero, set DCR > CTR */
+	NPCX_DCR(mdl) = sd ? sd : NPCX_PWM_MAX_RAW_DUTY + 1;
 }
 
 /**
@@ -187,7 +181,7 @@ uint16_t pwm_get_raw_duty(enum pwm_channel ch)
 	int mdl = pwm_channels[ch].channel;
 
 	/* Return duty */
-	if (!pwm_get_enabled(ch))
+	if (NPCX_DCR(mdl) > NPCX_CTR(mdl))
 		return 0;
 	else
 		/*
@@ -202,7 +196,6 @@ uint16_t pwm_get_raw_duty(enum pwm_channel ch)
  * PWM configuration.
  *
  * @param  ch    operation channel
- * @return none
  */
 void pwm_config(enum pwm_channel ch)
 {
@@ -226,15 +219,16 @@ void pwm_config(enum pwm_channel ch)
 	UPDATE_BIT(NPCX_PWMCTL(mdl), NPCX_PWMCTL_CKSEL,
 			(pwm_channels[ch].flags & PWM_CONFIG_DSLEEP));
 
+	/* Select PWM IO type */
+	UPDATE_BIT(NPCX_PWMCTLEX(mdl), NPCX_PWMCTLEX_OD_OUT,
+			(pwm_channels[ch].flags & PWM_CONFIG_OPEN_DRAIN));
+
 	/* Set PWM operation frequency */
 	pwm_set_freq(ch, pwm_channels[ch].freq);
 }
 
 /**
  * PWM initial.
- *
- * @param none
- * @return none
  */
 static void pwm_init(void)
 {

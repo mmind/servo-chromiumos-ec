@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -10,14 +10,42 @@
 #include "host_command.h"
 #include "panic.h"
 #include "printf.h"
+#include "software_panic.h"
+#include "sysjump.h"
 #include "system.h"
 #include "task.h"
 #include "timer.h"
 #include "uart.h"
+#include "usb_console.h"
 #include "util.h"
 
 /* Panic data goes at the end of RAM. */
 static struct panic_data * const pdata_ptr = PANIC_DATA_PTR;
+
+/* Common SW Panic reasons strings */
+const char * const panic_sw_reasons[] = {
+#ifdef CONFIG_SOFTWARE_PANIC
+	"PANIC_SW_DIV_ZERO",
+	"PANIC_SW_STACK_OVERFLOW",
+	"PANIC_SW_PD_CRASH",
+	"PANIC_SW_ASSERT",
+	"PANIC_SW_WATCHDOG",
+	"PANIC_SW_RNG",
+	"PANIC_SW_PMIC_FAULT",
+#endif
+};
+
+/**
+ * Check an interrupt vector as being a valid software panic
+ * @param reason	Reason for panic
+ * @return 0 if not a valid software panic reason, otherwise non-zero.
+ */
+int panic_sw_reason_is_valid(uint32_t reason)
+{
+	return (IS_ENABLED(CONFIG_SOFTWARE_PANIC) &&
+		reason >= PANIC_SW_BASE &&
+		(reason - PANIC_SW_BASE) < ARRAY_SIZE(panic_sw_reasons));
+}
 
 /**
  * Add a character directly to the UART buffer.
@@ -63,7 +91,13 @@ void panic_printf(const char *format, ...)
 	uart_flush_output();
 
 	va_start(args, format);
+	/* Send the message to the UART console */
 	vfnprintf(panic_txchar, NULL, format, args);
+#if defined(CONFIG_USB_CONSOLE) || defined(CONFIG_USB_CONSOLE_STREAM)
+	/* Send the message to the USB console on platforms which support it. */
+	usb_vprintf(format, args);
+#endif
+
 	va_end(args);
 
 	/* Flush the transmit FIFO */
@@ -114,7 +148,125 @@ void panic(const char *msg)
 
 struct panic_data *panic_get_data(void)
 {
-	return pdata_ptr->magic == PANIC_DATA_MAGIC ? pdata_ptr : NULL;
+	BUILD_ASSERT(sizeof(struct panic_data) <= CONFIG_PANIC_DATA_SIZE);
+
+	if (pdata_ptr->magic != PANIC_DATA_MAGIC ||
+	    pdata_ptr->struct_size != CONFIG_PANIC_DATA_SIZE)
+		return NULL;
+
+	return pdata_ptr;
+}
+
+/*
+ * Returns pointer to beginning of panic data.
+ * Please note that it is not safe to interpret this
+ * pointer as panic_data structure.
+ */
+uintptr_t get_panic_data_start(void)
+{
+	if (pdata_ptr->magic != PANIC_DATA_MAGIC)
+		return 0;
+
+	return ((uintptr_t)CONFIG_PANIC_DATA_BASE
+			   + CONFIG_PANIC_DATA_SIZE
+			   - pdata_ptr->struct_size);
+}
+
+static uint32_t get_panic_data_size(void)
+{
+	if (pdata_ptr->magic != PANIC_DATA_MAGIC)
+		return 0;
+
+	return pdata_ptr->struct_size;
+}
+
+/*
+ * Returns pointer to panic_data structure that can be safely written.
+ * Please note that this function can move jump data and jump tags.
+ * It can also delete panic data from previous boot, so this function
+ * should be used when we are sure that we don't need it.
+ */
+struct panic_data *get_panic_data_write(void)
+{
+	/*
+	 * Pointer to panic_data structure. It may not point to
+	 * the beginning of structure, but accessing struct_size
+	 * and magic is safe because it is always placed at the
+	 * end of RAM.
+	 */
+	struct panic_data * const pdata_ptr = PANIC_DATA_PTR;
+	const struct jump_data *jdata_ptr;
+	uintptr_t data_begin;
+	size_t move_size;
+	int delta;
+
+	/*
+	 * If panic data exists, jump data and jump tags should be moved
+	 * about difference between size of panic_data structure and size of
+	 * structure that is present in memory.
+	 *
+	 * If panic data doesn't exist, lets create place for a one
+	 */
+	if (pdata_ptr->magic == PANIC_DATA_MAGIC)
+		delta = CONFIG_PANIC_DATA_SIZE - pdata_ptr->struct_size;
+	else
+		delta = CONFIG_PANIC_DATA_SIZE;
+
+	/* If delta is 0, there is no need to move anything */
+	if (delta == 0)
+		return pdata_ptr;
+
+	/*
+	 * Expecting get_panic_data_start() will return a pointer to
+	 * the beginning of panic data, or NULL if no panic data available
+	 */
+	data_begin = get_panic_data_start();
+	if (!data_begin)
+		data_begin = CONFIG_RAM_BASE + CONFIG_RAM_SIZE;
+
+	jdata_ptr = (struct jump_data *)(data_begin - sizeof(struct jump_data));
+
+	/*
+	 * If we don't have valid jump_data structure we don't need to move
+	 * anything and can just return pdata_ptr (clear memory, set magic
+	 * and struct_size first).
+	 */
+	if (jdata_ptr->magic != JUMP_DATA_MAGIC ||
+	    jdata_ptr->version < 1 || jdata_ptr->version > 3) {
+		memset(pdata_ptr, 0, CONFIG_PANIC_DATA_SIZE);
+		pdata_ptr->magic = PANIC_DATA_MAGIC;
+		pdata_ptr->struct_size = CONFIG_PANIC_DATA_SIZE;
+
+		return pdata_ptr;
+	}
+
+	if (jdata_ptr->version == 1)
+		move_size = JUMP_DATA_SIZE_V1;
+	else if (jdata_ptr->version == 2)
+		move_size = JUMP_DATA_SIZE_V2 + jdata_ptr->jump_tag_total;
+	else if (jdata_ptr->version == 3)
+		move_size = jdata_ptr->struct_size + jdata_ptr->jump_tag_total;
+	else {
+		/* Unknown jump data version - set move size to 0 */
+		move_size = 0;
+	}
+
+	data_begin -= move_size;
+
+	if (move_size != 0) {
+		/* Move jump_tags and jump_data */
+		memmove((void *)(data_begin - delta), (void *)data_begin, move_size);
+	}
+
+	/*
+	 * Now we are sure that there is enough space for current
+	 * panic_data structure.
+	 */
+	memset(pdata_ptr, 0, CONFIG_PANIC_DATA_SIZE);
+	pdata_ptr->magic = PANIC_DATA_MAGIC;
+	pdata_ptr->struct_size = CONFIG_PANIC_DATA_SIZE;
+
+	return pdata_ptr;
 }
 
 static void panic_init(void)
@@ -129,7 +281,8 @@ static void panic_init(void)
 	}
 #endif
 }
-DECLARE_HOOK(HOOK_INIT, panic_init, HOOK_PRIO_DEFAULT);
+DECLARE_HOOK(HOOK_INIT, panic_init, HOOK_PRIO_LAST);
+DECLARE_HOOK(HOOK_CHIPSET_RESET, panic_init, HOOK_PRIO_LAST);
 
 #ifdef CONFIG_CMD_STACKOVERFLOW
 static void stack_overflow_recurse(int n)
@@ -163,15 +316,15 @@ static int command_crash(int argc, char **argv)
 	if (!strcasecmp(argv[1], "assert")) {
 		ASSERT(0);
 	} else if (!strcasecmp(argv[1], "divzero")) {
-		int zero = 0;
+		volatile int zero = 0;
 
 		cflush();
-		ccprintf("%08x", (long)1 / zero);
+		ccprintf("%08x", 1 / zero);
 	} else if (!strcasecmp(argv[1], "udivzero")) {
-		int zero = 0;
+		volatile int zero = 0;
 
 		cflush();
-		ccprintf("%08x", (unsigned long)1 / zero);
+		ccprintf("%08x", 1 / zero);
 #ifdef CONFIG_CMD_STACKOVERFLOW
 	} else if (!strcasecmp(argv[1], "stack")) {
 		stack_overflow_recurse(1);
@@ -205,7 +358,9 @@ DECLARE_CONSOLE_COMMAND(crash, command_crash,
 
 static int command_panicinfo(int argc, char **argv)
 {
-	if (pdata_ptr->magic == PANIC_DATA_MAGIC) {
+	struct panic_data * const pdata_ptr = panic_get_data();
+
+	if (pdata_ptr) {
 		ccprintf("Saved panic data:%s\n",
 			 (pdata_ptr->flags & PANIC_DATA_FLAG_OLD_CONSOLE ?
 			  "" : " (NEW)"));
@@ -215,7 +370,8 @@ static int command_panicinfo(int argc, char **argv)
 		/* Data has now been printed */
 		pdata_ptr->flags |= PANIC_DATA_FLAG_OLD_CONSOLE;
 	} else {
-		ccprintf("No saved panic data available.\n");
+		ccprintf("No saved panic data available "
+		    "or panic data can't be safely interpreted.\n");
 	}
 	return EC_SUCCESS;
 }
@@ -226,15 +382,22 @@ DECLARE_CONSOLE_COMMAND(panicinfo, command_panicinfo,
 /*****************************************************************************/
 /* Host commands */
 
-int host_command_panic_info(struct host_cmd_handler_args *args)
+enum ec_status host_command_panic_info(struct host_cmd_handler_args *args)
 {
-	if (pdata_ptr->magic == PANIC_DATA_MAGIC) {
-		ASSERT(pdata_ptr->struct_size <= args->response_max);
-		memcpy(args->response, pdata_ptr, pdata_ptr->struct_size);
-		args->response_size = pdata_ptr->struct_size;
+	uint32_t pdata_size = get_panic_data_size();
+	uintptr_t pdata_start = get_panic_data_start();
+	struct panic_data * pdata;
 
-		/* Data has now been returned */
-		pdata_ptr->flags |= PANIC_DATA_FLAG_OLD_HOSTCMD;
+	if (pdata_start && pdata_size > 0) {
+		ASSERT(pdata_size <= args->response_max);
+		memcpy(args->response, (void *)pdata_start, pdata_size);
+		args->response_size = pdata_size;
+
+		pdata = panic_get_data();
+		if (pdata) {
+			/* Data has now been returned */
+			pdata->flags |= PANIC_DATA_FLAG_OLD_HOSTCMD;
+		}
 	}
 
 	return EC_RES_SUCCESS;

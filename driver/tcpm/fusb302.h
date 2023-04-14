@@ -16,16 +16,13 @@
 
 /* I2C slave address varies by part number */
 /* FUSB302BUCX / FUSB302BMPX */
-#define FUSB302_I2C_SLAVE_ADDR 0x44
+#define FUSB302_I2C_SLAVE_ADDR_FLAGS 0x22
 /* FUSB302B01MPX */
-#define FUSB302_I2C_SLAVE_ADDR_B01 0x46
+#define FUSB302_I2C_SLAVE_ADDR_B01_FLAGS 0x23
 /* FUSB302B10MPX */
-#define FUSB302_I2C_SLAVE_ADDR_B10 0x48
+#define FUSB302_I2C_SLAVE_ADDR_B10_FLAGS 0x24
 /* FUSB302B11MPX */
-#define FUSB302_I2C_SLAVE_ADDR_B11 0x4A
-
-/* Default retry count for transmitting */
-#define PD_RETRY_COUNT		3
+#define FUSB302_I2C_SLAVE_ADDR_B11_FLAGS 0x25
 
 #define TCPC_REG_DEVICE_ID	0x01
 
@@ -49,8 +46,14 @@
 #define TCPC_REG_SWITCHES1_TXCC1_EN	(1<<0)
 
 #define TCPC_REG_MEASURE	0x04
+#define TCPC_REG_MEASURE_MDAC_MASK	0x3F
 #define TCPC_REG_MEASURE_VBUS		(1<<6)
-#define TCPC_REG_MEASURE_MDAC_MV(mv)	(((mv)/42) & 0x3f)
+/*
+ * MDAC reference voltage step size is 42 mV. Round our thresholds to reduce
+ * maximum error, which also matches suggested thresholds in datasheet
+ * (Table 3. Host Interrupt Summary).
+ */
+#define TCPC_REG_MEASURE_MDAC_MV(mv)	(DIV_ROUND_NEAREST((mv), 42) & 0x3f)
 
 #define TCPC_REG_CONTROL0	0x06
 #define TCPC_REG_CONTROL0_TX_FLUSH	(1<<6)
@@ -71,7 +74,7 @@
 
 #define TCPC_REG_CONTROL2	0x08
 /* two-bit field, valid values below */
-#define TCPC_REG_CONTROL2_MODE		(1<<1)
+#define TCPC_REG_CONTROL2_MODE_MASK	(0x3<<TCPC_REG_CONTROL2_MODE_POS)
 #define TCPC_REG_CONTROL2_MODE_DFP	(0x3)
 #define TCPC_REG_CONTROL2_MODE_UFP	(0x2)
 #define TCPC_REG_CONTROL2_MODE_DRP	(0x1)
@@ -206,4 +209,3 @@ enum fusb302_txfifo_tokens {
 extern const struct tcpm_drv fusb302_tcpm_drv;
 
 #endif /* __CROS_EC_DRIVER_TCPM_FUSB302_H */
-

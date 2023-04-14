@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -41,7 +41,7 @@ static void hang_detect_deferred(void)
 	if (timeout_will_reboot) {
 		CPRINTS("hang detect triggering warm reboot");
 		host_set_single_event(EC_HOST_EVENT_HANG_REBOOT);
-		chipset_reset(0);
+		chipset_reset(CHIPSET_RESET_HANG_REBOOT);
 		active = 0;
 		return;
 	}
@@ -159,7 +159,8 @@ DECLARE_HOOK(HOOK_CHIPSET_SHUTDOWN, hang_detect_shutdown, HOOK_PRIO_DEFAULT);
 /*****************************************************************************/
 /* Host command */
 
-static int hang_detect_host_command(struct host_cmd_handler_args *args)
+static enum ec_status
+hang_detect_host_command(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_hang_detect *p = args->params;
 

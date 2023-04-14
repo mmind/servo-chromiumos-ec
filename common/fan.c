@@ -1,10 +1,12 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
 
 /* Basic Chrome OS fan control */
 
+#include "assert.h"
+#include "chipset.h"
 #include "common.h"
 #include "console.h"
 #include "fan.h"
@@ -19,10 +21,35 @@
  * things manually. */
 static int thermal_control_enabled[CONFIG_FANS];
 
+int is_thermal_control_enabled(int idx)
+{
+	return thermal_control_enabled[idx];
+}
+
 #ifdef CONFIG_FAN_UPDATE_PERIOD
 /* Should we ignore the fans for a while? */
 static int fan_update_counter[CONFIG_FANS];
 #endif
+
+/*
+ * Number of fans.
+ *
+ * Use fan_get_count and fan_set_count to access it. It should be set only
+ * before HOOK_INIT/HOOK_PRIO_DEFAULT.
+ */
+static int fan_count = CONFIG_FANS;
+
+int fan_get_count(void)
+{
+	return fan_count;
+}
+
+void fan_set_count(int count)
+{
+	/* You can only decrease the count. */
+	assert(count <= CONFIG_FANS);
+	fan_count = count;
+}
 
 #ifndef CONFIG_FAN_RPM_CUSTOM
 /* This is the default implementation. It's only called over [0,100].
@@ -37,8 +64,8 @@ int fan_percent_to_rpm(int fan, int pct)
 	if (!pct) {
 		rpm = 0;
 	} else {
-		min = fans[fan].rpm_min;
-		max = fans[fan].rpm_max;
+		min = fans[fan].rpm->rpm_min;
+		max = fans[fan].rpm->rpm_max;
 		rpm = ((pct - 1) * max + (100 - pct) * min) / 99;
 	}
 
@@ -51,7 +78,7 @@ test_mockable void fan_set_percent_needed(int fan, int pct)
 {
 	int actual_rpm, new_rpm;
 
-	if (!thermal_control_enabled[fan])
+	if (!is_thermal_control_enabled(fan))
 		return;
 
 #ifdef CONFIG_FAN_UPDATE_PERIOD
@@ -62,40 +89,40 @@ test_mockable void fan_set_percent_needed(int fan, int pct)
 #endif
 
 	new_rpm = fan_percent_to_rpm(fan, pct);
-	actual_rpm = fan_get_rpm_actual(fans[fan].ch);
+	actual_rpm = fan_get_rpm_actual(FAN_CH(fan));
 
 	/* If we want to turn and the fans are currently significantly below
 	 * the minimum turning speed, we should turn at least as fast as the
 	 * necessary start speed instead. */
 	if (new_rpm &&
-	    actual_rpm < fans[fan].rpm_min * 9 / 10 &&
-	    new_rpm < fans[fan].rpm_start)
-		new_rpm = fans[fan].rpm_start;
+	    actual_rpm < fans[fan].rpm->rpm_min * 9 / 10 &&
+	    new_rpm < fans[fan].rpm->rpm_start)
+		new_rpm = fans[fan].rpm->rpm_start;
 
-	fan_set_rpm_target(fans[fan].ch, new_rpm);
+	fan_set_rpm_target(FAN_CH(fan), new_rpm);
 }
 
 static void set_enabled(int fan, int enable)
 {
-	fan_set_enabled(fans[fan].ch, enable);
+	fan_set_enabled(FAN_CH(fan), enable);
 
-	if (fans[fan].enable_gpio >= 0)
-		gpio_set_level(fans[fan].enable_gpio, enable);
+	if (fans[fan].conf->enable_gpio >= 0)
+		gpio_set_level(fans[fan].conf->enable_gpio, enable);
 }
 
-static void set_thermal_control_enabled(int fan, int enable)
+test_export_static void set_thermal_control_enabled(int fan, int enable)
 {
 	thermal_control_enabled[fan] = enable;
 
 	/* If controlling the fan, need it in RPM-control mode */
 	if (enable)
-		fan_set_rpm_mode(fans[fan].ch, 1);
+		fan_set_rpm_mode(FAN_CH(fan), 1);
 }
 
 static void set_duty_cycle(int fan, int percent)
 {
 	/* Move the fan to manual control */
-	fan_set_rpm_mode(fans[fan].ch, 0);
+	fan_set_rpm_mode(FAN_CH(fan), 0);
 
 	/* enable the fan when non-zero duty */
 	set_enabled(fan, (percent > 0) ? 1 : 0);
@@ -104,7 +131,7 @@ static void set_duty_cycle(int fan, int percent)
 	set_thermal_control_enabled(fan, 0);
 
 	/* Set the duty cycle */
-	fan_set_duty(fans[fan].ch, percent);
+	fan_set_duty(FAN_CH(fan), percent);
 }
 
 /*****************************************************************************/
@@ -115,13 +142,13 @@ static int cc_fanauto(int argc, char **argv)
 	char *e;
 	int fan = 0;
 
-	if (CONFIG_FANS > 1) {
+	if (fan_count > 1) {
 		if (argc < 2) {
 			ccprintf("fan number is required as the first arg\n");
 			return EC_ERROR_PARAM_COUNT;
 		}
 		fan = strtoi(argv[1], &e, 0);
-		if (*e || fan >= CONFIG_FANS)
+		if (*e || fan >= fan_count)
 			return EC_ERROR_PARAM1;
 		argc--;
 		argv++;
@@ -140,11 +167,11 @@ static int is_powered(int fan)
 	int is_pgood = -1;
 
 	/* If we have an enable output, see if it's on or off. */
-	if (fans[fan].enable_gpio >= 0)
-		is_pgood = gpio_get_level(fans[fan].enable_gpio);
+	if (fans[fan].conf->enable_gpio >= 0)
+		is_pgood = gpio_get_level(fans[fan].conf->enable_gpio);
 	/* If we have a pgood input, it overrides any enable output. */
-	if (fans[fan].pgood_gpio >= 0)
-		is_pgood = gpio_get_level(fans[fan].pgood_gpio);
+	if (fans[fan].conf->pgood_gpio >= 0)
+		is_pgood = gpio_get_level(fans[fan].conf->pgood_gpio);
 
 	return is_pgood;
 }
@@ -157,26 +184,26 @@ static int cc_faninfo(int argc, char **argv)
 	int tmp, is_pgood;
 	int fan;
 	char leader[20] = "";
-	for (fan = 0; fan < CONFIG_FANS; fan++) {
-		if (CONFIG_FANS > 1)
+	for (fan = 0; fan < fan_count; fan++) {
+		if (fan_count > 1)
 			snprintf(leader, sizeof(leader), "Fan %d ", fan);
 		if (fan)
 			ccprintf("\n");
 		ccprintf("%sActual: %4d rpm\n", leader,
-			 fan_get_rpm_actual(fans[fan].ch));
+			 fan_get_rpm_actual(FAN_CH(fan)));
 		ccprintf("%sTarget: %4d rpm\n", leader,
-			 fan_get_rpm_target(fans[fan].ch));
+			 fan_get_rpm_target(FAN_CH(fan)));
 		ccprintf("%sDuty:   %d%%\n", leader,
-			 fan_get_duty(fans[fan].ch));
-		tmp = fan_get_status(fans[fan].ch);
+			 fan_get_duty(FAN_CH(fan)));
+		tmp = fan_get_status(FAN_CH(fan));
 		ccprintf("%sStatus: %d (%s)\n", leader,
 			 tmp, human_status[tmp]);
 		ccprintf("%sMode:   %s\n", leader,
-			 fan_get_rpm_mode(fans[fan].ch) ? "rpm" : "duty");
+			 fan_get_rpm_mode(FAN_CH(fan)) ? "rpm" : "duty");
 		ccprintf("%sAuto:   %s\n", leader,
-			 thermal_control_enabled[fan] ? "yes" : "no");
+			 is_thermal_control_enabled(fan) ? "yes" : "no");
 		ccprintf("%sEnable: %s\n", leader,
-			 fan_get_enabled(fans[fan].ch) ? "yes" : "no");
+			 fan_get_enabled(FAN_CH(fan)) ? "yes" : "no");
 		is_pgood = is_powered(fan);
 		if (is_pgood >= 0)
 			ccprintf("%sPower:  %s\n", leader,
@@ -195,13 +222,18 @@ static int cc_fanset(int argc, char **argv)
 	char *e;
 	int fan = 0;
 
-	if (CONFIG_FANS > 1) {
+	if (fan_count == 0) {
+		ccprintf("Fan count is zero\n");
+		return EC_ERROR_INVAL;
+	}
+
+	if (fan_count > 1) {
 		if (argc < 2) {
 			ccprintf("fan number is required as the first arg\n");
 			return EC_ERROR_PARAM_COUNT;
 		}
 		fan = strtoi(argv[1], &e, 0);
-		if (*e || fan >= CONFIG_FANS)
+		if (*e || fan >= fan_count)
 			return EC_ERROR_PARAM1;
 		argc--;
 		argv++;
@@ -210,7 +242,7 @@ static int cc_fanset(int argc, char **argv)
 	if (argc < 2)
 		return EC_ERROR_PARAM_COUNT;
 
-	rpm = strtoi(argv[1], &e, 0);
+	rpm = strtoi(argv[2], &e, 0);
 	if (*e == '%') {		/* Wait, that's a percentage */
 		ccprintf("Fan rpm given as %d%%\n", rpm);
 		if (rpm < 0)
@@ -223,7 +255,7 @@ static int cc_fanset(int argc, char **argv)
 	}
 
 	/* Move the fan to automatic control */
-	fan_set_rpm_mode(fans[fan].ch, 1);
+	fan_set_rpm_mode(FAN_CH(fan), 1);
 
 	/* enable the fan when non-zero rpm */
 	set_enabled(fan, (rpm > 0) ? 1 : 0);
@@ -231,7 +263,7 @@ static int cc_fanset(int argc, char **argv)
 	/* Disable thermal engine automatic fan control. */
 	set_thermal_control_enabled(fan, 0);
 
-	fan_set_rpm_target(fans[fan].ch, rpm);
+	fan_set_rpm_target(FAN_CH(fan), rpm);
 
 	ccprintf("Setting fan %d rpm target to %d\n", fan, rpm);
 
@@ -247,13 +279,18 @@ static int cc_fanduty(int argc, char **argv)
 	char *e;
 	int fan = 0;
 
-	if (CONFIG_FANS > 1) {
+	if (fan_count == 0) {
+		ccprintf("Fan count is zero\n");
+		return EC_ERROR_INVAL;
+	}
+
+	if (fan_count > 1) {
 		if (argc < 2) {
 			ccprintf("fan number is required as the first arg\n");
 			return EC_ERROR_PARAM_COUNT;
 		}
 		fan = strtoi(argv[1], &e, 0);
-		if (*e || fan >= CONFIG_FANS)
+		if (*e || fan >= fan_count)
 			return EC_ERROR_PARAM1;
 		argc--;
 		argv++;
@@ -283,10 +320,13 @@ int dptf_get_fan_duty_target(void)
 {
 	int fan = 0;				/* TODO(crosbug.com/p/23803) */
 
-	if (thermal_control_enabled[fan] || fan_get_rpm_mode(fans[fan].ch))
+	if (fan_count == 0)
 		return -1;
 
-	return fan_get_duty(fans[fan].ch);
+	if (is_thermal_control_enabled(fan) || fan_get_rpm_mode(FAN_CH(fan)))
+		return -1;
+
+	return fan_get_duty(FAN_CH(fan));
 }
 
 /* 0-100% sets duty, out of range means let the EC drive */
@@ -296,11 +336,11 @@ void dptf_set_fan_duty_target(int pct)
 
 	if (pct < 0 || pct > 100) {
 		/* TODO(crosbug.com/p/23803) */
-		for (fan = 0; fan < CONFIG_FANS; fan++)
+		for (fan = 0; fan < fan_count; fan++)
 			set_thermal_control_enabled(fan, 1);
 	} else {
 		/* TODO(crosbug.com/p/23803) */
-		for (fan = 0; fan < CONFIG_FANS; fan++)
+		for (fan = 0; fan < fan_count; fan++)
 			set_duty_cycle(fan, pct);
 	}
 }
@@ -308,13 +348,16 @@ void dptf_set_fan_duty_target(int pct)
 /*****************************************************************************/
 /* Host commands */
 
-static int hc_pwm_get_fan_target_rpm(struct host_cmd_handler_args *args)
+static enum ec_status
+hc_pwm_get_fan_target_rpm(struct host_cmd_handler_args *args)
 {
 	struct ec_response_pwm_get_fan_rpm *r = args->response;
-	int fan = 0;
+
+	if (fan_count == 0)
+		return EC_RES_ERROR;
 
 	/* TODO(crosbug.com/p/23803) */
-	r->rpm = fan_get_rpm_target(fans[fan].ch);
+	r->rpm = fan_get_rpm_target(FAN_CH(0));
 	args->response_size = sizeof(*r);
 
 	return EC_RES_SUCCESS;
@@ -323,35 +366,36 @@ DECLARE_HOST_COMMAND(EC_CMD_PWM_GET_FAN_TARGET_RPM,
 		     hc_pwm_get_fan_target_rpm,
 		     EC_VER_MASK(0));
 
-static int hc_pwm_set_fan_target_rpm(struct host_cmd_handler_args *args)
+static enum ec_status
+hc_pwm_set_fan_target_rpm(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_pwm_set_fan_target_rpm_v1 *p_v1 = args->params;
 	const struct ec_params_pwm_set_fan_target_rpm_v0 *p_v0 = args->params;
 	int fan;
 
 	if (args->version == 0) {
-		for (fan = 0; fan < CONFIG_FANS; fan++) {
+		for (fan = 0; fan < fan_count; fan++) {
 			/* enable the fan if rpm is non-zero */
 			set_enabled(fan, (p_v0->rpm > 0) ? 1 : 0);
 
 			set_thermal_control_enabled(fan, 0);
-			fan_set_rpm_mode(fans[fan].ch, 1);
-			fan_set_rpm_target(fans[fan].ch, p_v0->rpm);
+			fan_set_rpm_mode(FAN_CH(fan), 1);
+			fan_set_rpm_target(FAN_CH(fan), p_v0->rpm);
 		}
 
 		return EC_RES_SUCCESS;
 	}
 
 	fan = p_v1->fan_idx;
-	if (fan >= CONFIG_FANS)
+	if (fan >= fan_count)
 		return EC_RES_ERROR;
 
 	/* enable the fan if rpm is non-zero */
 	set_enabled(fan, (p_v1->rpm > 0) ? 1 :0);
 
 	set_thermal_control_enabled(fan, 0);
-	fan_set_rpm_mode(fans[fan].ch, 1);
-	fan_set_rpm_target(fans[fan].ch, p_v1->rpm);
+	fan_set_rpm_mode(FAN_CH(fan), 1);
+	fan_set_rpm_target(FAN_CH(fan), p_v1->rpm);
 
 	return EC_RES_SUCCESS;
 }
@@ -359,21 +403,21 @@ DECLARE_HOST_COMMAND(EC_CMD_PWM_SET_FAN_TARGET_RPM,
 		     hc_pwm_set_fan_target_rpm,
 		     EC_VER_MASK(0) | EC_VER_MASK(1));
 
-static int hc_pwm_set_fan_duty(struct host_cmd_handler_args *args)
+static enum ec_status hc_pwm_set_fan_duty(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_pwm_set_fan_duty_v1 *p_v1 = args->params;
 	const struct ec_params_pwm_set_fan_duty_v0 *p_v0 = args->params;
 	int fan;
 
 	if (args->version == 0) {
-		for (fan = 0; fan < CONFIG_FANS; fan++)
+		for (fan = 0; fan < fan_count; fan++)
 			set_duty_cycle(fan, p_v0->percent);
 
 		return EC_RES_SUCCESS;
 	}
 
 	fan = p_v1->fan_idx;
-	if (fan >= CONFIG_FANS)
+	if (fan >= fan_count)
 		return EC_RES_ERROR;
 
 	set_duty_cycle(fan, p_v1->percent);
@@ -384,20 +428,21 @@ DECLARE_HOST_COMMAND(EC_CMD_PWM_SET_FAN_DUTY,
 		     hc_pwm_set_fan_duty,
 		     EC_VER_MASK(0) | EC_VER_MASK(1));
 
-static int hc_thermal_auto_fan_ctrl(struct host_cmd_handler_args *args)
+static enum ec_status
+hc_thermal_auto_fan_ctrl(struct host_cmd_handler_args *args)
 {
 	int fan;
 	const struct ec_params_auto_fan_ctrl_v1 *p_v1 = args->params;
 
 	if (args->version == 0) {
-		for (fan = 0; fan < CONFIG_FANS; fan++)
+		for (fan = 0; fan < fan_count; fan++)
 			set_thermal_control_enabled(fan, 1);
 
 		return EC_RES_SUCCESS;
 	}
 
 	fan = p_v1->fan_idx;
-	if (fan >= CONFIG_FANS)
+	if (fan >= fan_count)
 		return EC_RES_ERROR;
 
 	set_thermal_control_enabled(fan, 1);
@@ -423,37 +468,45 @@ BUILD_ASSERT(CONFIG_FANS <= EC_FAN_SPEED_ENTRIES);
 /* Saved PWM state across sysjumps */
 struct pwm_fan_state {
 	/* TODO(crosbug.com/p/23530): Still treating all fans as one. */
-	uint16_t fan_rpm;
-	uint8_t fan_en;
+	uint16_t rpm;
+	uint8_t flag;	/* FAN_STATE_FLAG_* */
 };
+
+/* For struct pwm_fan_state.flag */
+#define FAN_STATE_FLAG_ENABLED	BIT(0)
+#define FAN_STATE_FLAG_THERMAL	BIT(1)
 
 static void pwm_fan_init(void)
 {
 	const struct pwm_fan_state *prev;
+	struct pwm_fan_state state;
 	uint16_t *mapped;
 	int version, size;
 	int i;
-	int fan = 0;
+	int fan;
 
-	for (fan = 0; fan < CONFIG_FANS; fan++)
-		fan_channel_setup(fans[fan].ch, fans[fan].flags);
+	if (fan_count == 0)
+		return;
 
+	for (fan = 0; fan < fan_count; fan++)
+		fan_channel_setup(FAN_CH(fan), fans[fan].conf->flags);
+
+	/* Restore previous state. */
 	prev = (const struct pwm_fan_state *)
 		system_get_jump_tag(PWMFAN_SYSJUMP_TAG, &version, &size);
 	if (prev && version == PWM_HOOK_VERSION && size == sizeof(*prev)) {
-		/* Restore previous state. */
-		for (fan = 0; fan < CONFIG_FANS; fan++) {
-			fan_set_enabled(fans[fan].ch, prev->fan_en);
-			fan_set_rpm_target(fans[fan].ch, prev->fan_rpm);
-		}
+		memcpy(&state, prev, sizeof(state));
 	} else {
-		/* Set initial fan speed to maximum */
-		for (fan = 0; fan < CONFIG_FANS; fan++)
-			fan_set_rpm_target(fans[fan].ch, fans[fan].rpm_max);
+		memset(&state, 0, sizeof(state));
 	}
 
-	for (fan = 0; fan < CONFIG_FANS; fan++)
-		set_thermal_control_enabled(fan, 1);
+	for (fan = 0; fan < fan_count; fan++) {
+		fan_set_enabled(FAN_CH(fan),
+				state.flag & FAN_STATE_FLAG_ENABLED);
+		fan_set_rpm_target(FAN_CH(fan), state.rpm);
+		set_thermal_control_enabled(
+				fan, state.flag & FAN_STATE_FLAG_THERMAL);
+	}
 
 	/* Initialize memory-mapped data */
 	mapped = (uint16_t *)host_get_memmap(EC_MEMMAP_FAN);
@@ -469,13 +522,13 @@ static void pwm_fan_second(void)
 	int stalled = 0;
 	int fan;
 
-	for (fan = 0; fan < CONFIG_FANS; fan++) {
-		if (fan_is_stalled(fans[fan].ch)) {
+	for (fan = 0; fan < fan_count; fan++) {
+		if (fan_is_stalled(FAN_CH(fan))) {
 			rpm = EC_FAN_SPEED_STALLED;
 			stalled = 1;
 			cprints(CC_PWM, "Fan %d stalled!", fan);
 		} else {
-			rpm = fan_get_rpm_actual(fans[fan].ch);
+			rpm = fan_get_rpm_actual(FAN_CH(fan));
 		}
 
 		mapped[fan] = rpm;
@@ -492,41 +545,70 @@ DECLARE_HOOK(HOOK_SECOND, pwm_fan_second, HOOK_PRIO_DEFAULT);
 
 static void pwm_fan_preserve_state(void)
 {
-	struct pwm_fan_state state;
+	struct pwm_fan_state state = {0};
 	int fan = 0;
 
+	if (fan_count == 0)
+		return;
+
 	/* TODO(crosbug.com/p/23530): Still treating all fans as one. */
-	state.fan_en = fan_get_enabled(fans[fan].ch);
-	state.fan_rpm = fan_get_rpm_target(fans[fan].ch);
+	if (fan_get_enabled(FAN_CH(fan)))
+		state.flag |= FAN_STATE_FLAG_ENABLED;
+	if (is_thermal_control_enabled(fan))
+		state.flag |= FAN_STATE_FLAG_THERMAL;
+	state.rpm = fan_get_rpm_target(FAN_CH(fan));
 
 	system_add_jump_tag(PWMFAN_SYSJUMP_TAG, PWM_HOOK_VERSION,
 			    sizeof(state), &state);
 }
 DECLARE_HOOK(HOOK_SYSJUMP, pwm_fan_preserve_state, HOOK_PRIO_DEFAULT);
 
-static void pwm_fan_resume(void)
-{
-	int fan;
-	for (fan = 0; fan < CONFIG_FANS; fan++)
-		set_enabled(fan, 1);
-}
-DECLARE_HOOK(HOOK_CHIPSET_RESUME, pwm_fan_resume, HOOK_PRIO_DEFAULT);
-
-static void pwm_fan_S3_S5(void)
+static void pwm_fan_control(int enable)
 {
 	int fan;
 
 	/* TODO(crosbug.com/p/23530): Still treating all fans as one. */
-	for (fan = 0; fan < CONFIG_FANS; fan++) {
-		/* Take back fan control when the processor shuts down */
-		set_thermal_control_enabled(fan, 1);
-		/* For now don't do anything with it. We'll have to turn it on
-		 * again if we need active cooling during heavy battery
-		 * charging or something.
-		 */
-		fan_set_rpm_target(fans[fan].ch, 0);
-		set_enabled(fan, 0); /* crosbug.com/p/8097 */
+	for (fan = 0; fan < fan_count; fan++) {
+		set_thermal_control_enabled(fan, enable);
+		fan_set_rpm_target(FAN_CH(fan), enable ?
+			fan_percent_to_rpm(FAN_CH(fan), CONFIG_FAN_INIT_SPEED) :
+			0);
+		set_enabled(fan, enable);
 	}
 }
-DECLARE_HOOK(HOOK_CHIPSET_SUSPEND, pwm_fan_S3_S5, HOOK_PRIO_DEFAULT);
-DECLARE_HOOK(HOOK_CHIPSET_SHUTDOWN, pwm_fan_S3_S5, HOOK_PRIO_DEFAULT);
+
+static void pwm_fan_stop(void)
+{
+	/*
+	 * There is no need to cool CPU in S3 or S5. We currently don't
+	 * have fans for battery or charger chip. Battery systems will
+	 * control charge current based on its own temperature readings.
+	 * Thus, we do not need to keep fans running in S3 or S5.
+	 *
+	 * Even with a fan on charging system, it's questionable to run
+	 * a fan in S3/S5. Under an extreme heat condition, spinning a
+	 * fan would create more heat as it draws current from a
+	 * battery and heat would come from ambient air instead of CPU.
+	 *
+	 * Thermal control may be already disabled if DPTF is used.
+	 */
+	pwm_fan_control(0); /* crosbug.com/p/8097 */
+}
+DECLARE_HOOK(HOOK_CHIPSET_SUSPEND, pwm_fan_stop, HOOK_PRIO_DEFAULT);
+DECLARE_HOOK(HOOK_CHIPSET_SHUTDOWN, pwm_fan_stop, HOOK_PRIO_DEFAULT);
+
+static void pwm_fan_start(void)
+{
+	/*
+	 * Even if the DPTF is enabled, enable thermal control here.
+	 * Upon booting to S0, if needed AP will disable/throttle it using
+	 * host commands.
+	 */
+	if (chipset_in_or_transitioning_to_state(CHIPSET_STATE_ON))
+		pwm_fan_control(1);
+}
+/* On Fizz, CHIPSET_RESUME isn't triggered when AP warm resets.
+ * So we hook CHIPSET_RESET instead.
+ */
+DECLARE_HOOK(HOOK_CHIPSET_RESET, pwm_fan_start, HOOK_PRIO_FIRST);
+DECLARE_HOOK(HOOK_CHIPSET_RESUME, pwm_fan_start, HOOK_PRIO_DEFAULT);

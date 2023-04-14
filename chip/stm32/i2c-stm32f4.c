@@ -11,6 +11,7 @@
 #include "hooks.h"
 #include "i2c.h"
 #include "registers.h"
+#include "system.h"
 #include "task.h"
 #include "timer.h"
 #include "util.h"
@@ -22,7 +23,17 @@
 #define I2C_ERROR_FAILED_START EC_ERROR_INTERNAL_FIRST
 
 /* Transmit timeout in microseconds */
-#define I2C_TX_TIMEOUT_MASTER   (10 * MSEC)
+#define I2C_TX_TIMEOUT_CONTROLLER   (10 * MSEC)
+
+#ifdef CONFIG_HOSTCMD_I2C_ADDR_FLAGS
+#if (I2C_PORT_EC == STM32_I2C1_PORT)
+#define IRQ_PERIPHERAL_EV STM32_IRQ_I2C1_EV
+#define IRQ_PERIPHERAL_ER STM32_IRQ_I2C1_ER
+#else
+#define IRQ_PERIPHERAL_EV STM32_IRQ_I2C2_EV
+#define IRQ_PERIPHERAL_ER STM32_IRQ_I2C2_ER
+#endif
+#endif
 
 /* Define I2C blocks available in stm32f4:
  * We have standard ST I2C blocks and a "fast mode plus" I2C block,
@@ -32,8 +43,7 @@
  */
 #define STM32F4_FMPI2C_PORT	3
 
-
-static const struct dma_option dma_tx_option[I2C_PORT_COUNT] = {
+static const __unused struct dma_option dma_tx_option[I2C_PORT_COUNT] = {
 	{STM32_DMAC_I2C1_TX, (void *)&STM32_I2C_DR(STM32_I2C1_PORT),
 	 STM32_DMA_CCR_MSIZE_8_BIT | STM32_DMA_CCR_PSIZE_8_BIT |
 	 STM32_DMA_CCR_CHANNEL(STM32_I2C1_TX_REQ_CH)},
@@ -63,13 +73,13 @@ static const struct dma_option dma_rx_option[I2C_PORT_COUNT] = {
 	 STM32_DMA_CCR_CHANNEL(STM32_FMPI2C4_RX_REQ_CH)},
 };
 
-/* Callabck for ISR to wake task on DMA complete. */
+/* Callback for ISR to wake task on DMA complete. */
 static inline void _i2c_dma_wake_callback(void *cb_data, int port)
 {
 	task_id_t id = (task_id_t)(int)cb_data;
 
 	if (id != TASK_ID_INVALID)
-		task_set_event(id, TASK_EVENT_I2C_COMPLETION(port), 0);
+		task_set_event(id, TASK_EVENT_I2C_COMPLETION(port));
 }
 
 /* Each callback is hardcoded to an I2C channel. */
@@ -123,7 +133,7 @@ void i2c_dma_enable_tc_interrupt(enum dma_channel stream, int port)
 #define UNSET 0
 static int wait_sr1_poll(int port, int mask, int val, int poll)
 {
-	uint64_t timeout = get_time().val + I2C_TX_TIMEOUT_MASTER;
+	uint64_t timeout = get_time().val + I2C_TX_TIMEOUT_CONTROLLER;
 
 	while (get_time().val < timeout) {
 		int sr1 = STM32_I2C_SR1(port);
@@ -154,14 +164,14 @@ static int wait_sr1(int port, int mask)
 
 
 /**
- * Send a start condition and slave address on the specified port.
+ * Send a start condition and peripheral address on the specified port.
  *
  * @param port		I2C port
- * @param slave_addr	Slave address, with LSB set for receive-mode
+ * @param addr_8bit	I2C address, with LSB set for receive-mode
  *
  * @return Non-zero if error.
  */
-static int send_start(int port, int slave_addr)
+static int send_start(const int port, const uint16_t addr_8bit)
 {
 	int rv;
 
@@ -171,8 +181,8 @@ static int send_start(int port, int slave_addr)
 	if (rv)
 		return I2C_ERROR_FAILED_START;
 
-	/* Write slave address */
-	STM32_I2C_DR(port) = slave_addr & 0xff;
+	/* Write peripheral address */
+	STM32_I2C_DR(port) = addr_8bit;
 	rv = wait_sr1_poll(port, STM32_I2C_SR1_ADDR, SET, 1);
 	if (rv)
 		return rv;
@@ -214,7 +224,7 @@ static const struct i2c_port_t *find_port(int port)
  */
 static int wait_fmpi2c_isr_poll(int port, int mask, int val, int poll)
 {
-	uint64_t timeout = get_time().val + I2C_TX_TIMEOUT_MASTER;
+	uint64_t timeout = get_time().val + I2C_TX_TIMEOUT_CONTROLLER;
 
 	while (get_time().val < timeout) {
 		int isr = STM32_FMPI2C_ISR(port);
@@ -244,16 +254,17 @@ static int wait_fmpi2c_isr(int port, int mask)
 }
 
 /**
- * Send a start condition and slave address on the specified port.
+ * Send a start condition and peripheral address on the specified port.
  *
  * @param port		I2C port
- * @param slave_addr	Slave address
+ * @param addr_8bit	I2C address
  * @param size		bytes to transfer
  * @param is_read	read, or write?
  *
  * @return Non-zero if error.
  */
-static int send_fmpi2c_start(int port, int slave_addr, int size, int is_read)
+static int send_fmpi2c_start(const int port, const uint16_t addr_8bit,
+			     int size, int is_read)
 {
 	uint32_t reg;
 
@@ -263,7 +274,7 @@ static int send_fmpi2c_start(int port, int slave_addr, int size, int is_read)
 		FMPI2C_CR2_RELOAD | FMPI2C_CR2_AUTOEND |
 		FMPI2C_CR2_RD_WRN | FMPI2C_CR2_START | FMPI2C_CR2_STOP);
 	reg |= FMPI2C_CR2_START | FMPI2C_CR2_AUTOEND |
-		FMPI2C_CR2_SADD(slave_addr) | FMPI2C_CR2_SIZE(size) |
+		addr_8bit | FMPI2C_CR2_SIZE(size) |
 		(is_read ? FMPI2C_CR2_RD_WRN : 0);
 	STM32_FMPI2C_CR2(port) = reg;
 
@@ -381,7 +392,7 @@ static void fmpi2c_clear_regs(int port)
  * Perform an i2c transaction
  *
  * @param port		i2c port to use
- * @param slave_addr	the i2c slave addr
+ * @param addr_8bit	the i2c address
  * @param out		source buffer for data
  * @param out_bytes	bytes of data to write
  * @param in		destination buffer for data
@@ -390,8 +401,9 @@ static void fmpi2c_clear_regs(int port)
  *
  * @return		EC_SUCCESS on success.
  */
-static int chip_fmpi2c_xfer(int port, int slave_addr, const uint8_t *out,
-		     int out_bytes, uint8_t *in, int in_bytes, int flags)
+static int chip_fmpi2c_xfer(const int port, const uint16_t addr_8bit,
+			    const uint8_t *out, int out_bytes,
+			    uint8_t *in, int in_bytes, int flags)
 {
 	int started = (flags & I2C_XFER_START) ? 0 : 1;
 	int rv = EC_SUCCESS;
@@ -411,7 +423,7 @@ static int chip_fmpi2c_xfer(int port, int slave_addr, const uint8_t *out,
 	/* No out bytes and no in bytes means just check for active */
 	if (out_bytes || !in_bytes) {
 		rv = send_fmpi2c_start(
-			port, slave_addr, out_bytes, FMPI2C_WRITE);
+			port, addr_8bit, out_bytes, FMPI2C_WRITE);
 		if (rv)
 			goto xfer_exit;
 
@@ -437,7 +449,7 @@ static int chip_fmpi2c_xfer(int port, int slave_addr, const uint8_t *out,
 		i2c_dma_enable_tc_interrupt(dma->channel, port);
 
 		rv_start = send_fmpi2c_start(
-				port, slave_addr, in_bytes, FMPI2C_READ);
+				port, addr_8bit, in_bytes, FMPI2C_READ);
 		if (rv_start)
 			goto xfer_exit;
 
@@ -446,15 +458,13 @@ static int chip_fmpi2c_xfer(int port, int slave_addr, const uint8_t *out,
 			goto xfer_exit;
 		STM32_FMPI2C_CR1(port) |= FMPI2C_CR1_RXDMAEN;
 
-		if (!rv_start) {
-			rv = task_wait_event_mask(
-					TASK_EVENT_I2C_COMPLETION(port),
-					DMA_TRANSFER_TIMEOUT_US);
-			if (rv & TASK_EVENT_I2C_COMPLETION(port))
-				rv = EC_SUCCESS;
-			else
-				rv = EC_ERROR_TIMEOUT;
-		}
+		rv = task_wait_event_mask(
+				TASK_EVENT_I2C_COMPLETION(port),
+				DMA_TRANSFER_TIMEOUT_US);
+		if (rv & TASK_EVENT_I2C_COMPLETION(port))
+			rv = EC_SUCCESS;
+		else
+			rv = EC_ERROR_TIMEOUT;
 
 		dma_disable(dma->channel);
 		dma_disable_tc_interrupt(dma->channel);
@@ -464,9 +474,6 @@ static int chip_fmpi2c_xfer(int port, int slave_addr, const uint8_t *out,
 			rv = wait_fmpi2c_isr(port, FMPI2C_ISR_STOPF);
 
 		STM32_FMPI2C_CR1(port) &= ~FMPI2C_CR1_RXDMAEN;
-
-		if (rv_start)
-			rv = rv_start;
 	}
 
  xfer_exit:
@@ -502,7 +509,7 @@ static int chip_fmpi2c_xfer(int port, int slave_addr, const uint8_t *out,
 
 		/*
 		 * Allow bus to idle for at least one 100KHz clock = 10 us.
-		 * This allows slaves on the bus to detect bus-idle before
+		 * This allows peripherals on the bus to detect bus-idle before
 		 * the next start condition.
 		 */
 		STM32_FMPI2C_CR1(port) &= ~FMPI2C_CR1_PE;
@@ -541,9 +548,11 @@ static void i2c_clear_regs(int port)
  */
 
 /* Perform an i2c transaction. */
-int chip_i2c_xfer(int port, int slave_addr, const uint8_t *out, int out_bytes,
+int chip_i2c_xfer(const int port, const uint16_t addr_flags,
+		  const uint8_t *out, int out_bytes,
 		  uint8_t *in, int in_bytes, int flags)
 {
+	int addr_8bit = I2C_STRIP_FLAGS(addr_flags) << 1;
 	int started = (flags & I2C_XFER_START) ? 0 : 1;
 	int rv = EC_SUCCESS;
 	int i;
@@ -554,15 +563,16 @@ int chip_i2c_xfer(int port, int slave_addr, const uint8_t *out, int out_bytes,
 	ASSERT(!started);
 
 	if (p->port == STM32F4_FMPI2C_PORT) {
-		return chip_fmpi2c_xfer(port, slave_addr, out, out_bytes,
-			in, in_bytes, flags);
+		return chip_fmpi2c_xfer(port, addr_8bit,
+					out, out_bytes,
+					in, in_bytes, flags);
 	}
 
 	i2c_clear_regs(port);
 
 	/* No out bytes and no in bytes means just check for active */
 	if (out_bytes || !in_bytes) {
-		rv = send_start(port, slave_addr);
+		rv = send_start(port, addr_8bit);
 		if (rv)
 			goto xfer_exit;
 
@@ -601,7 +611,7 @@ int chip_i2c_xfer(int port, int slave_addr, const uint8_t *out, int out_bytes,
 		STM32_I2C_CR2(port) |= STM32_I2C_CR2_LAST;
 		STM32_I2C_CR2(port) |= STM32_I2C_CR2_DMAEN;
 
-		rv_start = send_start(port, slave_addr | 0x01);
+		rv_start = send_start(port, addr_8bit | 0x01);
 
 		if ((in_bytes == 1) && (flags & I2C_XFER_STOP))
 			STM32_I2C_CR1(port) |= STM32_I2C_CR1_STOP;
@@ -665,7 +675,7 @@ int chip_i2c_xfer(int port, int slave_addr, const uint8_t *out, int out_bytes,
 
 		/*
 		 * Allow bus to idle for at least one 100KHz clock = 10 us.
-		 * This allows slaves on the bus to detect bus-idle before
+		 * This allows peripherals on the bus to detect bus-idle before
 		 * the next start condition.
 		 */
 		usleep(10);
@@ -705,6 +715,7 @@ int i2c_get_line_levels(int port)
 /*****************************************************************************/
 /* Hooks */
 
+#ifdef CONFIG_I2C_CONTROLLER
 /* Handle CPU clock changing frequency */
 static void i2c_freq_change(void)
 {
@@ -740,14 +751,260 @@ static void i2c_freq_change_hook(void)
 		i2c_lock(p->port, 0);
 }
 DECLARE_HOOK(HOOK_FREQ_CHANGE, i2c_freq_change_hook, HOOK_PRIO_DEFAULT);
+#endif
+
+/*****************************************************************************/
+/* Peripheral */
+#ifdef CONFIG_HOSTCMD_I2C_ADDR_FLAGS
+/* Host command peripheral */
+/*
+ * Buffer for received host command packets (including prefix byte on request,
+ * and result/size on response).  After any protocol-specific headers, the
+ * buffers must be 32-bit aligned.
+ */
+static uint8_t host_buffer_padded[I2C_MAX_HOST_PACKET_SIZE + 4 +
+				  CONFIG_I2C_EXTRA_PACKET_SIZE] __aligned(4);
+static uint8_t * const host_buffer = host_buffer_padded + 2;
+static uint8_t params_copy[I2C_MAX_HOST_PACKET_SIZE] __aligned(4);
+static int host_i2c_resp_port;
+static int tx_pending;
+static int tx_index, tx_end;
+static struct host_packet i2c_packet;
+
+static void i2c_send_response_packet(struct host_packet *pkt)
+{
+	int size = pkt->response_size;
+	uint8_t *out = host_buffer;
+
+	/* Ignore host command in-progress */
+	if (pkt->driver_result == EC_RES_IN_PROGRESS)
+		return;
+
+	/* Write result and size to first two bytes. */
+	*out++ = pkt->driver_result;
+	*out++ = size;
+
+	/* host_buffer data range */
+	tx_index = 0;
+	tx_end = size + 2;
+
+	/*
+	 * Set the transmitter to be in 'not full' state to keep sending
+	 * '0xec' in the event loop. Because of this, the controller i2c
+	 * doesn't need to snoop the response stream to abort transaction.
+	 */
+	STM32_I2C_CR2(host_i2c_resp_port) |= STM32_I2C_CR2_ITBUFEN;
+}
+
+/* Process the command in the i2c host buffer */
+static void i2c_process_command(void)
+{
+	char *buff = host_buffer;
+
+	/*
+	 * TODO(crosbug.com/p/29241): Combine this functionality with the
+	 * i2c_process_command function in chip/stm32/i2c-stm32f.c to make one
+	 * host command i2c process function which handles all protocol
+	 * versions.
+	 */
+	i2c_packet.send_response = i2c_send_response_packet;
+
+	i2c_packet.request = (const void *)(&buff[1]);
+	i2c_packet.request_temp = params_copy;
+	i2c_packet.request_max = sizeof(params_copy);
+	/* Don't know the request size so pass in the entire buffer */
+	i2c_packet.request_size = I2C_MAX_HOST_PACKET_SIZE;
+
+	/*
+	 * Stuff response at buff[2] to leave the first two bytes of
+	 * buffer available for the result and size to send over i2c.  Note
+	 * that this 2-byte offset and the 2-byte offset from host_buffer
+	 * add up to make the response buffer 32-bit aligned.
+	 */
+	i2c_packet.response = (void *)(&buff[2]);
+	i2c_packet.response_max = I2C_MAX_HOST_PACKET_SIZE;
+	i2c_packet.response_size = 0;
+
+	if (*buff >= EC_COMMAND_PROTOCOL_3) {
+		i2c_packet.driver_result = EC_RES_SUCCESS;
+	} else {
+		/* Only host command protocol 3 is supported. */
+		i2c_packet.driver_result = EC_RES_INVALID_HEADER;
+	}
+	host_packet_receive(&i2c_packet);
+}
+
+#ifdef CONFIG_BOARD_I2C_ADDR_FLAGS
+static void i2c_send_board_response(int len)
+{
+	/* host_buffer data range, beyond this length, will return 0xec */
+	tx_index = 0;
+	tx_end = len;
+
+	/* enable transmit interrupt and use irq to send data back */
+	STM32_I2C_CR2(host_i2c_resp_port) |= STM32_I2C_CR2_ITBUFEN;
+}
+
+static void i2c_process_board_command(int read, int addr, int len)
+{
+	board_i2c_process(read, addr, len, &host_buffer[0],
+			  i2c_send_board_response);
+}
+#endif
+
+static void i2c_event_handler(int port)
+{
+	volatile uint32_t i2c_cr1;
+	volatile uint32_t i2c_sr2;
+	volatile uint32_t i2c_sr1;
+	static int rx_pending, buf_idx;
+	static uint16_t addr_8bit;
+
+	volatile uint32_t unused __attribute__((unused));
+
+	i2c_cr1 = STM32_I2C_CR1(port);
+	i2c_sr2 = STM32_I2C_SR2(port);
+	i2c_sr1 = STM32_I2C_SR1(port);
+
+	/*
+	 * Check for error conditions. Note, arbitration loss and bus error
+	 * are the only two errors we can get as a peripheral allowing clock
+	 * stretching and in non-SMBus mode.
+	 */
+	if (i2c_sr1 & (STM32_I2C_SR1_ARLO | STM32_I2C_SR1_BERR)) {
+		rx_pending = 0;
+		tx_pending = 0;
+		/* Disable buffer interrupt */
+		STM32_I2C_CR2(port) &= ~STM32_I2C_CR2_ITBUFEN;
+		/* Clear error status bits */
+		STM32_I2C_SR1(port) &= ~(STM32_I2C_SR1_ARLO |
+					 STM32_I2C_SR1_BERR);
+	}
+
+	/* Transfer matched our peripheral address */
+	if (i2c_sr1 & STM32_I2C_SR1_ADDR) {
+		addr_8bit = ((i2c_sr2 & STM32_I2C_SR2_DUALF) ?
+			STM32_I2C_OAR2(port) : STM32_I2C_OAR1(port)) & 0xfe;
+		if (i2c_sr2 & STM32_I2C_SR2_TRA) {
+			/* Transmitter peripheral */
+			i2c_sr1 |= STM32_I2C_SR1_TXE;
+#ifdef CONFIG_BOARD_I2C_ADDR_FLAGS
+			if (!rx_pending && !tx_pending) {
+				tx_pending = 1;
+				i2c_process_board_command(1, addr_8bit, 0);
+			}
+#endif
+		} else {
+			/* Receiver peripheral */
+			buf_idx = 0;
+			rx_pending = 1;
+		}
+
+		/* Enable buffer interrupt to start receive/response */
+		STM32_I2C_CR2(port) |= STM32_I2C_CR2_ITBUFEN;
+		/* Clear ADDR bit */
+		unused = STM32_I2C_SR1(port);
+		unused = STM32_I2C_SR2(port);
+		/* Inhibit stop mode when addressed until STOPF flag is set */
+		disable_sleep(SLEEP_MASK_I2C_PERIPHERAL);
+	}
+
+	/* I2C in peripheral transmitter */
+	if (i2c_sr2 & STM32_I2C_SR2_TRA) {
+		if (i2c_sr1 & (STM32_I2C_SR1_BTF | STM32_I2C_SR1_TXE)) {
+			if (tx_pending) {
+				if (tx_index < tx_end) {
+					STM32_I2C_DR(port) =
+						host_buffer[tx_index++];
+				} else {
+					STM32_I2C_DR(port) = 0xec;
+					tx_index = 0;
+					tx_end = 0;
+					tx_pending = 0;
+				}
+			} else if (rx_pending) {
+				host_i2c_resp_port = port;
+				/* Disable buffer interrupt */
+				STM32_I2C_CR2(port) &= ~STM32_I2C_CR2_ITBUFEN;
+#ifdef CONFIG_BOARD_I2C_ADDR_FLAGS
+				if ((addr_8bit >> 1) ==
+				    I2C_STRIP_FLAGS(
+					    CONFIG_BOARD_I2C_ADDR_FLAGS))
+					i2c_process_board_command(1, addr_8bit,
+								  buf_idx);
+				else
+#endif
+					i2c_process_command();
+				/* Reset host buffer */
+				rx_pending = 0;
+				tx_pending = 1;
+			} else {
+				STM32_I2C_DR(port) = 0xec;
+			}
+		}
+	} else { /* I2C in peripheral receiver */
+		if (i2c_sr1 & (STM32_I2C_SR1_BTF | STM32_I2C_SR1_RXNE))
+			host_buffer[buf_idx++] = STM32_I2C_DR(port);
+	}
+
+	/* STOPF or AF */
+	if (i2c_sr1 & (STM32_I2C_SR1_STOPF | STM32_I2C_SR1_AF)) {
+		/* Disable buffer interrupt */
+		STM32_I2C_CR2(port) &= ~STM32_I2C_CR2_ITBUFEN;
+
+#ifdef CONFIG_BOARD_I2C_ADDR_FLAGS
+		if (rx_pending &&
+		    (addr_8b >> 1) ==
+		    I2C_STRIP_FLAGS(CONFIG_BOARD_I2C_ADDR_FLAGS))
+			i2c_process_board_command(0, addr_8bit, buf_idx);
+#endif
+		rx_pending = 0;
+		tx_pending = 0;
+
+		/* Clear AF */
+		STM32_I2C_SR1(port) &= ~STM32_I2C_SR1_AF;
+		/* Clear STOPF: read SR1 and write CR1 */
+		unused = STM32_I2C_SR1(port);
+		STM32_I2C_CR1(port) = i2c_cr1 | STM32_I2C_CR1_PE;
+
+		/* No longer inhibit deep sleep after stop condition */
+		enable_sleep(SLEEP_MASK_I2C_PERIPHERAL);
+	}
+
+	/* Enable again */
+	if (!(i2c_cr1 & STM32_I2C_CR1_PE))
+		STM32_I2C_CR1(port) |= STM32_I2C_CR1_PE;
+}
+void i2c_event_interrupt(void) { i2c_event_handler(I2C_PORT_EC); }
+DECLARE_IRQ(IRQ_PERIPHERAL_EV, i2c_event_interrupt, 2);
+DECLARE_IRQ(IRQ_PERIPHERAL_ER, i2c_event_interrupt, 2);
+#endif
+
 
 /* Init all available i2c ports */
-static void i2c_init(void)
+void i2c_init(void)
 {
 	const struct i2c_port_t *p = i2c_ports;
 	int i;
 
 	for (i = 0; i < i2c_ports_used; i++, p++)
 		i2c_init_port(p);
+
+
+#ifdef CONFIG_HOSTCMD_I2C_ADDR_FLAGS
+	/* Enable ACK */
+	STM32_I2C_CR1(I2C_PORT_EC) |= STM32_I2C_CR1_ACK;
+	/* Enable interrupts */
+	STM32_I2C_CR2(I2C_PORT_EC) |= STM32_I2C_CR2_ITEVTEN
+			| STM32_I2C_CR2_ITERREN;
+	/* Setup host command peripheral */
+	STM32_I2C_OAR1(I2C_PORT_EC) = STM32_I2C_OAR1_B14
+		| (I2C_STRIP_ADDR(CONFIG_HOSTCMD_I2C_ADDR_FLAGS) << 1);
+#ifdef CONFIG_BOARD_I2C_ADDR_FLAGS
+	STM32_I2C_OAR2(I2C_PORT_EC) = STM32_I2C_OAR2_ENDUAL
+		| (I2C_STRIP_FLAGS(CONFIG_BOARD_I2C_ADDR_FLAGS) << 1);
+#endif
+	task_enable_irq(IRQ_PERIPHERAL_EV);
+	task_enable_irq(IRQ_PERIPHERAL_ER);
+#endif
 }
-DECLARE_HOOK(HOOK_INIT, i2c_init, HOOK_PRIO_INIT_I2C);

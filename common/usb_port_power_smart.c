@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -18,20 +18,24 @@
 #define CPUTS(outstr) cputs(CC_USBCHARGE, outstr)
 #define CPRINTS(format, args...) cprints(CC_USBCHARGE, format, ## args)
 
-#define USB_SYSJUMP_TAG 0x5550 /* "UP" - Usb Port */
-#define USB_HOOK_VERSION 1
-
 #ifndef CONFIG_USB_PORT_POWER_SMART_DEFAULT_MODE
 #define CONFIG_USB_PORT_POWER_SMART_DEFAULT_MODE USB_CHARGE_MODE_SDP2
 #endif
 
-/* The previous USB port state before sys jump */
-struct usb_state {
-	uint8_t port_mode[CONFIG_USB_PORT_POWER_SMART_PORT_COUNT];
-};
+struct charge_mode_t {
+	uint8_t mode:7;
+	uint8_t inhibit_charging_in_suspend:1;
+} __pack;
 
-static uint8_t charge_mode[CONFIG_USB_PORT_POWER_SMART_PORT_COUNT];
+static struct charge_mode_t charge_mode[CONFIG_USB_PORT_POWER_SMART_PORT_COUNT];
 
+#ifdef CONFIG_USB_PORT_POWER_SMART_CDP_SDP_ONLY
+/*
+ * If we only support CDP and SDP, the control signals are hard-wired so
+ * there's nothing to do.  The only to do is set ILIM_SEL.
+ */
+static void usb_charge_set_control_mode(int port_id, int mode) {}
+#else /* !defined(CONFIG_USB_PORT_POWER_SMART_CDP_SDP_ONLY) */
 static void usb_charge_set_control_mode(int port_id, int mode)
 {
 #ifdef CONFIG_USB_PORT_POWER_SMART_SIMPLE
@@ -40,55 +44,45 @@ static void usb_charge_set_control_mode(int port_id, int mode)
 	 * port wins.  Also, only CTL1 can be set; the other pins are
 	 * hard-wired.
 	 */
-	gpio_set_level(GPIO_USB_CTL1, mode & 0x4);
+	gpio_or_ioex_set_level(GPIO_USB_CTL1, mode & 0x4);
 #else
 	if (port_id == 0) {
-		gpio_set_level(GPIO_USB1_CTL1, mode & 0x4);
-		gpio_set_level(GPIO_USB1_CTL2, mode & 0x2);
-		gpio_set_level(GPIO_USB1_CTL3, mode & 0x1);
+		gpio_or_ioex_set_level(GPIO_USB1_CTL1, mode & 0x4);
+		gpio_or_ioex_set_level(GPIO_USB1_CTL2, mode & 0x2);
+		gpio_or_ioex_set_level(GPIO_USB1_CTL3, mode & 0x1);
 	} else {
-		gpio_set_level(GPIO_USB2_CTL1, mode & 0x4);
-		gpio_set_level(GPIO_USB2_CTL2, mode & 0x2);
-		gpio_set_level(GPIO_USB2_CTL3, mode & 0x1);
+		gpio_or_ioex_set_level(GPIO_USB2_CTL1, mode & 0x4);
+		gpio_or_ioex_set_level(GPIO_USB2_CTL2, mode & 0x2);
+		gpio_or_ioex_set_level(GPIO_USB2_CTL3, mode & 0x1);
 	}
-#endif
+#endif /* defined(CONFIG_USB_PORT_POWER_SMART_SIMPLE) */
 }
+#endif /* defined(CONFIG_USB_PORT_POWER_SMART_CDP_SDP_ONLY) */
 
 static void usb_charge_set_enabled(int port_id, int en)
 {
 	ASSERT(port_id < CONFIG_USB_PORT_POWER_SMART_PORT_COUNT);
-#if CONFIG_USB_PORT_POWER_SMART_PORT_COUNT >= 1
-	if (port_id == 0)
-		gpio_set_level(GPIO_USB1_ENABLE, en);
-#endif
-#if CONFIG_USB_PORT_POWER_SMART_PORT_COUNT >= 2
-	if (port_id == 1)
-		gpio_set_level(GPIO_USB2_ENABLE, en);
-#endif
-#if CONFIG_USB_PORT_POWER_SMART_PORT_COUNT >= 3
-	if (port_id == 2)
-		gpio_set_level(GPIO_USB3_ENABLE, en);
-#endif
+	gpio_or_ioex_set_level(usb_port_enable[port_id], en);
 }
 
 static void usb_charge_set_ilim(int port_id, int sel)
 {
-#if defined(CONFIG_USB_PORT_POWER_SMART_SIMPLE)
-	/* ILIM_SEL signal is shared and inverted */
-	gpio_set_level(GPIO_USB_ILIM_SEL, !sel);
-#elif defined(CONFIG_USB_PORT_POWER_SMART_INVERTED)
-	/* ILIM_SEL signal is per-port and active low */
-	if (port_id == 0)
-		gpio_set_level(GPIO_USB1_ILIM_SEL_L, !sel);
-	else
-		gpio_set_level(GPIO_USB2_ILIM_SEL_L, !sel);
-#else
-	/* ILIM_SEL is per-port and active high */
-	if (port_id == 0)
-		gpio_set_level(GPIO_USB1_ILIM_SEL, sel);
-	else
-		gpio_set_level(GPIO_USB2_ILIM_SEL, sel);
-#endif /* CONFIG_USB_PORT_POWER_SMART_SIMPLE */
+	int ilim_sel;
+
+#if defined(CONFIG_USB_PORT_POWER_SMART_SIMPLE) ||	\
+	defined(CONFIG_USB_PORT_POWER_SMART_INVERTED)
+	/* ILIM_SEL is inverted. */
+	sel = !sel;
+#endif
+
+	ilim_sel = GPIO_USB1_ILIM_SEL;
+#if !defined(CONFIG_USB_PORT_POWER_SMART_SIMPLE) && \
+	CONFIG_USB_PORT_POWER_SMART_PORT_COUNT == 2
+	if (port_id != 0)
+		ilim_sel = GPIO_USB2_ILIM_SEL;
+#endif
+
+	gpio_or_ioex_set_level(ilim_sel, sel);
 }
 
 static void usb_charge_all_ports_ctrl(enum usb_charge_mode mode)
@@ -96,34 +90,19 @@ static void usb_charge_all_ports_ctrl(enum usb_charge_mode mode)
 	int i;
 
 	for (i = 0; i < CONFIG_USB_PORT_POWER_SMART_PORT_COUNT; i++)
-		usb_charge_set_mode(i, mode);
+		usb_charge_set_mode(i, mode, USB_ALLOW_SUSPEND_CHARGE);
 }
 
-int usb_charge_ports_enabled(void)
+int usb_charge_set_mode(int port_id, enum usb_charge_mode mode,
+			enum usb_suspend_charge inhibit_charge)
 {
-	int mask = 0;
-
-#if CONFIG_USB_PORT_POWER_SMART_PORT_COUNT >= 1
-	if (gpio_get_level(GPIO_USB1_ENABLE))
-		mask |= (1 << 0);
-#endif
-#if CONFIG_USB_PORT_POWER_SMART_PORT_COUNT >= 2
-	if (gpio_get_level(GPIO_USB2_ENABLE))
-		mask |= (1 << 1);
-#endif
-#if CONFIG_USB_PORT_POWER_SMART_PORT_COUNT >= 3
-	if (gpio_get_level(GPIO_USB3_ENABLE))
-		mask |= (1 << 2);
-#endif
-	return mask;
-}
-
-int usb_charge_set_mode(int port_id, enum usb_charge_mode mode)
-{
-	CPRINTS("USB charge p%d m%d", port_id, mode);
+	CPRINTS("USB charge p%d m%d i%d", port_id, mode, inhibit_charge);
 
 	if (port_id >= CONFIG_USB_PORT_POWER_SMART_PORT_COUNT)
 		return EC_ERROR_INVAL;
+
+	if (mode == USB_CHARGE_MODE_DEFAULT)
+		mode = CONFIG_USB_PORT_POWER_SMART_DEFAULT_MODE;
 
 	switch (mode) {
 	case USB_CHARGE_MODE_DISABLED:
@@ -139,15 +118,18 @@ int usb_charge_set_mode(int port_id, enum usb_charge_mode mode)
 		usb_charge_set_ilim(port_id, 1);
 		usb_charge_set_enabled(port_id, 1);
 		break;
+#ifndef CONFIG_USB_PORT_POWER_SMART_CDP_SDP_ONLY
 	case USB_CHARGE_MODE_DCP_SHORT:
 		usb_charge_set_control_mode(port_id, 4);
 		usb_charge_set_enabled(port_id, 1);
 		break;
+#endif /* !defined(CONFIG_USB_PORT_POWER_SMART_CDP_SDP_ONLY) */
 	default:
 		return EC_ERROR_UNKNOWN;
 	}
 
-	charge_mode[port_id] = mode;
+	charge_mode[port_id].mode = mode;
+	charge_mode[port_id].inhibit_charging_in_suspend = inhibit_charge;
 
 	return EC_SUCCESS;
 }
@@ -158,17 +140,18 @@ int usb_charge_set_mode(int port_id, enum usb_charge_mode mode)
 static int command_set_mode(int argc, char **argv)
 {
 	int port_id = -1;
-	int mode = -1;
+	int mode = -1, inhibit_charge = 0;
 	char *e;
 	int i;
 
 	if (argc == 1) {
 		for (i = 0; i < CONFIG_USB_PORT_POWER_SMART_PORT_COUNT; i++)
-			ccprintf("Port %d: %d\n", i, charge_mode[i]);
+			ccprintf("Port %d: %d,%d\n", i, charge_mode[i].mode,
+				charge_mode[i].inhibit_charging_in_suspend);
 		return EC_SUCCESS;
 	}
 
-	if (argc != 3)
+	if (argc != 3 && argc != 4)
 		return EC_ERROR_PARAM_COUNT;
 
 	port_id = strtoi(argv[1], &e, 0);
@@ -180,27 +163,28 @@ static int command_set_mode(int argc, char **argv)
 	if (*e || mode < 0 || mode >= USB_CHARGE_MODE_COUNT)
 		return EC_ERROR_PARAM2;
 
-	return usb_charge_set_mode(port_id, mode);
+	if (argc == 4) {
+		inhibit_charge = strtoi(argv[3], &e, 0);
+		if (*e || (inhibit_charge != 0 && inhibit_charge != 1))
+			return EC_ERROR_PARAM3;
+	}
+
+	return usb_charge_set_mode(port_id, mode, inhibit_charge);
 }
 DECLARE_CONSOLE_COMMAND(usbchargemode, command_set_mode,
-			"[<port> <0 | 1 | 2 | 3>]",
+			"[<port> <0 | 1 | 2 | 3> [<0 | 1>]]",
 			"Set USB charge mode");
-/*
- * Modes:
- * 0=Disabled.
- * 1=Standard downstream port.
- * 2=Charging downstream port, BC 1.2.
- * 3=Dedicated charging port, BC 1.2.
- */
 
 /*****************************************************************************/
 /* Host commands */
 
-static int usb_charge_command_set_mode(struct host_cmd_handler_args *args)
+static enum ec_status
+usb_charge_command_set_mode(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_usb_charge_set_mode *p = args->params;
 
-	if (usb_charge_set_mode(p->usb_port_id, p->mode) != EC_SUCCESS)
+	if (usb_charge_set_mode(p->usb_port_id, p->mode,
+				p->inhibit_charge) != EC_SUCCESS)
 		return EC_RES_ERROR;
 
 	return EC_RES_SUCCESS;
@@ -214,40 +198,56 @@ DECLARE_HOST_COMMAND(EC_CMD_USB_CHARGE_SET_MODE,
 
 static void usb_charge_preserve_state(void)
 {
-	struct usb_state state;
-	int i;
-
-	for (i = 0; i < CONFIG_USB_PORT_POWER_SMART_PORT_COUNT; i++)
-		state.port_mode[i] = charge_mode[i];
-
 	system_add_jump_tag(USB_SYSJUMP_TAG, USB_HOOK_VERSION,
-			    sizeof(state), &state);
+			    sizeof(charge_mode), charge_mode);
 }
 DECLARE_HOOK(HOOK_SYSJUMP, usb_charge_preserve_state, HOOK_PRIO_DEFAULT);
 
 static void usb_charge_init(void)
 {
-	const struct usb_state *prev;
+	const struct charge_mode_t *prev;
 	int version, size, i;
 
-	prev = (const struct usb_state *)system_get_jump_tag(USB_SYSJUMP_TAG,
-							     &version, &size);
+	prev = (const struct charge_mode_t *)system_get_jump_tag(USB_SYSJUMP_TAG,
+						    &version, &size);
 
-	if (prev && version == USB_HOOK_VERSION && size == sizeof(*prev)) {
-		for (i = 0; i < CONFIG_USB_PORT_POWER_SMART_PORT_COUNT; i++)
-			usb_charge_set_mode(i, prev->port_mode[i]);
-	} else {
+	if (!prev || version != USB_HOOK_VERSION ||
+			size != sizeof(charge_mode)) {
 		usb_charge_all_ports_ctrl(USB_CHARGE_MODE_DISABLED);
+		return;
 	}
+
+	for (i = 0; i < CONFIG_USB_PORT_POWER_SMART_PORT_COUNT; i++)
+		usb_charge_set_mode(i, prev[i].mode,
+			prev[i].inhibit_charging_in_suspend);
 }
 DECLARE_HOOK(HOOK_INIT, usb_charge_init, HOOK_PRIO_DEFAULT);
 
 static void usb_charge_resume(void)
 {
+	int i;
+
 	/* Turn on USB ports on as we go into S0 from S3 or S5. */
-	usb_charge_all_ports_ctrl(CONFIG_USB_PORT_POWER_SMART_DEFAULT_MODE);
+	for (i = 0; i < CONFIG_USB_PORT_POWER_SMART_PORT_COUNT; i++)
+		usb_charge_set_mode(i,
+			CONFIG_USB_PORT_POWER_SMART_DEFAULT_MODE,
+			charge_mode[i].inhibit_charging_in_suspend);
 }
 DECLARE_HOOK(HOOK_CHIPSET_RESUME, usb_charge_resume, HOOK_PRIO_DEFAULT);
+
+static void usb_charge_suspend(void)
+{
+	int i;
+
+	/*
+	 * Inhibit charging during suspend if the inhibit_charging_in_suspend
+	 * is set to 1.
+	 */
+	for (i = 0; i < CONFIG_USB_PORT_POWER_SMART_PORT_COUNT; i++)
+		if (charge_mode[i].inhibit_charging_in_suspend)
+			usb_charge_set_enabled(i, 0 /* disabled */);
+}
+DECLARE_HOOK(HOOK_CHIPSET_SUSPEND, usb_charge_suspend, HOOK_PRIO_DEFAULT);
 
 static void usb_charge_shutdown(void)
 {

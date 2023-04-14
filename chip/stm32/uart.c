@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -232,6 +232,8 @@ static void uart_freq_change(void)
 	 * up from sleep
 	 */
 	freq = 8000000;
+#elif defined(CHIP_FAMILY_STM32H7)
+	freq = 64000000; /* from 64 Mhz HSI */
 #else
 	/* UART clocked from the main clock */
 	freq = clock_get_freq();
@@ -245,7 +247,7 @@ static void uart_freq_change(void)
 
 #if defined(CHIP_FAMILY_STM32L) || defined(CHIP_FAMILY_STM32F0) || \
 	defined(CHIP_FAMILY_STM32F3) || defined(CHIP_FAMILY_STM32L4) || \
-	defined(CHIP_FAMILY_STM32F4)
+	defined(CHIP_FAMILY_STM32F4) || defined(CHIP_FAMILY_STM32G4)
 	if (div / 16 > 0) {
 		/*
 		 * CPU clock is high enough to support x16 oversampling.
@@ -278,10 +280,16 @@ void uart_init(void)
 #elif (UARTN == 2)
 	STM32_RCC_CFGR3 |= 0x030000; /* USART2 clock source from HSI(8MHz) */
 #endif /* UARTN */
-#elif defined(CHIP_FAMILY_STM32L4)
+#elif defined(CHIP_FAMILY_STM32H7) /* Clocked from 64 Mhz HSI */
+#if ((UARTN == 1) || (UARTN == 6))
+	STM32_RCC_D2CCIP2R |= STM32_RCC_D2CCIP2_USART16SEL_HSI;
+#else
+	STM32_RCC_D2CCIP2R |= STM32_RCC_D2CCIP2_USART234578SEL_HSI;
+#endif /* UARTN */
+#elif defined(CHIP_FAMILY_STM32L4) || defined(CHIP_FAMILY_STM32G4)
 	/* USART1 clock source from SYSCLK */
 	STM32_RCC_CCIPR &= ~STM32_RCC_CCIPR_USART1SEL_MASK;
-	STM32_RCC_CCIPR |= 
+	STM32_RCC_CCIPR |=
 		(STM32_RCC_CCIPR_UART_SYSCLK << STM32_RCC_CCIPR_USART1SEL_SHIFT);
 	/* LPUART1 clock source from SYSCLK */
 	STM32_RCC_CCIPR &= ~STM32_RCC_CCIPR_LPUART1SEL_MASK;
@@ -309,7 +317,8 @@ void uart_init(void)
 	/* Configure GPIOs */
 	gpio_config_module(MODULE_UART, 1);
 
-#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32F3)
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32F3) \
+|| defined(CHIP_FAMILY_STM32H7)
 	/*
 	 * Wake up on start bit detection. WUS can only be written when UE=0,
 	 * so clear UE first.
@@ -368,3 +377,20 @@ void uart_init(void)
 
 	init_done = 1;
 }
+
+#ifdef CONFIG_FORCE_CONSOLE_RESUME
+void uart_enable_wakeup(int enable)
+{
+	if (enable) {
+		/*
+		 * Allow UART wake up from STOP mode. Note, UART clock must
+		 * be HSI(8MHz) for wakeup to work.
+		 */
+		STM32_USART_CR1(UARTN_BASE) |= STM32_USART_CR1_UESM;
+		STM32_USART_CR3(UARTN_BASE) |= STM32_USART_CR3_WUFIE;
+	} else {
+		/* Disable wake up from STOP mode. */
+		STM32_USART_CR1(UARTN_BASE) &= ~STM32_USART_CR1_UESM;
+	}
+}
+#endif

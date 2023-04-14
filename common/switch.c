@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -43,10 +43,15 @@ static void switch_update(void)
 	else
 		*memmap_switches &= ~EC_SWITCH_POWER_BUTTON_PRESSED;
 
+#ifdef CONFIG_LID_SWITCH
 	if (lid_is_open())
 		*memmap_switches |= EC_SWITCH_LID_OPEN;
 	else
 		*memmap_switches &= ~EC_SWITCH_LID_OPEN;
+#else
+	/* For lid-less systems, lid looks always open */
+	*memmap_switches |= EC_SWITCH_LID_OPEN;
+#endif
 
 	if ((flash_get_protect() & EC_FLASH_PROTECT_GPIO_ASSERTED) == 0)
 		*memmap_switches |= EC_SWITCH_WRITE_PROTECT_DISABLED;
@@ -94,13 +99,14 @@ static void switch_init(void)
 	gpio_enable_interrupt(GPIO_WP_L);
 #endif
 }
-DECLARE_HOOK(HOOK_INIT, switch_init, HOOK_PRIO_DEFAULT);
+DECLARE_HOOK(HOOK_INIT, switch_init, HOOK_PRIO_INIT_SWITCH);
 
 void switch_interrupt(enum gpio_signal signal)
 {
 	hook_call_deferred(&switch_update_data, 0);
 }
 
+#ifdef CONFIG_CMD_MMAPINFO
 static int command_mmapinfo(int argc, char **argv)
 {
 	uint8_t *memmap_switches = host_get_memmap(EC_MEMMAP_SWITCHES);
@@ -116,7 +122,7 @@ static int command_mmapinfo(int argc, char **argv)
 	};
 	ccprintf("memmap switches = 0x%x\n", val);
 	for (i = 0; i < ARRAY_SIZE(explanation); i++)
-		if (val & (1 << i))
+		if (val & BIT(i))
 			ccprintf(" %s\n", explanation[i]);
 
 	return EC_SUCCESS;
@@ -124,4 +130,4 @@ static int command_mmapinfo(int argc, char **argv)
 DECLARE_CONSOLE_COMMAND(mmapinfo, command_mmapinfo,
 			NULL,
 			"Print memmap switch state");
-
+#endif

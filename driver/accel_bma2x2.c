@@ -25,134 +25,52 @@
 /* Number of times to attempt to enable sensor before giving up. */
 #define SENSOR_ENABLE_ATTEMPTS 5
 
-/*
- * Struct for pairing an engineering value with the register value for a
- * parameter.
- */
-struct accel_param_pair {
-	int val; /* Value in engineering units. */
-	int reg; /* Corresponding register value. */
-};
-
-/* List of range values in +/-G's and their associated register values. */
-static const struct accel_param_pair ranges[] = {
-	{2, BMA2x2_RANGE_2G},
-	{4, BMA2x2_RANGE_4G},
-	{8, BMA2x2_RANGE_8G},
-	{16, BMA2x2_RANGE_16G},
-};
-
-/* List of ODR values in mHz and their associated register values. */
-static const struct accel_param_pair datarates[] = {
-	{781,     BMA2x2_BW_7_81HZ},
-	{1563,    BMA2x2_BW_15_63HZ},
-	{3125,    BMA2x2_BW_31_25HZ},
-	{6250,    BMA2x2_BW_62_50HZ},
-	{12500,   BMA2x2_BW_125HZ},
-	{25000,   BMA2x2_BW_250HZ},
-	{50000,   BMA2x2_BW_500HZ},
-	{100000,  BMA2x2_BW_1000HZ},
-};
-
-/**
- * Find index into a accel_param_pair that matches the given engineering value
- * passed in. The round_up flag is used to specify whether to round up or down.
- * Note, this function always returns a valid index. If the request is
- * outside the range of values, it returns the closest valid index.
- */
-static int find_param_index(const int eng_val, const int round_up,
-			const struct accel_param_pair *pairs,
-			const int size)
-{
-	int i = 0;
-
-	/* match first index */
-	if (eng_val <= pairs[i].val)
-		return i;
-
-	/* Linear search for index to match. */
-	while (++i < size) {
-		if (eng_val < pairs[i].val)
-			return round_up ? i : i - 1;
-		else if (eng_val == pairs[i].val)
-			return i;
-	}
-
-	return i - 1;
-}
-
 /**
  * Read register from accelerometer.
  */
-static int raw_read8(const int port, const int addr, const int reg,
-					 int *data_ptr)
+static inline int raw_read8(const int port, const uint16_t i2c_addr_flags,
+			    const int reg, int *data_ptr)
 {
-	return i2c_read8(port, addr, reg, data_ptr);
+	return i2c_read8(port, i2c_addr_flags, reg, data_ptr);
 }
 
 /**
  * Write register from accelerometer.
  */
-static int raw_write8(const int port, const int addr, const int reg, int data)
+static inline int raw_write8(const int port, const uint16_t i2c_addr_flags,
+			     const int reg, int data)
 {
-	return i2c_write8(port, addr, reg, data);
+	return i2c_write8(port, i2c_addr_flags, reg, data);
 }
 
-static int raw_read_multi(const int port, int addr, uint8_t reg,
-			  uint8_t *rxdata, int rxlen)
+static int set_range(struct motion_sensor_t *s, int range, int rnd)
 {
-	int rv;
+	int ret,  range_val, reg_val, range_reg_val;
 
-	i2c_lock(port, 1);
-	rv = i2c_xfer(port, addr, &reg, 1, rxdata, rxlen,
-		      I2C_XFER_SINGLE);
-	i2c_lock(port, 0);
-
-	return rv;
-}
-
-static int set_range(const struct motion_sensor_t *s, int range, int rnd)
-{
-	int ret,  index, reg, range_val, reg_val, range_reg_val;
-	struct bma2x2_accel_data *data = s->drv_data;
-
-	/* Find index for interface pair matching the specified range. */
-	index = find_param_index(range, rnd, ranges, ARRAY_SIZE(ranges));
-
-	reg = BMA2x2_RANGE_SELECT_REG;
-	range_val = ranges[index].reg;
+	range_val = BMA2x2_RANGE_TO_REG(range);
+	if ((BMA2x2_RANGE_TO_REG(range_val) < range) && rnd)
+		range_val = BMA2x2_RANGE_TO_REG(range * 2);
 
 	mutex_lock(s->mutex);
 
 	/* Determine the new value of control reg and attempt to write it. */
-	ret = raw_read8(s->port, s->addr, reg, &range_reg_val);
+	ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+			BMA2x2_RANGE_SELECT_ADDR, &range_reg_val);
 	if (ret != EC_SUCCESS) {
 		mutex_unlock(s->mutex);
 		return ret;
 	}
 	reg_val = (range_reg_val & ~BMA2x2_RANGE_SELECT_MSK) | range_val;
-	ret = raw_write8(s->port, s->addr, reg, reg_val);
+	ret = raw_write8(s->port, s->i2c_spi_addr_flags,
+			 BMA2x2_RANGE_SELECT_ADDR, reg_val);
 
 	/* If successfully written, then save the range. */
 	if (ret == EC_SUCCESS)
-		data->sensor_range = index;
+		s->current_range = BMA2x2_REG_TO_RANGE(range_val);
 
 	mutex_unlock(s->mutex);
 
 	return ret;
-}
-
-static int get_range(const struct motion_sensor_t *s)
-{
-	struct bma2x2_accel_data *data = s->drv_data;
-
-	return ranges[data->sensor_range].val;
-}
-
-static int set_resolution(const struct motion_sensor_t *s, int res, int rnd)
-{
-	/* Only one resolution, BMA2x2_RESOLUTION, so nothing to do. */
-	return EC_SUCCESS;
 }
 
 static int get_resolution(const struct motion_sensor_t *s)
@@ -162,30 +80,30 @@ static int get_resolution(const struct motion_sensor_t *s)
 
 static int set_data_rate(const struct motion_sensor_t *s, int rate, int rnd)
 {
-	int ret, index, odr_val, odr_reg_val, reg_val, reg;
-	struct bma2x2_accel_data *data = s->drv_data;
+	int ret, odr_val, odr_reg_val, reg_val;
+	struct accelgyro_saved_data_t *data = s->drv_data;
 
-	/* Find index for interface pair matching the specified rate. */
-	index = find_param_index(rate, rnd, datarates, ARRAY_SIZE(datarates));
-
-	odr_val = datarates[index].reg;
-	reg = BMA2x2_BW_REG;
+	odr_val = BMA2x2_BW_TO_REG(rate);
+	if ((BMA2x2_REG_TO_BW(odr_val) < rate) && rnd)
+		odr_val = BMA2x2_BW_TO_REG(rate * 2);
 
 	mutex_lock(s->mutex);
 
 	/* Determine the new value of control reg and attempt to write it. */
-	ret = raw_read8(s->port, s->addr, reg, &odr_reg_val);
+	ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+			BMA2x2_BW_SELECT_ADDR, &odr_reg_val);
 	if (ret != EC_SUCCESS) {
 		mutex_unlock(s->mutex);
 		return ret;
 	}
 	reg_val = (odr_reg_val & ~BMA2x2_BW_MSK) | odr_val;
 	/* Set output data rate. */
-	ret = raw_write8(s->port, s->addr, reg, reg_val);
+	ret = raw_write8(s->port, s->i2c_spi_addr_flags,
+			 BMA2x2_BW_SELECT_ADDR, reg_val);
 
 	/* If successfully written, then save the new data rate. */
 	if (ret == EC_SUCCESS)
-		data->sensor_datarate = index;
+		data->odr = BMA2x2_REG_TO_BW(odr_val);
 
 	mutex_unlock(s->mutex);
 	return ret;
@@ -193,46 +111,61 @@ static int set_data_rate(const struct motion_sensor_t *s, int rate, int rnd)
 
 static int get_data_rate(const struct motion_sensor_t *s)
 {
-	struct bma2x2_accel_data *data = s->drv_data;
+	struct accelgyro_saved_data_t *data = s->drv_data;
 
-	return datarates[data->sensor_datarate].val;
+	return data->odr;
 }
 
 static int set_offset(const struct motion_sensor_t *s, const int16_t *offset,
 		      int16_t temp)
 {
+	int i, ret;
+	intv3_t v = { offset[X], offset[Y], offset[Z] };
+
+	rotate_inv(v, *s->rot_standard_ref, v);
+
 	/* temperature is ignored */
-	struct bma2x2_accel_data *data = s->drv_data;
-
-	data->offset[X] = offset[X];
-	data->offset[Y] = offset[Y];
-	data->offset[Z] = offset[Z];
-
+	/* Offset from host is in 1/1024g, 1/128g internally. */
+	for (i = X; i <= Z; i++) {
+		ret = raw_write8(s->port, s->i2c_spi_addr_flags,
+				 BMA2x2_OFFSET_X_AXIS_ADDR + i, v[i] / 8);
+		if (ret)
+			return ret;
+	}
 	return EC_SUCCESS;
 }
 
 static int get_offset(const struct motion_sensor_t *s, int16_t *offset,
 		      int16_t *temp)
 {
-	struct bma2x2_accel_data *data = s->drv_data;
+	int i, val, ret;
+	intv3_t v;
 
-	offset[X] = data->offset[X];
-	offset[Y] = data->offset[Y];
-	offset[Z] = data->offset[Z];
+	for (i = X; i <= Z; i++) {
+		ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+				BMA2x2_OFFSET_X_AXIS_ADDR + i, &val);
+		if (ret)
+			return ret;
+		v[i] = (int8_t)val * 8;
+	}
+	rotate(v, *s->rot_standard_ref, v);
+	offset[X] = v[X];
+	offset[Y] = v[Y];
+	offset[Z] = v[Z];
+
 	*temp = EC_MOTION_SENSE_INVALID_CALIB_TEMP;
-
 	return EC_SUCCESS;
 }
 
-static int read(const struct motion_sensor_t *s, vector_3_t v)
+static int read(const struct motion_sensor_t *s, intv3_t v)
 {
 	uint8_t acc[6];
-	int ret, i, range;
-	struct bma2x2_accel_data *data = s->drv_data;
+	int ret, i;
 
 	/* Read 6 bytes starting at X_AXIS_LSB. */
 	mutex_lock(s->mutex);
-	ret = raw_read_multi(s->port, s->addr, BMA2x2_X_AXIS_LSB_ADDR, acc, 6);
+	ret = i2c_read_block(s->port, s->i2c_spi_addr_flags,
+			     BMA2x2_X_AXIS_LSB_ADDR, acc, 6);
 	mutex_unlock(s->mutex);
 
 	if (ret != EC_SUCCESS)
@@ -248,26 +181,87 @@ static int read(const struct motion_sensor_t *s, vector_3_t v)
 	 * acc[3] = Y_AXIS_MSB
 	 * acc[4] = Z_AXIS_LSB -> bit 7~4 for value, bit 0 for new data bit
 	 * acc[5] = Z_AXIS_MSB
-	 *
-	 * Add calibration offset before returning the data.
 	 */
 	for (i = X; i <= Z; i++)
 		v[i] = (((int8_t)acc[i * 2 + 1]) << 8) | (acc[i * 2] & 0xf0);
 	rotate(v, *s->rot_standard_ref, v);
 
-	/* apply offset in the device coordinates */
-	range = get_range(s);
-	for (i = X; i <= Z; i++)
-		v[i] += (data->offset[i] << 5) / range;
-
 	return EC_SUCCESS;
 }
 
-static int init(const struct motion_sensor_t *s)
+static int perform_calib(struct motion_sensor_t *s, int enable)
+{
+	int ret, val, status, rate, range, i;
+	timestamp_t deadline;
+
+	if (!enable)
+		return EC_SUCCESS;
+
+	ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+			BMA2x2_OFFSET_CTRL_ADDR, &val);
+	if (ret)
+		return ret;
+	if (!(val & BMA2x2_OFFSET_CAL_READY))
+		return EC_ERROR_ACCESS_DENIED;
+
+	rate = get_data_rate(s);
+	range = s->current_range;
+	/*
+	 * Temporary set frequency to 100Hz to get enough data in a short
+	 * period of time.
+	 */
+	set_data_rate(s, 100000, 0);
+	set_range(s, 2, 0);
+
+	/* We assume the device is laying flat for calibration */
+	if (s->rot_standard_ref == NULL ||
+	    (*s->rot_standard_ref)[2][2] > INT_TO_FP(0))
+		val = BMA2x2_OFC_TARGET_PLUS_1G;
+	else
+		val = BMA2x2_OFC_TARGET_MINUS_1G;
+	val = ((BMA2x2_OFC_TARGET_0G << BMA2x2_OFC_TARGET_AXIS(X)) |
+	       (BMA2x2_OFC_TARGET_0G << BMA2x2_OFC_TARGET_AXIS(Y)) |
+	       (val << BMA2x2_OFC_TARGET_AXIS(Z)));
+	raw_write8(s->port, s->i2c_spi_addr_flags,
+		   BMA2x2_OFC_SETTING_ADDR, val);
+
+	for (i = X; i <= Z; i++) {
+		val = (i + 1) << BMA2x2_OFFSET_TRIGGER_OFF;
+		raw_write8(s->port, s->i2c_spi_addr_flags,
+			   BMA2x2_OFFSET_CTRL_ADDR, val);
+		/*
+		 * The sensor needs 16 samples. At 100Hz/10ms, it needs 160ms to
+		 * complete. Set 400ms to have some margin.
+		 */
+		deadline.val = get_time().val + 400 * MSEC;
+		do {
+			if (timestamp_expired(deadline, NULL)) {
+				ret = EC_RES_TIMEOUT;
+				goto end_perform_calib;
+			}
+			msleep(50);
+			ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+					BMA2x2_OFFSET_CTRL_ADDR, &status);
+			if (ret != EC_SUCCESS)
+				goto end_perform_calib;
+		} while ((status & BMA2x2_OFFSET_CAL_READY) == 0);
+	}
+
+end_perform_calib:
+	set_range(s, range, 0);
+	set_data_rate(s, rate, 0);
+	return ret;
+}
+
+static int init(struct motion_sensor_t *s)
 {
 	int ret = 0, tries = 0, val, reg, reset_field;
 
-	ret = raw_read8(s->port, s->addr, BMA2x2_CHIP_ID_ADDR, &val);
+	/* This driver requires a mutex */
+	ASSERT(s->mutex);
+
+	ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+			BMA2x2_CHIP_ID_ADDR, &val);
 	if (ret)
 		return EC_ERROR_UNKNOWN;
 
@@ -280,13 +274,13 @@ static int init(const struct motion_sensor_t *s)
 
 	mutex_lock(s->mutex);
 
-	ret = raw_read8(s->port, s->addr, reg, &val);
+	ret = raw_read8(s->port, s->i2c_spi_addr_flags, reg, &val);
 	if (ret != EC_SUCCESS) {
 		mutex_unlock(s->mutex);
 		return ret;
 	}
 	val |= reset_field;
-	ret = raw_write8(s->port, s->addr, reg, val);
+	ret = raw_write8(s->port, s->i2c_spi_addr_flags, reg, val);
 	if (ret != EC_SUCCESS) {
 		mutex_unlock(s->mutex);
 		return ret;
@@ -294,7 +288,7 @@ static int init(const struct motion_sensor_t *s)
 
 	/* The SRST will be cleared when reset is complete. */
 	do {
-		ret = raw_read8(s->port, s->addr, reg, &val);
+		ret = raw_read8(s->port, s->i2c_spi_addr_flags, reg, &val);
 
 		/* Reset complete. */
 		if ((ret == EC_SUCCESS) && !(val & reset_field))
@@ -310,31 +304,17 @@ static int init(const struct motion_sensor_t *s)
 	} while (1);
 	mutex_unlock(s->mutex);
 
-	/* Initialize with the desired parameters. */
-	ret = set_range(s, s->default_range, 1);
-	if (ret != EC_SUCCESS)
-		return ret;
-
-	ret = set_resolution(s, 12, 1);
-	if (ret != EC_SUCCESS)
-		return ret;
-
-	CPRINTF("[%T %s: Done Init type:0x%X range:%d]\n",
-		s->name, s->type, get_range(s));
-
-	return ret;
+	return sensor_init_done(s);
 }
 
 const struct accelgyro_drv bma2x2_accel_drv = {
 	.init = init,
 	.read = read,
 	.set_range = set_range,
-	.get_range = get_range,
-	.set_resolution = set_resolution,
 	.get_resolution = get_resolution,
 	.set_data_rate = set_data_rate,
 	.get_data_rate = get_data_rate,
 	.set_offset = set_offset,
 	.get_offset = get_offset,
-	.perform_calib = NULL,
+	.perform_calib = perform_calib,
 };

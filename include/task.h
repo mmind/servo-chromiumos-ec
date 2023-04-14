@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -9,16 +9,26 @@
 #define __CROS_EC_TASK_H
 
 #include "common.h"
+#include "compile_time_macros.h"
 #include "task_id.h"
 
 /* Task event bitmasks */
-/* Tasks may use the bits in TASK_EVENT_CUSTOM for their own events */
-#define TASK_EVENT_CUSTOM(x)	(x & 0x0007ffff)
+/* Tasks may use the bits in TASK_EVENT_CUSTOM_BIT for their own events */
+#define TASK_EVENT_CUSTOM_BIT(x) BUILD_CHECK_INLINE(BIT(x), BIT(x) & 0x0ffff)
+
+/* Used to signal that sysjump preparation has completed */
+#define TASK_EVENT_SYSJUMP_READY BIT(16)
+
+/* Used to signal that IPC layer is available for sending new data */
+#define TASK_EVENT_IPC_READY	BIT(17)
+
+#define TASK_EVENT_PD_AWAKE	BIT(18)
 
 /* npcx peci event */
-#define TASK_EVENT_PECI_DONE	(1 << 19)
+#define TASK_EVENT_PECI_DONE	BIT(19)
 
 /* I2C tx/rx interrupt handler completion event. */
+#ifdef CHIP_STM32
 #define TASK_EVENT_I2C_COMPLETION(port) \
 				(1 << ((port) + 20))
 #define TASK_EVENT_I2C_IDLE	(TASK_EVENT_I2C_COMPLETION(0))
@@ -28,15 +38,25 @@
 #error "Too many i2c ports for i2c events"
 #endif
 #endif
+#else
+#define TASK_EVENT_I2C_IDLE	BIT(20)
+#define TASK_EVENT_PS2_DONE	BIT(21)
+#endif
 
 /* DMA transmit complete event */
-#define TASK_EVENT_DMA_TC       (1 << 26)
+#define TASK_EVENT_DMA_TC       BIT(26)
 /* ADC interrupt handler event */
-#define TASK_EVENT_ADC_DONE	(1 << 27)
+#define TASK_EVENT_ADC_DONE	BIT(27)
+/*
+ * task_reset() that was requested has been completed
+ *
+ * For test-only builds, may be used by some tasks to restart themselves.
+ */
+#define TASK_EVENT_RESET_DONE   BIT(28)
 /* task_wake() called on task */
-#define TASK_EVENT_WAKE		(1 << 29)
+#define TASK_EVENT_WAKE		BIT(29)
 /* Mutex unlocking */
-#define TASK_EVENT_MUTEX	(1 << 30)
+#define TASK_EVENT_MUTEX	BIT(30)
 /*
  * Timer expired.  For example, task_wait_event() timed out before receiving
  * another event.
@@ -59,17 +79,53 @@ void interrupt_disable(void);
  */
 void interrupt_enable(void);
 
+/*
+ * Define irq_lock and irq_unlock that match the function signatures to Zephyr's
+ * functions. In reality, these simply call the current implementation of
+ * interrupt_disable() and interrupt_enable().
+ */
+#ifndef CONFIG_ZEPHYR
+/**
+ * Perform the same operation as interrupt_disable but allow nesting. The
+ * return value from this function should be used as the argument to
+ * irq_unlock. Do not attempt to parse the value, it is a representation
+ * of the state and not an indication of any form of count.
+ *
+ * For more information see:
+ * https://docs.zephyrproject.org/latest/reference/kernel/other/interrupts.html#c.irq_lock
+ *
+ * @return Lock key to use for restoring the state via irq_unlock.
+ */
+uint32_t irq_lock(void);
+
+/**
+ * Perform the same operation as interrupt_enable but allow nesting. The key
+ * should be the unchanged value returned by irq_lock.
+ *
+ * For more information see:
+ * https://docs.zephyrproject.org/latest/reference/kernel/other/interrupts.html#c.irq_unlock
+ *
+ * @param key The lock-out key used to restore the interrupt state.
+ */
+void irq_unlock(uint32_t key);
+#endif /* CONFIG_ZEPHYR */
+
 /**
  * Return true if we are in interrupt context.
  */
 int in_interrupt_context(void);
 
 /**
- * Return current interrupt mask. Meaning is chip-specific and
- * should not be examined; just pass it to set_int_mask() to
- * restore a previous interrupt state after interrupt_disable().
+ * Return true if we are in software interrupt context.
  */
-uint32_t get_int_mask(void);
+int in_soft_interrupt_context(void);
+
+/**
+ * Return current interrupt mask with disabling interrupt. Meaning is
+ * chip-specific and should not be examined; just pass it to set_int_mask() to
+ * restore a previous interrupt state after interrupt disable.
+ */
+uint32_t read_clear_int_mask(void);
 
 /**
  * Set interrupt mask. As with interrupt_disable(), use with care.
@@ -91,7 +147,7 @@ void set_int_mask(uint32_t val);
  *			interrupt context.
  * @return		The bitmap of events which occurred if wait!=0, else 0.
  */
-uint32_t task_set_event(task_id_t tskid, uint32_t event, int wait);
+uint32_t task_set_event(task_id_t tskid, uint32_t event);
 
 /**
  * Wake a task.  This sends it the TASK_EVENT_WAKE event.
@@ -100,7 +156,7 @@ uint32_t task_set_event(task_id_t tskid, uint32_t event, int wait);
  */
 static inline void task_wake(task_id_t tskid)
 {
-	task_set_event(tskid, TASK_EVENT_WAKE, 0);
+	task_set_event(tskid, TASK_EVENT_WAKE);
 }
 
 /**
@@ -214,6 +270,18 @@ void task_clear_fp_used(void);
 void task_enable_all_tasks(void);
 
 /**
+ * Enable a task.
+ */
+void task_enable_task(task_id_t tskid);
+
+/**
+ * Disable a task.
+ *
+ * If the task disable itself, this will cause an immediate reschedule.
+ */
+void task_disable_task(task_id_t tskid);
+
+/**
  * Enable an interrupt.
  */
 void task_enable_irq(int irq);
@@ -228,6 +296,55 @@ void task_disable_irq(int irq);
  */
 void task_trigger_irq(int irq);
 
+/*
+ * A task that supports resets may call this to indicate that it may be reset
+ * at any point between this call and the next call to task_disable_resets().
+ *
+ * Calling this function will trigger any resets that were requested while
+ * resets were disabled.
+ *
+ * It is not expected for this to be called if resets are already enabled.
+ */
+void task_enable_resets(void);
+
+/*
+ * A task that supports resets may call this to indicate that it may not be
+ * reset until the next call to task_enable_resets(). Any calls to task_reset()
+ * during this time will cause a reset request to be queued, and executed
+ * the next time task_enable_resets() is called.
+ *
+ * Must not be called if resets are already disabled.
+ */
+void task_disable_resets(void);
+
+/*
+ * If the current task was reset, completes the reset operation.
+ *
+ * Returns a non-zero value if the task was reset; tasks with state outside
+ * of the stack should perform any necessary cleanup immediately after calling
+ * this function.
+ *
+ * Tasks that support reset must call this function once at startup before
+ * doing anything else.
+ *
+ * Must only be called once at task startup.
+ */
+int task_reset_cleanup(void);
+
+/*
+ * Resets the specified task, which must not be the current task,
+ * to initial state.
+ *
+ * Returns EC_SUCCESS, or EC_ERROR_INVAL if the specified task does
+ * not support resets.
+ *
+ * If wait is true, blocks until the task has been reset. Otherwise,
+ * returns immediately - in this case the task reset may be delayed until
+ * that task can be safely reset. The duration of this delay depends on the
+ * task implementation.
+ */
+int task_reset(task_id_t id, int wait);
+
 /**
  * Clear a pending interrupt.
  *
@@ -239,10 +356,18 @@ void task_trigger_irq(int irq);
  */
 void task_clear_pending_irq(int irq);
 
+#ifdef CONFIG_ZEPHYR
+typedef struct k_mutex mutex_t;
+
+#define mutex_lock(mtx) (k_mutex_lock(mtx, K_FOREVER))
+#define mutex_unlock(mtx) (k_mutex_unlock(mtx))
+#else
 struct mutex {
 	uint32_t lock;
 	uint32_t waiters;
 };
+
+typedef struct mutex mutex_t;
 
 /**
  * Lock a mutex.
@@ -252,12 +377,16 @@ struct mutex {
  *
  * Must not be used in interrupt context!
  */
-void mutex_lock(struct mutex *mtx);
+void mutex_lock(mutex_t *mtx);
 
 /**
  * Release a mutex previously locked by the same task.
  */
-void mutex_unlock(struct mutex *mtx);
+void mutex_unlock(mutex_t *mtx);
+
+/** Zephyr will try to init the mutex using `k_mutex_init()`. */
+#define k_mutex_init(mutex) 0
+#endif /* CONFIG_ZEPHYR */
 
 struct irq_priority {
 	uint8_t irq;
@@ -265,9 +394,27 @@ struct irq_priority {
 };
 
 /*
+ * Some cores may make use of this struct for mapping irqs to handlers
+ * for DECLARE_IRQ in a linker-script defined section.
+ */
+struct irq_def {
+	int irq;
+
+	/* The routine which was declared as an IRQ */
+	void (*routine)(void);
+
+	/*
+	 * The routine usually needs wrapped so the core can handle it
+	 * as an IRQ.
+	 */
+	void (*handler)(void);
+};
+
+/*
  * Implement the DECLARE_IRQ(irq, routine, priority) macro which is
  * a core specific helper macro to declare an interrupt handler "routine".
  */
+#ifndef CONFIG_ZEPHYR
 #ifdef CONFIG_COMMON_RUNTIME
 #include "irq_handler.h"
 #else
@@ -280,6 +427,7 @@ struct irq_priority {
 /* Include ec.irqlist here for compilation dependency */
 #define ENABLE_IRQ(x)
 #include "ec.irqlist"
-#endif
+#endif /* CONFIG_COMMON_RUNTIME */
+#endif /* !CONFIG_ZEPHYR */
 
 #endif  /* __CROS_EC_TASK_H */

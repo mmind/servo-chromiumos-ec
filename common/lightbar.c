@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+ * Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -412,36 +412,22 @@ static inline int cycle_010(uint8_t i)
 		((_ramp_table[bucket + 1] - _ramp_table[bucket]) * index >> 2);
 }
 
-/* This function provides a smooth oscillation between -0.5 and +0.5.
- * Zero starts at 0x00. */
-static inline int cycle_0p0n0(uint8_t i)
-{
-	return cycle_010(i + 64) - FP_SCALE / 2;
-}
-
-/* This function provides a pulsing oscillation between -0.5 and +0.5. */
-static inline int cycle_npn(uint16_t i)
-{
-	if ((i / 256) % 4)
-		return -FP_SCALE / 2;
-	return cycle_010(i) - FP_SCALE / 2;
-}
-
 /******************************************************************************/
 /* Here's where we keep messages waiting to be delivered to the lightbar task.
  * If more than one is sent before the task responds, we only want to deliver
  * the latest one. */
 static uint32_t pending_msg;
 /* And here's the task event that we use to trigger delivery. */
-#define PENDING_MSG 1
+#define PENDING_MSG TASK_EVENT_CUSTOM_BIT(0)
 
 /* Interruptible delay. */
-#define WAIT_OR_RET(A) do {				\
-		uint32_t msg = task_wait_event(A);	\
-		uint32_t p_msg = pending_msg;		\
-		if (TASK_EVENT_CUSTOM(msg) == PENDING_MSG &&	\
-		    p_msg != st.cur_seq)			\
-			return p_msg; } while (0)
+#define WAIT_OR_RET(A)                                                         \
+	do {                                                                   \
+		uint32_t msg = task_wait_event(A);                             \
+		uint32_t p_msg = pending_msg;                                  \
+		if (msg & PENDING_MSG && p_msg != st.cur_seq)                  \
+			return p_msg;                                          \
+	} while (0)
 
 /******************************************************************************/
 /* Here are the preprogrammed sequences. */
@@ -523,6 +509,14 @@ static uint32_t sequence_S3S0(void)
 }
 
 #ifdef BLUE_PULSING
+
+/* This function provides a pulsing oscillation between -0.5 and +0.5. */
+static inline int cycle_npn(uint16_t i)
+{
+	if ((i / 256) % 4)
+		return -FP_SCALE / 2;
+	return cycle_010(i) - FP_SCALE / 2;
+}
 
 /* CPU is fully on */
 static uint32_t sequence_S0(void)
@@ -821,7 +815,7 @@ static uint32_t sequence_STOP(void)
 	uint32_t msg;
 
 	do {
-		msg = TASK_EVENT_CUSTOM(task_wait_event(-1));
+		msg = task_wait_event(-1);
 		CPRINTS("LB %s() got pending_msg %d", __func__, pending_msg);
 	} while (msg != PENDING_MSG || (
 			 pending_msg != LIGHTBAR_RUN &&
@@ -1329,7 +1323,7 @@ static uint32_t lightbyte_SET_COLOR_SINGLE(void)
 		return EC_RES_INVALID_PARAM;
 
 	for (i = 0; i < NUM_LEDS; i++)
-		if (led & (1 << i))
+		if (led & BIT(i))
 			led_desc[i][control][color] = value;
 
 	return EC_SUCCESS;
@@ -1357,7 +1351,7 @@ static uint32_t lightbyte_SET_COLOR_RGB(void)
 		return EC_RES_INVALID_PARAM;
 
 	for (i = 0; i < NUM_LEDS; i++)
-		if (led & (1 << i)) {
+		if (led & BIT(i)) {
 			led_desc[i][control][LB_COL_RED] = r;
 			led_desc[i][control][LB_COL_GREEN] = g;
 			led_desc[i][control][LB_COL_BLUE] = b;
@@ -1664,9 +1658,7 @@ void lightbar_sequence_f(enum lightbar_sequence num, const char *f)
 		CPRINTS("LB %s() requests %d %s", f, num,
 			lightbar_cmds[num].string);
 		pending_msg = num;
-		task_set_event(TASK_ID_LIGHTBAR,
-			       TASK_EVENT_CUSTOM(PENDING_MSG),
-			       0);
+		task_set_event(TASK_ID_LIGHTBAR, PENDING_MSG);
 	} else
 		CPRINTS("LB %s() requests %d - ignored", f, num);
 }
@@ -1707,7 +1699,7 @@ DECLARE_HOOK(HOOK_CHIPSET_SHUTDOWN, lightbar_shutdown, HOOK_PRIO_DEFAULT);
 /* Host commands via LPC bus */
 /****************************************************************************/
 
-static int lpc_cmd_lightbar(struct host_cmd_handler_args *args)
+static enum ec_status lpc_cmd_lightbar(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_lightbar *in = args->params;
 	struct ec_response_lightbar *out = args->response;

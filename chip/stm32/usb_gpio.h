@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -9,6 +9,7 @@
 
 #include "compile_time_macros.h"
 #include "usb_descriptor.h"
+#include "usb_hw.h"
 
 struct usb_gpio_state {
 	uint32_t set_mask;
@@ -107,14 +108,14 @@ struct usb_gpio_config {
 	{								\
 		usb_gpio_rx(&NAME);					\
 	}								\
-	static void CONCAT2(NAME, _ep_reset)(void)			\
+	static void CONCAT2(NAME, _ep_event)(enum usb_ep_event evt)	\
 	{								\
-		usb_gpio_reset(&NAME);					\
+		usb_gpio_event(&NAME, evt);				\
 	}								\
 	USB_DECLARE_EP(ENDPOINT,					\
 		       CONCAT2(NAME, _ep_tx),				\
 		       CONCAT2(NAME, _ep_rx),				\
-		       CONCAT2(NAME, _ep_reset))
+		       CONCAT2(NAME, _ep_event))
 
 
 /*
@@ -123,6 +124,7 @@ struct usb_gpio_config {
  */
 void usb_gpio_tx(struct usb_gpio_config const *config);
 void usb_gpio_rx(struct usb_gpio_config const *config);
-void usb_gpio_reset(struct usb_gpio_config const *config);
+void usb_gpio_event(struct usb_gpio_config const *config,
+		    enum usb_ep_event evt);
 
 #endif /* __CROS_EC_USB_GPIO_H */

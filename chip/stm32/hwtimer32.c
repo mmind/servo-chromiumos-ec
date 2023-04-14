@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -6,6 +6,7 @@
 /* Hardware 32-bit timer driver */
 
 #include "clock.h"
+#include "clock-f.h"
 #include "common.h"
 #include "hooks.h"
 #include "hwtimer.h"
@@ -72,37 +73,40 @@ void __hw_timer_enable_clock(int n, int enable)
 	 * Mapping of timers to reg/mask is split into a few different ranges,
 	 * some specific to individual chips.
 	 */
-#if defined(CHIP_FAMILY_STM32F0)
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32H7)
 	if (n == 1) {
 		reg = &STM32_RCC_APB2ENR;
 		mask = STM32_RCC_PB2_TIM1;
 	}
-#elif defined(CHIP_FAMILY_STM32L)
+#elif defined(CHIP_FAMILY_STM32L) || defined(CHIP_FAMILY_STM32F4)
 	if (n >= 9 && n <= 11) {
 		reg = &STM32_RCC_APB2ENR;
 		mask = STM32_RCC_PB2_TIM9 << (n - 9);
 	}
 #endif
 
-#if defined(CHIP_FAMILY_STM32F0)
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32H7)
 	if (n >= 15 && n <= 17) {
 		reg = &STM32_RCC_APB2ENR;
 		mask = STM32_RCC_PB2_TIM15 << (n - 15);
 	}
 #endif
 
-#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32F3)
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32F3) || \
+defined(CHIP_FAMILY_STM32H7)
 	if (n == 14) {
 		reg = &STM32_RCC_APB1ENR;
 		mask = STM32_RCC_PB1_TIM14;
 	}
 #endif
 
-#if defined(CHIP_FAMILY_STM32F3)
+#if defined(CHIP_FAMILY_STM32F3) || defined(CHIP_FAMILY_STM32H7)
 	if (n == 12 || n == 13) {
 		reg = &STM32_RCC_APB1ENR;
 		mask = STM32_RCC_PB1_TIM12 << (n - 12);
 	}
+#endif
+#if defined(CHIP_FAMILY_STM32F3)
 	if (n == 18) {
 		reg = &STM32_RCC_APB1ENR;
 		mask = STM32_RCC_PB1_TIM18;
@@ -111,6 +115,17 @@ void __hw_timer_enable_clock(int n, int enable)
 		reg = &STM32_RCC_APB2ENR;
 		mask = STM32_RCC_PB2_TIM19;
 	}
+#endif
+#if defined(CHIP_FAMILY_STM32G4)
+	reg = &STM32_RCC_APB2ENR;
+	if (n == 1)
+		mask = STM32_RCC_APB2ENR_TIM1;
+	else if (n == 8)
+		mask = STM32_RCC_APB2ENR_TIM8;
+	else if (n == 20)
+		mask = STM32_RCC_APB2ENR_TIM20;
+	else if (n >= 15 && n <= 17)
+		mask = STM32_RCC_APB2ENR_TIM15 << (n - 15);
 #endif
 	if (n >= 2 && n <= 7) {
 		reg = &STM32_RCC_APB1ENR;
@@ -126,23 +141,50 @@ void __hw_timer_enable_clock(int n, int enable)
 		*reg &= ~mask;
 }
 
+#if defined(CHIP_FAMILY_STM32L) || defined(CHIP_FAMILY_STM32L4) || \
+	defined(CHIP_FAMILY_STM32F4) || defined(CHIP_FAMILY_STM32H7)
+/* for families using a variable clock feeding the timer */
 static void update_prescaler(void)
 {
+	uint32_t t;
 	/*
 	 * Pre-scaler value :
 	 * the timer is incrementing every microsecond
-	 *
-	 * This will take effect at the next update event (when the current
-	 * prescaler counter ticks down, or if forced via EGR).
 	 */
-	STM32_TIM_PSC(TIM_CLOCK32) = (clock_get_freq() / SECOND) - 1;
+	STM32_TIM_PSC(TIM_CLOCK32) = (clock_get_timer_freq() / SECOND) - 1;
+	/*
+	 * Forcing reloading the pre-scaler,
+	 * but try to maintain a sensible time-keeping while triggering
+	 * the update event.
+	 */
+	interrupt_disable();
+	/* Ignore the next update */
+	STM32_TIM_DIER(TIM_CLOCK32) &= ~0x0001;
+	/*
+	 * prepare to reload the counter with the current value
+	 * to avoid rolling backward the microsecond counter.
+	 */
+	t = STM32_TIM32_CNT(TIM_CLOCK32) + 1;
+	/* issue an update event, reloads the pre-scaler and the counter */
+	STM32_TIM_EGR(TIM_CLOCK32) = 0x0001;
+	/* clear the 'spurious' update unless we were going to roll-over */
+	if (t)
+		STM32_TIM_SR(TIM_CLOCK32) = ~1;
+	/* restore a sensible time value */
+	STM32_TIM32_CNT(TIM_CLOCK32) = t;
+	/* restore roll-over events */
+	STM32_TIM_DIER(TIM_CLOCK32) |= 0x0001;
+	interrupt_enable();
 
 #ifdef CONFIG_WATCHDOG_HELP
 	/* Watchdog timer runs at 1KHz */
-	STM32_TIM_PSC(TIM_WATCHDOG) = (clock_get_freq() / SECOND * MSEC) - 1;
+	STM32_TIM_PSC(TIM_WATCHDOG) =
+		(clock_get_timer_freq()  / SECOND * MSEC)- 1;
 #endif  /* CONFIG_WATCHDOG_HELP */
 }
 DECLARE_HOOK(HOOK_FREQ_CHANGE, update_prescaler, HOOK_PRIO_DEFAULT);
+#endif /* CHIP_FAMILY_STM32L  || CHIP_FAMILY_STM32L4 || */
+	/*  CHIP_FAMILY_STM32F4 || CHIP_FAMILY_STM32H7 */
 
 int __hw_clock_source_init(uint32_t start_t)
 {
@@ -163,8 +205,8 @@ int __hw_clock_source_init(uint32_t start_t)
 	/* Auto-reload value : 32-bit free-running counter */
 	STM32_TIM32_ARR(TIM_CLOCK32) = 0xffffffff;
 
-	/* Update prescaler */
-	update_prescaler();
+	/* Update prescaler to increment every microsecond */
+	STM32_TIM_PSC(TIM_CLOCK32) = (clock_get_timer_freq() / SECOND) - 1;
 
 	/* Reload the pre-scaler */
 	STM32_TIM_EGR(TIM_CLOCK32) = 0x0001;
@@ -209,7 +251,7 @@ void IRQ_HANDLER(IRQ_WD)(void)
 		     "bl watchdog_check\n"
 		     "pop {r0,pc}\n");
 }
-const struct irq_priority IRQ_PRIORITY(IRQ_WD)
+const struct irq_priority __keep IRQ_PRIORITY(IRQ_WD)
 	__attribute__((section(".rodata.irqprio")))
 		= {IRQ_WD, 0}; /* put the watchdog at the highest
 					    priority */
@@ -233,8 +275,9 @@ void hwtimer_setup_watchdog(void)
 	/* AUto-reload value */
 	STM32_TIM_ARR(TIM_WATCHDOG) = CONFIG_AUX_TIMER_PERIOD_MS;
 
-	/* Update prescaler */
-	update_prescaler();
+	/* Update prescaler: watchdog timer runs at 1KHz */
+	STM32_TIM_PSC(TIM_WATCHDOG) =
+		(clock_get_timer_freq() / SECOND * MSEC) - 1;
 
 	/* Reload the pre-scaler */
 	STM32_TIM_EGR(TIM_WATCHDOG) = 0x0001;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 The Chromium OS Authors. All rights reserved.
+/* Copyright 2016 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -13,16 +13,20 @@
 #define I2C_CALIB_ADDRESS		0x3
 #define I2C_INTERRUPT_TIMEOUT		(TICKFREQ / 20)
 #define NS_IN_SEC			1000
-#define DEFAULT_SDA_HOLD		133
+#define DEFAULT_SDA_HOLD		240
+#define DEFAULT_SDA_HOLD_STD		2400
+#define DEFAULT_SDA_HOLD_FAST		600
+#define DEFAULT_SDA_HOLD_FAST_PLUS	300
+#define DEFAULT_SDA_HOLD_HIGH		140
 #define NS_2_COUNTERS(ns, clk)		((ns * clk)/NS_IN_SEC)
 #define COUNTERS_2_NS(counters, clk)	(counters * (NANOSECONDS_IN_SEC / \
 					(clk * HZ_IN_MEGAHZ)))
+#define I2C_TX_FLUSH_TIMEOUT_USEC	200
+
+#define ISH_I2C_FIFO_SIZE 64
+
 
 enum {
-	/* speed mode values */
-	I2C_SPEED_STD = 0,
-	I2C_SPEED_FAST = 1,
-	I2C_SPEED_HIGH = 2,
 	/* freq mode values */
 	I2C_FREQ_25 = 0,
 	I2C_FREQ_50 = 1,
@@ -91,6 +95,7 @@ enum {
 	IC_ENABLE_DISABLE = 0,
 	/* IC_STATUS OFFSETS */
 	IC_STATUS_MASTER_ACTIVITY = 5,
+	IC_STATUS_TFE = 2,
 	/* IC_CON OFFSETS */
 	MASTER_MODE_OFFSET = 0,
 	SPEED_OFFSET = 1,
@@ -143,11 +148,11 @@ enum {
 	TX_BUFFER_DEPTH_OFFSET = 16,
 	RX_BUFFER_DEPTH_OFFSET = 8,
 	/* IC_INTR_MASK VALUES */
-	M_RX_FULL = (1 << 2),
-	M_TX_EMPTY = (1 << 4),
-	M_TX_ABRT = (1 << 6),
-	M_STOP_DET = (1 << 9),
-	M_START_DET = (1 << 10),
+	M_RX_FULL = BIT(2),
+	M_TX_EMPTY = BIT(4),
+	M_TX_ABRT = BIT(6),
+	M_STOP_DET = BIT(9),
+	M_START_DET = BIT(10),
 	IC_INTR_WRITE_MASK_VAL = (M_STOP_DET | M_TX_ABRT),
 	IC_INTR_READ_MASK_VAL = (M_RX_FULL | M_TX_ABRT),
 	DISABLE_INT = 0,
@@ -158,7 +163,7 @@ enum {
 	/* IC_ENABLE_STATUS_VALUES */
 	IC_EN_DISABLED_VAL = 0,
 	IC_EN_DISABLED = (IC_EN_DISABLED_VAL << IC_EN_OFFSET),
-	IC_EN_MASK = (1 << IC_EN_OFFSET),
+	IC_EN_MASK = BIT(IC_EN_OFFSET),
 	/* IC_TX_ABRT_SOURCE bits */
 	ABRT_7B_ADDR_NOACK = 1,
 };
@@ -173,18 +178,27 @@ struct i2c_bus_info {
 	uint8_t bus_id;
 	struct i2c_bus_data std_speed;
 	struct i2c_bus_data fast_speed;
+	struct i2c_bus_data fast_plus_speed;
 	struct i2c_bus_data high_speed;
 } __attribute__ ((__packed__));
+
+enum i2c_speed {
+	I2C_SPEED_100KHZ,	/* 100kHz */
+	I2C_SPEED_400KHZ,	/* 400kHz */
+	I2C_SPEED_1MHZ,		/*   1MHz */
+	I2C_SPEED_3M4HZ,	/* 3.4MHz */
+};
 
 struct i2c_context {
 	uint32_t *base;
 	uint8_t max_rx_depth;
 	uint8_t max_tx_depth;
 	uint8_t bus;
+	enum i2c_speed speed;
 	uint32_t interrupts;
 	uint32_t reason;
+	uint32_t int_pin;
 	uint8_t error_flag;
-	uint8_t speed;
 	task_id_t wait_task_id;
 };
 

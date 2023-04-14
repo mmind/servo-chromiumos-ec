@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -6,13 +6,16 @@
 /* LPC module for Chrome EC */
 
 #include "acpi.h"
+#include "chipset.h"
 #include "clock.h"
 #include "common.h"
 #include "console.h"
 #include "ec2i_chip.h"
+#include "espi.h"
 #include "gpio.h"
 #include "hooks.h"
 #include "host_command.h"
+#include "intc.h"
 #include "irq_chip.h"
 #include "keyboard_protocol.h"
 #include "lpc.h"
@@ -28,8 +31,6 @@
 /* Console output macros */
 #define CPUTS(outstr) cputs(CC_LPC, outstr)
 #define CPRINTS(format, args...) cprints(CC_LPC, format, ## args)
-
-#define LPC_SYSJUMP_TAG 0x4c50  /* "LP" */
 
 /* LPC PM channels */
 enum lpc_pm_ch {
@@ -56,8 +57,6 @@ static uint8_t acpi_ec_memmap[EC_MEMMAP_SIZE]
 static uint8_t host_cmd_memmap[256]
 			__attribute__((section(".h2ram.pool.hostcmd")));
 
-static uint32_t host_events;     /* Currently pending SCI/SMI events */
-static uint32_t event_mask[3];   /* Event masks for each type */
 static struct host_packet lpc_packet;
 static struct host_cmd_handler_args host_cmd_args;
 static uint8_t host_cmd_flags;   /* Flags from host command */
@@ -67,8 +66,6 @@ static uint8_t params_copy[EC_LPC_HOST_PACKET_SIZE] __aligned(4);
 static int init_done;
 static int p80l_index;
 
-static uint8_t * const cmd_params = (uint8_t *)host_cmd_memmap +
-	EC_LPC_ADDR_HOST_PARAM - EC_LPC_ADDR_HOST_ARGS;
 static struct ec_lpc_host_args * const lpc_host_args =
 	(struct ec_lpc_host_args *)host_cmd_memmap;
 
@@ -106,7 +103,7 @@ static void pm_put_data_out(enum lpc_pm_ch ch, uint8_t out)
 static void pm_clear_ibf(enum lpc_pm_ch ch)
 {
 	/* bit7, write-1 clear IBF */
-	IT83XX_PMC_PMIE(ch) |= (1 << 7);
+	IT83XX_PMC_PMIE(ch) |= BIT(7);
 }
 
 #ifdef CONFIG_KEYBOARD_IRQ_GPIO
@@ -139,16 +136,28 @@ static void keyboard_irq_assert(void)
  */
 static void lpc_generate_smi(void)
 {
+#ifdef CONFIG_HOSTCMD_ESPI
+	espi_vw_set_wire(VW_SMI_L, 0);
+	udelay(65);
+	espi_vw_set_wire(VW_SMI_L, 1);
+#else
 	gpio_set_level(GPIO_PCH_SMI_L, 0);
 	udelay(65);
 	gpio_set_level(GPIO_PCH_SMI_L, 1);
+#endif
 }
 
 static void lpc_generate_sci(void)
 {
+#ifdef CONFIG_HOSTCMD_ESPI
+	espi_vw_set_wire(VW_SCI_L, 0);
+	udelay(65);
+	espi_vw_set_wire(VW_SCI_L, 1);
+#else
 	gpio_set_level(GPIO_PCH_SCI_L, 0);
 	udelay(65);
 	gpio_set_level(GPIO_PCH_SCI_L, 1);
+#endif
 }
 
 /**
@@ -156,7 +165,7 @@ static void lpc_generate_sci(void)
  *
  * @param wake_events	Currently asserted wake events
  */
-static void lpc_update_wake(uint32_t wake_events)
+static void lpc_update_wake(host_event_t wake_events)
 {
 	/*
 	 * Mask off power button event, since the AP gets that through a
@@ -212,7 +221,7 @@ static void lpc_send_response(struct host_cmd_handler_args *args)
 	pm_set_status(LPC_HOST_CMD, EC_LPC_STATUS_PROCESSING, 0);
 }
 
-static void update_host_event_status(void)
+void lpc_update_host_event_status(void)
 {
 	int need_sci = 0;
 	int need_smi = 0;
@@ -223,7 +232,7 @@ static void update_host_event_status(void)
 	/* Disable PMC1 interrupt while updating status register */
 	task_disable_irq(IT83XX_IRQ_PMC_IN);
 
-	if (host_events & event_mask[LPC_HOST_EVENT_SMI]) {
+	if (lpc_get_host_events_by_type(LPC_HOST_EVENT_SMI)) {
 		/* Only generate SMI for first event */
 		if (!(pm_get_status(LPC_ACPI_CMD) & EC_LPC_STATUS_SMI_PENDING))
 			need_smi = 1;
@@ -232,7 +241,7 @@ static void update_host_event_status(void)
 		pm_set_status(LPC_ACPI_CMD, EC_LPC_STATUS_SMI_PENDING, 0);
 	}
 
-	if (host_events & event_mask[LPC_HOST_EVENT_SCI]) {
+	if (lpc_get_host_events_by_type(LPC_HOST_EVENT_SCI)) {
 		/* Generate SCI for every event */
 		need_sci = 1;
 		pm_set_status(LPC_ACPI_CMD, EC_LPC_STATUS_SCI_PENDING, 1);
@@ -241,12 +250,13 @@ static void update_host_event_status(void)
 	}
 
 	/* Copy host events to mapped memory */
-	*(uint32_t *)host_get_memmap(EC_MEMMAP_HOST_EVENTS) = host_events;
+	*(host_event_t *)host_get_memmap(EC_MEMMAP_HOST_EVENTS) =
+				lpc_get_host_events();
 
 	task_enable_irq(IT83XX_IRQ_PMC_IN);
 
 	/* Process the wake events. */
-	lpc_update_wake(host_events & event_mask[LPC_HOST_EVENT_WAKE]);
+	lpc_update_wake(lpc_get_host_events_by_type(LPC_HOST_EVENT_WAKE));
 
 	/* Send pulse on SMI signal if needed */
 	if (need_smi)
@@ -327,11 +337,11 @@ void lpc_keyboard_put_char(uint8_t chr, int send_irq)
 
 void lpc_keyboard_clear_buffer(void)
 {
-	uint32_t int_mask = get_int_mask();
-	interrupt_disable();
+	uint32_t int_mask = read_clear_int_mask();
+
 	/* bit6, write-1 clear OBF */
-	IT83XX_KBC_KBHICR |= (1 << 6);
-	IT83XX_KBC_KBHICR &= ~(1 << 6);
+	IT83XX_KBC_KBHICR |= BIT(6);
+	IT83XX_KBC_KBHICR &= ~BIT(6);
 	set_int_mask(int_mask);
 }
 
@@ -357,54 +367,6 @@ void lpc_keyboard_resume_irq(void)
 	}
 }
 
-void lpc_set_host_event_state(uint32_t mask)
-{
-	if (mask != host_events) {
-		host_events = mask;
-		update_host_event_status();
-	}
-}
-
-int lpc_query_host_event_state(void)
-{
-	const uint32_t any_mask = event_mask[0] | event_mask[1] | event_mask[2];
-	int evt_index = 0;
-	int i;
-
-	for (i = 0; i < 32; i++) {
-		const uint32_t e = (1 << i);
-
-		if (host_events & e) {
-			host_clear_events(e);
-
-			/*
-			 * If host hasn't unmasked this event, drop it.  We do
-			 * this at query time rather than event generation time
-			 * so that the host has a chance to unmask events
-			 * before they're dropped by a query.
-			 */
-			if (!(e & any_mask))
-				continue;
-
-			evt_index = i + 1;	/* Events are 1-based */
-			break;
-		}
-	}
-
-	return evt_index;
-}
-
-void lpc_set_host_event_mask(enum lpc_host_event_type type, uint32_t mask)
-{
-	event_mask[type] = mask;
-	update_host_event_status();
-}
-
-uint32_t lpc_get_host_event_mask(enum lpc_host_event_type type)
-{
-	return event_mask[type];
-}
-
 void lpc_set_acpi_status_mask(uint8_t mask)
 {
 	pm_set_status(LPC_ACPI_CMD, mask, 1);
@@ -415,11 +377,14 @@ void lpc_clear_acpi_status_mask(uint8_t mask)
 	pm_set_status(LPC_ACPI_CMD, mask, 0);
 }
 
+#ifndef CONFIG_HOSTCMD_ESPI
 int lpc_get_pltrst_asserted(void)
 {
 	return !gpio_get_level(GPIO_PCH_PLTRST_L);
 }
+#endif
 
+#ifdef HAS_TASK_KEYPROTO
 /* KBC and PMC control modules */
 void lpc_kbc_ibf_interrupt(void)
 {
@@ -427,15 +392,13 @@ void lpc_kbc_ibf_interrupt(void)
 		keyboard_host_write(IT83XX_KBC_KBHIDIR,
 			(IT83XX_KBC_KBHISR & 0x08) ? 1 : 0);
 		/* bit7, write-1 clear IBF */
-		IT83XX_KBC_KBHICR |= (1 << 7);
-		IT83XX_KBC_KBHICR &= ~(1 << 7);
+		IT83XX_KBC_KBHICR |= BIT(7);
+		IT83XX_KBC_KBHICR &= ~BIT(7);
 	}
 
 	task_clear_pending_irq(IT83XX_IRQ_KBC_IN);
 
-#ifdef HAS_TASK_KEYPROTO
 	task_wake(TASK_ID_KEYPROTO);
-#endif
 }
 
 void lpc_kbc_obe_interrupt(void)
@@ -452,10 +415,9 @@ void lpc_kbc_obe_interrupt(void)
 	}
 #endif
 
-#ifdef HAS_TASK_KEYPROTO
 	task_wake(TASK_ID_KEYPROTO);
-#endif
 }
+#endif /* HAS_TASK_KEYPROTO */
 
 void pm1_ibf_interrupt(void)
 {
@@ -599,32 +561,6 @@ void pm5_ibf_interrupt(void)
 	task_clear_pending_irq(IT83XX_IRQ_PMC5_IN);
 }
 
-/**
- * Preserve event masks across a sysjump.
- */
-static void lpc_sysjump(void)
-{
-	system_add_jump_tag(LPC_SYSJUMP_TAG, 1,
-				sizeof(event_mask), event_mask);
-}
-DECLARE_HOOK(HOOK_SYSJUMP, lpc_sysjump, HOOK_PRIO_DEFAULT);
-
-/**
- * Restore event masks after a sysjump.
- */
-static void lpc_post_sysjump(void)
-{
-	const uint32_t *prev_mask;
-	int size, version;
-
-	prev_mask = (const uint32_t *)system_get_jump_tag(LPC_SYSJUMP_TAG,
-							  &version, &size);
-	if (!prev_mask || version != 1 || size != sizeof(event_mask))
-		return;
-
-	memcpy(event_mask, prev_mask, sizeof(event_mask));
-}
-
 static void lpc_init(void)
 {
 	enum ec2i_message ec2i_r;
@@ -666,6 +602,17 @@ static void lpc_init(void)
 	memset(lpc_host_args, 0, sizeof(*lpc_host_args));
 
 	/* Host LPC I/O cycle mapping to RAM */
+#ifdef IT83XX_H2RAM_REMAPPING
+	/*
+	 * On it8xxx2 series, host I/O cycles are mapped to the first block
+	 * (0x80080000~0x80080fff) at default, and it is adjustable.
+	 * We should set the correct offset depends on the base address of
+	 * H2RAM section, so EC will be able to receive/handle commands from
+	 * host.
+	 */
+	IT83XX_GCTRL_H2ROFSR =
+		(CONFIG_H2RAM_BASE - CONFIG_RAM_BASE) / CONFIG_H2RAM_SIZE;
+#endif
 	/*
 	 * bit[4], H2RAM through LPC IO cycle.
 	 * bit[1], H2RAM window 1 enabled.
@@ -741,13 +688,17 @@ static void lpc_init(void)
 	 */
 	IT83XX_GCTRL_SPCTRL1 |= 0xC2;
 
+#ifndef CONFIG_HOSTCMD_ESPI
 	gpio_enable_interrupt(GPIO_PCH_PLTRST_L);
+#endif
 
+#ifdef HAS_TASK_KEYPROTO
 	task_clear_pending_irq(IT83XX_IRQ_KBC_OUT);
 	task_disable_irq(IT83XX_IRQ_KBC_OUT);
 
 	task_clear_pending_irq(IT83XX_IRQ_KBC_IN);
 	task_enable_irq(IT83XX_IRQ_KBC_IN);
+#endif
 
 	task_clear_pending_irq(IT83XX_IRQ_PMC_IN);
 	pm_set_status(LPC_ACPI_CMD, EC_LPC_STATUS_PROCESSING, 0);
@@ -760,14 +711,14 @@ static void lpc_init(void)
 	task_clear_pending_irq(IT83XX_IRQ_PMC3_IN);
 	task_enable_irq(IT83XX_IRQ_PMC3_IN);
 
-	/* Restore event masks if needed */
-	lpc_post_sysjump();
-
+#ifdef CONFIG_HOSTCMD_ESPI
+	espi_init();
+#endif
 	/* Sufficiently initialized */
 	init_done = 1;
 
 	/* Update host events now that we can copy them to memmap */
-	update_host_event_status();
+	lpc_update_host_event_status();
 }
 /*
  * Set prio to higher than default; this way LPC memory mapped data is ready
@@ -775,6 +726,7 @@ static void lpc_init(void)
  */
 DECLARE_HOOK(HOOK_INIT, lpc_init, HOOK_PRIO_INIT_LPC);
 
+#ifndef CONFIG_HOSTCMD_ESPI
 void lpcrst_interrupt(enum gpio_signal signal)
 {
 	if (lpc_get_pltrst_asserted())
@@ -784,6 +736,7 @@ void lpcrst_interrupt(enum gpio_signal signal)
 	CPRINTS("LPC RESET# %sasserted",
 		lpc_get_pltrst_asserted() ? "" : "de");
 }
+#endif
 
 /* Enable LPC ACPI-EC interrupts */
 void lpc_enable_acpi_interrupts(void)
@@ -797,25 +750,13 @@ void lpc_disable_acpi_interrupts(void)
 	task_disable_irq(IT83XX_IRQ_PMC_IN);
 }
 
-static void lpc_resume(void)
-{
-	/* Mask all host events until the host unmasks them itself.  */
-	lpc_set_host_event_mask(LPC_HOST_EVENT_SMI, 0);
-	lpc_set_host_event_mask(LPC_HOST_EVENT_SCI, 0);
-	lpc_set_host_event_mask(LPC_HOST_EVENT_WAKE, 0);
-
-	/* Store port 80 event so we know where resume happened */
-	port_80_write(PORT_80_EVENT_RESUME);
-}
-DECLARE_HOOK(HOOK_CHIPSET_RESUME, lpc_resume, HOOK_PRIO_DEFAULT);
-
 /* Get protocol information */
-static int lpc_get_protocol_info(struct host_cmd_handler_args *args)
+static enum ec_status lpc_get_protocol_info(struct host_cmd_handler_args *args)
 {
 	struct ec_response_get_protocol_info *r = args->response;
 
 	memset(r, 0, sizeof(*r));
-	r->protocol_versions = (1 << 3);
+	r->protocol_versions = BIT(3);
 	r->max_request_packet_size = EC_LPC_HOST_PACKET_SIZE;
 	r->max_response_packet_size = EC_LPC_HOST_PACKET_SIZE;
 	r->flags = 0;

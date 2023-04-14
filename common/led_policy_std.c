@@ -124,6 +124,14 @@ int led_set_brightness(enum ec_led_id led_id, const uint8_t *brightness)
 	return EC_SUCCESS;
 }
 
+#ifdef HAS_TASK_CHIPSET
+static void std_led_shutdown(void)
+{
+	pwr_led_set_color(LED_OFF);
+}
+DECLARE_HOOK(HOOK_CHIPSET_SHUTDOWN, std_led_shutdown, HOOK_PRIO_DEFAULT);
+#endif
+
 static void std_led_set_power(void)
 {
 	static int power_second;
@@ -134,8 +142,7 @@ static void std_led_set_power(void)
 		pwr_led_set_color(LED_OFF);
 	else if (chipset_in_state(CHIPSET_STATE_ON))
 		pwr_led_set_color(LED_WHITE);
-	else if (chipset_in_state(CHIPSET_STATE_SUSPEND |
-			CHIPSET_STATE_STANDBY))
+	else if (chipset_in_state(CHIPSET_STATE_ANY_SUSPEND))
 		pwr_led_set_color((power_second & 3) ? LED_OFF : LED_WHITE);
 }
 

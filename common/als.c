@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -18,6 +18,11 @@
 #include "timer.h"
 #include "util.h"
 
+#define CPUTS(outstr) cputs(CC_ALS, outstr)
+#define CPRINTS(format, args...) cprints(CC_ALS, format, ## args)
+#define CPRINTF(format, args...) cprintf(CC_ALS, format, ## args)
+
+
 #define ALS_POLL_PERIOD SECOND
 
 static int task_timeout = -1;
@@ -28,7 +33,7 @@ int als_read(enum als_id id, int *lux)
 	return als[id].read(lux, af);
 }
 
-void als_task(void)
+void als_task(void *u)
 {
 	int i, val;
 	uint16_t *mapped = (uint16_t *)host_get_memmap(EC_MEMMAP_ALS);
@@ -58,7 +63,7 @@ static void als_task_enable(void)
 		err = als[i].init();
 		if (err) {
 			fail_count++;
-			ccprintf("%s ALS sensor failed to initialize, err=%d\n",
+			CPRINTF("%s ALS sensor failed to initialize, err=%d\n",
 				als[i].name, err);
 		}
 	}
@@ -85,7 +90,7 @@ static void als_task_init(void)
 	 * Enable ALS task in S0 only and may need to re-enable
 	 * when sysjumped.
 	 */
-	if (system_jumped_to_this_image() &&
+	if (system_jumped_late() &&
 		chipset_in_state(CHIPSET_STATE_ON))
 		als_task_enable();
 }

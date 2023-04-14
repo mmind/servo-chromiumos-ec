@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -12,8 +12,8 @@
 #include "i2c.h"
 
 /* I2C address */
-#define BQ24770_ADDR (0x12)
-#define BQ24773_ADDR (0x6a << 1)
+#define BQ24770_ADDR_FLAGS	0x09
+#define BQ24773_ADDR_FLAGS	0x6a
 
 /* Chip specific commands */
 #define BQ24770_CHARGE_OPTION0          0x12
@@ -41,38 +41,22 @@
 #define BQ24773_CHARGE_OPTION2          0x10
 
 /* Option bits */
-#define OPTION0_CHARGE_INHIBIT          (1 << 0)
-#define OPTION0_LEARN_ENABLE            (1 << 5)
+#define OPTION0_CHARGE_INHIBIT          BIT(0)
+#define OPTION0_LEARN_ENABLE            BIT(5)
 #define OPTION0_SWITCHING_FREQ_MASK     (3 << 8)
 #define OPTION0_SWITCHING_FREQ_600KHZ   (0 << 8)
-#define OPTION0_SWITCHING_FREQ_800KHZ   (1 << 8)
+#define OPTION0_SWITCHING_FREQ_800KHZ   BIT(8)
 #define OPTION0_SWITCHING_FREQ_1000KHZ  (2 << 8)
 #define OPTION0_SWITCHING_FREQ_1200KHZ  (3 << 8)
 
-#define OPTION2_EN_EXTILIM              (1 << 7)
+#define OPTION2_EN_EXTILIM              BIT(7)
 
 /* Prochot Option bits */
 #define PROCHOT_OPTION1_SELECTOR_MASK   0x7f /* [6:0] PROCHOT SELECTOR */
 
-/* ChargeCurrent Register - 0x14 (mA) */
-#define CHARGE_I_OFF                    0
-#define CHARGE_I_MIN                    128
-#define CHARGE_I_MAX                    8128
-#define CHARGE_I_STEP                   64
-
-/* MaxChargeVoltage Register - 0x15 (mV) */
-#define CHARGE_V_MIN                    1024
-#define CHARGE_V_MAX                    19200
-#define CHARGE_V_STEP                   16
-
-/* InputCurrent Register - 0x3f (mA) */
-#define INPUT_I_MIN                    128
-#define INPUT_I_MAX                    8128
-#define INPUT_I_STEP                   64
-
 #ifdef CONFIG_CHARGER_BQ24770
 	#define CHARGER_NAME		"bq24770"
-	#define I2C_ADDR_CHARGER	BQ24770_ADDR
+	#define I2C_ADDR_CHARGER_FLAGS	BQ24770_ADDR_FLAGS
 
 	#define REG_CHARGE_OPTION0	BQ24770_CHARGE_OPTION0
 	#define REG_CHARGE_OPTION1	BQ24770_CHARGE_OPTION1
@@ -88,7 +72,7 @@
 
 #elif defined(CONFIG_CHARGER_BQ24773)
 	#define CHARGER_NAME		"bq24773"
-	#define I2C_ADDR_CHARGER	BQ24773_ADDR
+	#define I2C_ADDR_CHARGER_FLAGS	BQ24773_ADDR_FLAGS
 
 	#define REG_CHARGE_OPTION0	BQ24773_CHARGE_OPTION0
 	#define REG_CHARGE_OPTION1	BQ24773_CHARGE_OPTION1
@@ -102,26 +86,6 @@
 	#define REG_DEVICE_ADDRESS	BQ24773_DEVICE_ADDRESS
 #endif
 
-#ifdef CONFIG_CHARGER_BQ24773
-static inline int raw_read8(int offset, int *value)
-{
-	return i2c_read8(I2C_PORT_CHARGER, I2C_ADDR_CHARGER, offset, value);
-}
-
-static inline int raw_write8(int offset, int value)
-{
-	return i2c_write8(I2C_PORT_CHARGER, I2C_ADDR_CHARGER, offset, value);
-}
-#endif
-
-static inline int raw_read16(int offset, int *value)
-{
-	return i2c_read16(I2C_PORT_CHARGER, I2C_ADDR_CHARGER, offset, value);
-}
-
-static inline int raw_write16(int offset, int value)
-{
-	return i2c_write16(I2C_PORT_CHARGER, I2C_ADDR_CHARGER, offset, value);
-}
+extern const struct charger_drv bq2477x_drv;
 
 #endif /* __CROS_EC_BQ24773_H */

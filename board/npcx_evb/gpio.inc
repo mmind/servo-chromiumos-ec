@@ -1,6 +1,6 @@
 /* -*- mode:c -*-
  *
- * Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+ * Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -70,16 +70,24 @@ ALTERNATE(PIN_MASK(D, 0x03), 1,  MODULE_I2C,         0)    /* I2C3SDA/I2C3SCL   
 ALTERNATE(PIN_MASK(4, 0x38), 1,  MODULE_ADC,         0)    /* ADC                     GPIO45/44/43 */
 ALTERNATE(PIN_MASK(A, 0x0A), 1,  MODULE_SPI,         0)    /* SPIP_MOSI/SPIP_SCLK     GPIOA3/A1	   */
 ALTERNATE(PIN_MASK(9, 0x20), 1,  MODULE_SPI,         0)    /* SPIP_MISO               GPIO95       */
-ALTERNATE(PIN_MASK(C, 0x04), 3,  MODULE_PWM,         0)    /* PWM1 for PWM/KBLIGHT Test GPIOC2     */
+ALTERNATE(PIN_MASK(C, 0x04), 1,  MODULE_PWM,         0)    /* PWM1 for PWM/KBLIGHT Test GPIOC2     */
 /* Alternative functionality for FANS */
 #ifdef CONFIG_FANS
-ALTERNATE(PIN_MASK(C, 0x08), 7,  MODULE_PWM,         0)    /* PWM0 for PWM/FAN Test   GPIOC3       */
+ALTERNATE(PIN_MASK(C, 0x08), 1,  MODULE_PWM,         0)    /* PWM0 for PWM/FAN Test GPIOC3 */
 #if NPCX_TACH_SEL2
-ALTERNATE(PIN_MASK(9, 0x08), 3,  MODULE_PWM,         0)    /* MFT-1/TA1_TACH1 for FAN GPIO93       */
+ALTERNATE(PIN_MASK(9, 0x08), 1,  MODULE_PWM,         0)    /* TA1_SL2 GPIO93 for tachometer input */
 #else
-ALTERNATE(PIN_MASK(4, 0x01), 3,  MODULE_PWM,         0)    /* MFT-1/TA1_TACH1 for FAN Test GPIO40  */
-#endif
-#endif
+ALTERNATE(PIN_MASK(4, 0x01), 1,  MODULE_PWM,         0)    /* TA1_SL1 GPIO40 for tachometer input */
+#endif /* NPCX_TACH_SEL2 */
+#if (CONFIG_FANS == 2)
+ALTERNATE(PIN_MASK(C, 0x10), 1,  MODULE_PWM,         0)    /* PWM2 for PWM/FAN Test GPIOC4 */
+#if NPCX_TACH_SEL2
+ALTERNATE(PIN_MASK(A, 0x40), 1,  MODULE_PWM,         0)    /* TA2_SL2 GPIOA6 for tachometer input */
+#else
+ALTERNATE(PIN_MASK(7, 0x08), 1,  MODULE_PWM,         0)    /* TA2_SL1 GPIO73 for tachometer input */
+#endif /* NPCX_TACH_SEL2 */
+#endif /* (CONFIG_FANS == 2) */
+#endif /* CONFIG_FANS */
 
 /* Keyboard Columns */
 ALTERNATE(PIN_MASK(0, 0xE0), 0,  MODULE_KEYBOARD_SCAN, 0)

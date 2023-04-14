@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -16,13 +16,14 @@
 #include "task.h"
 #include "tcpm.h"
 #include "timer.h"
+#include "usb_pd.h"
 #include "usb_pd_tcpm.h"
 #include "util.h"
 
 #define CPRINTS(format, args...) cprints(CC_PD_HOST_CMD, format, ## args)
 
-#define TASK_EVENT_EXCHANGE_PD_STATUS  TASK_EVENT_CUSTOM(1)
-#define TASK_EVENT_HIBERNATING         TASK_EVENT_CUSTOM(2)
+#define TASK_EVENT_EXCHANGE_PD_STATUS  TASK_EVENT_CUSTOM_BIT(0)
+#define TASK_EVENT_HIBERNATING         TASK_EVENT_CUSTOM_BIT(1)
 
 /* Define local option for if we are a TCPM with an off chip TCPC */
 #if defined(CONFIG_USB_POWER_DELIVERY) && !defined(CONFIG_USB_PD_TCPM_STUB)
@@ -50,12 +51,12 @@ void host_command_pd_send_status(enum pd_charge_state new_chg_state)
 		charge_state = new_chg_state;
 #endif
 	/* Wake PD HC task to send status */
-	task_set_event(TASK_ID_PDCMD, TASK_EVENT_EXCHANGE_PD_STATUS, 0);
+	task_set_event(TASK_ID_PDCMD, TASK_EVENT_EXCHANGE_PD_STATUS);
 }
 
 void host_command_pd_request_hibernate(void)
 {
-	task_set_event(TASK_ID_PDCMD, TASK_EVENT_HIBERNATING, 0);
+	task_set_event(TASK_ID_PDCMD, TASK_EVENT_HIBERNATING);
 }
 
 #ifdef CONFIG_HOSTCMD_PD
@@ -126,7 +127,7 @@ static void pd_check_chg_status(struct ec_response_pd_status *pd_status)
 
 	/* Set input current limit */
 	rv = charge_set_input_current_limit(MAX(pd_status->curr_lim_ma,
-					CONFIG_CHARGER_INPUT_CURRENT));
+					CONFIG_CHARGER_INPUT_CURRENT), 0);
 	if (rv < 0)
 		CPRINTS("Failed to set input curr limit from PD MCU");
 }
@@ -138,8 +139,9 @@ static void pd_service_tcpc_ports(uint16_t port_status)
 {
 	int i;
 
-	for (i = 0; i < CONFIG_USB_PD_PORT_COUNT; i++) {
-		if (port_status & (PD_STATUS_TCPC_ALERT_0 << i))
+	for (i = 0; i < board_get_usb_pd_port_count(); i++) {
+		if ((port_status & (PD_STATUS_TCPC_ALERT_0 << i)) &&
+		    pd_is_port_enabled(i))
 			tcpc_alert(i);
 	}
 }
@@ -205,7 +207,7 @@ static void pd_exchange_status(uint32_t ec_state)
 #endif /* USB_TCPM_WITH_OFF_CHIP_TCPC */
 }
 
-void pd_command_task(void)
+void pd_command_task(void *u)
 {
 	/* On startup exchange status with the PD */
 	pd_exchange_status(0);
@@ -225,36 +227,3 @@ void pd_command_task(void)
 	}
 }
 
-#if defined(USB_TCPM_WITH_OFF_CHIP_TCPC) && defined(CONFIG_HOSTCMD_EVENTS)
-/*
- * PD host event status for host command
- * Note: this variable must be aligned on 4-byte boundary because we pass the
- * address to atomic_ functions which use assembly to access them.
- */
-static uint32_t pd_host_event_status __aligned(4);
-
-static int hc_pd_host_event_status(struct host_cmd_handler_args *args)
-{
-	struct ec_response_host_event_status *r = args->response;
-
-	/* Read and clear the host event status to return to AP */
-	r->status = atomic_read_clear(&pd_host_event_status);
-
-	args->response_size = sizeof(*r);
-	return EC_RES_SUCCESS;
-}
-DECLARE_HOST_COMMAND(EC_CMD_PD_HOST_EVENT_STATUS, hc_pd_host_event_status,
-		     EC_VER_MASK(0));
-
-/* Send host event up to AP */
-void pd_send_host_event(int mask)
-{
-	/* mask must be set */
-	if (!mask)
-		return;
-
-	atomic_or(&pd_host_event_status, mask);
-	/* interrupt the AP */
-	host_set_single_event(EC_HOST_EVENT_PD_MCU);
-}
-#endif

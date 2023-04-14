@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -8,6 +8,7 @@
 #include "cpu.h"
 #include "host_command.h"
 #include "panic.h"
+#include "panic-internal.h"
 #include "printf.h"
 #include "system.h"
 #include "task.h"
@@ -105,6 +106,10 @@ void panic_data_print(const struct panic_data *pdata)
 
 void __keep report_panic(void)
 {
+	/*
+	 * Don't need to get pointer via get_panic_data_write()
+	 * because memory below pdata_ptr is stack now (see exception_panic())
+	 */
 	struct panic_data *pdata = pdata_ptr;
 	uint32_t sp;
 
@@ -138,7 +143,6 @@ void __keep report_panic(void)
  *
  * Declare this as a naked call so we can extract raw LR and IPSR values.
  */
-__keep void exception_panic(void) __attribute__((naked));
 void exception_panic(void)
 {
 	/* Save registers and branch directly to panic handler */
@@ -172,18 +176,22 @@ void software_panic(uint32_t reason, uint32_t info)
 		"mov " STRINGIFY(SOFTWARE_PANIC_REASON_REG) ", %1\n"
 		"bl exception_panic\n"
 		: : "r"(info), "r"(reason));
+	__builtin_unreachable();
 }
 
 void panic_set_reason(uint32_t reason, uint32_t info, uint8_t exception)
 {
-	uint32_t *lregs = pdata_ptr->cm.regs;
+	struct panic_data * const pdata = get_panic_data_write();
+	uint32_t *lregs;
+
+	lregs = pdata->cm.regs;
 
 	/* Setup panic data structure */
-	memset(pdata_ptr, 0, sizeof(*pdata_ptr));
-	pdata_ptr->magic = PANIC_DATA_MAGIC;
-	pdata_ptr->struct_size = sizeof(*pdata_ptr);
-	pdata_ptr->struct_version = 2;
-	pdata_ptr->arch = PANIC_ARCH_CORTEX_M;
+	memset(pdata, 0, CONFIG_PANIC_DATA_SIZE);
+	pdata->magic = PANIC_DATA_MAGIC;
+	pdata->struct_size = CONFIG_PANIC_DATA_SIZE;
+	pdata->struct_version = 2;
+	pdata->arch = PANIC_ARCH_CORTEX_M;
 
 	/* Log panic cause */
 	lregs[1] = exception;
@@ -193,10 +201,11 @@ void panic_set_reason(uint32_t reason, uint32_t info, uint8_t exception)
 
 void panic_get_reason(uint32_t *reason, uint32_t *info, uint8_t *exception)
 {
-	uint32_t *lregs = pdata_ptr->cm.regs;
+	struct panic_data * const pdata = panic_get_data();
+	uint32_t *lregs;
 
-	if (pdata_ptr->magic == PANIC_DATA_MAGIC &&
-	    pdata_ptr->struct_version == 2) {
+	if (pdata && pdata->struct_version == 2) {
+		lregs = pdata->cm.regs;
 		*exception = lregs[1];
 		*reason = lregs[3];
 		*info = lregs[4];

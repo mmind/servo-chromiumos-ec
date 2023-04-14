@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -24,12 +24,8 @@
 #define CPUTS(outstr) cputs(CC_LPC, outstr)
 #define CPRINTS(format, args...) cprints(CC_LPC, format, ## args)
 
-#define LPC_SYSJUMP_TAG 0x4c50  /* "LP" */
-
 static uint8_t mem_mapped[0x200] __attribute__((section(".bss.big_align")));
 
-static uint32_t host_events;     /* Currently pending SCI/SMI events */
-static uint32_t event_mask[3];   /* Event masks for each type */
 static struct host_packet lpc_packet;
 static struct host_cmd_handler_args host_cmd_args;
 static uint8_t host_cmd_flags;   /* Flags from host command */
@@ -97,7 +93,7 @@ static void lpc_generate_sci(void)
  *
  * @param wake_events	Currently asserted wake events
  */
-static void lpc_update_wake(uint32_t wake_events)
+static void lpc_update_wake(host_event_t wake_events)
 {
 	/*
 	 * Mask off power button event, since the AP gets that through a
@@ -126,7 +122,7 @@ static uint8_t *lpc_get_hostcmd_data_range(void)
  *   - SMI pulse via PCH_SMI_L GPIO
  *   - SCI pulse via PCH_SCI_L GPIO
  */
-static void update_host_event_status(void)
+void lpc_update_host_event_status(void)
 {
 	int need_sci = 0;
 	int need_smi = 0;
@@ -137,7 +133,7 @@ static void update_host_event_status(void)
 	/* Disable LPC interrupt while updating status register */
 	task_disable_irq(MEC1322_IRQ_ACPIEC0_IBF);
 
-	if (host_events & event_mask[LPC_HOST_EVENT_SMI]) {
+	if (lpc_get_host_events_by_type(LPC_HOST_EVENT_SMI)) {
 		/* Only generate SMI for first event */
 		if (!(MEC1322_ACPI_EC_STATUS(0) & EC_LPC_STATUS_SMI_PENDING))
 			need_smi = 1;
@@ -146,7 +142,7 @@ static void update_host_event_status(void)
 		MEC1322_ACPI_EC_STATUS(0) &= ~EC_LPC_STATUS_SMI_PENDING;
 	}
 
-	if (host_events & event_mask[LPC_HOST_EVENT_SCI]) {
+	if (lpc_get_host_events_by_type(LPC_HOST_EVENT_SCI)) {
 		/* Generate SCI for every event */
 		need_sci = 1;
 		MEC1322_ACPI_EC_STATUS(0) |= EC_LPC_STATUS_SCI_PENDING;
@@ -155,12 +151,13 @@ static void update_host_event_status(void)
 	}
 
 	/* Copy host events to mapped memory */
-	*(uint32_t *)host_get_memmap(EC_MEMMAP_HOST_EVENTS) = host_events;
+	*(host_event_t *)host_get_memmap(EC_MEMMAP_HOST_EVENTS) =
+				lpc_get_host_events();
 
 	task_enable_irq(MEC1322_IRQ_ACPIEC0_IBF);
 
 	/* Process the wake events. */
-	lpc_update_wake(host_events & event_mask[LPC_HOST_EVENT_WAKE]);
+	lpc_update_wake(lpc_get_host_events_by_type(LPC_HOST_EVENT_WAKE));
 
 	/* Send pulse on SMI signal if needed */
 	if (need_smi)
@@ -184,34 +181,6 @@ static void lpc_send_response_packet(struct host_packet *pkt)
 	MEC1322_ACPI_EC_STATUS(1) &= ~EC_LPC_STATUS_PROCESSING;
 }
 
-/**
- * Preserve event masks across a sysjump.
- */
-static void lpc_sysjump(void)
-{
-	system_add_jump_tag(LPC_SYSJUMP_TAG, 1,
-				sizeof(event_mask), event_mask);
-}
-DECLARE_HOOK(HOOK_SYSJUMP, lpc_sysjump, HOOK_PRIO_DEFAULT);
-
-/**
- * Restore event masks after a sysjump.
- */
-static void lpc_post_sysjump(void)
-{
-	const uint32_t *prev_mask;
-	int size, version;
-
-	prev_mask = (const uint32_t *)system_get_jump_tag(LPC_SYSJUMP_TAG,
-							  &version, &size);
-	if (!prev_mask || version != 1 || size != sizeof(event_mask))
-		return;
-
-	memcpy(event_mask, prev_mask, sizeof(event_mask));
-}
-
-
-
 /*
  * Most registers in LPC module are reset when the host is off. We need to
  * set up LPC again when the host is starting up.
@@ -221,23 +190,23 @@ static void setup_lpc(void)
 	gpio_config_module(MODULE_LPC, 1);
 
 	/* Set up interrupt on LRESET# deassert */
-	MEC1322_INT_SOURCE(19) = 1 << 1;
-	MEC1322_INT_ENABLE(19) |= 1 << 1;
-	MEC1322_INT_BLK_EN |= 1 << 19;
+	MEC1322_INT_SOURCE(19) = BIT(1);
+	MEC1322_INT_ENABLE(19) |= BIT(1);
+	MEC1322_INT_BLK_EN |= BIT(19);
 	task_enable_irq(MEC1322_IRQ_GIRQ19);
 
 	/* Set up ACPI0 for 0x62/0x66 */
 	MEC1322_LPC_ACPI_EC0_BAR = 0x00628304;
-	MEC1322_INT_ENABLE(15) |= 1 << 6;
-	MEC1322_INT_BLK_EN |= 1 << 15;
+	MEC1322_INT_ENABLE(15) |= BIT(6);
+	MEC1322_INT_BLK_EN |= BIT(15);
 	/* Clear STATUS_PROCESSING bit in case it was set during sysjump */
 	MEC1322_ACPI_EC_STATUS(0) &= ~EC_LPC_STATUS_PROCESSING;
 	task_enable_irq(MEC1322_IRQ_ACPIEC0_IBF);
 
 	/* Set up ACPI1 for 0x200/0x204 */
 	MEC1322_LPC_ACPI_EC1_BAR = 0x02008407;
-	MEC1322_INT_ENABLE(15) |= 1 << 8;
-	MEC1322_INT_BLK_EN |= 1 << 15;
+	MEC1322_INT_ENABLE(15) |= BIT(8);
+	MEC1322_INT_BLK_EN |= BIT(15);
 	MEC1322_ACPI_EC_STATUS(1) &= ~EC_LPC_STATUS_PROCESSING;
 	task_enable_irq(MEC1322_IRQ_ACPIEC1_IBF);
 
@@ -245,24 +214,24 @@ static void setup_lpc(void)
 	MEC1322_LPC_8042_BAR = 0x00608104;
 
 	/* Set up indication of Auxiliary sts */
-	MEC1322_8042_KB_CTRL |= 1 << 7;
+	MEC1322_8042_KB_CTRL |= BIT(7);
 
 	MEC1322_8042_ACT |= 1;
-	MEC1322_INT_ENABLE(15) |= ((1 << 13) | (1 << 14));
-	MEC1322_INT_BLK_EN |= 1 << 15;
+	MEC1322_INT_ENABLE(15) |= (BIT(13) | BIT(14));
+	MEC1322_INT_BLK_EN |= BIT(15);
 	task_enable_irq(MEC1322_IRQ_8042EM_IBF);
 	task_enable_irq(MEC1322_IRQ_8042EM_OBF);
 
 #ifndef CONFIG_KEYBOARD_IRQ_GPIO
 	/* Set up SERIRQ for keyboard */
-	MEC1322_8042_KB_CTRL |= (1 << 5);
+	MEC1322_8042_KB_CTRL |= BIT(5);
 	MEC1322_LPC_SIRQ(1) = 0x01;
 #endif
 
 	/* Set up EMI module for memory mapped region, base address 0x800 */
 	MEC1322_LPC_EMI_BAR = 0x0800800f;
-	MEC1322_INT_ENABLE(15) |= 1 << 2;
-	MEC1322_INT_BLK_EN |= 1 << 15;
+	MEC1322_INT_ENABLE(15) |= BIT(2);
+	MEC1322_INT_BLK_EN |= BIT(15);
 	task_enable_irq(MEC1322_IRQ_EMI);
 
 	/* Access data RAM through alias address */
@@ -288,27 +257,9 @@ static void setup_lpc(void)
 	init_done = 1;
 
 	/* Update host events now that we can copy them to memmap */
-	update_host_event_status();
+	lpc_update_host_event_status();
 }
 DECLARE_HOOK(HOOK_CHIPSET_STARTUP, setup_lpc, HOOK_PRIO_FIRST);
-
-static void lpc_resume(void)
-{
-#ifdef CONFIG_POWER_S0IX
-	if (chipset_in_state(CHIPSET_STATE_SUSPEND | CHIPSET_STATE_ON))
-#endif
-	{
-		/* Mask all host events until the host unmasks them itself.  */
-		lpc_set_host_event_mask(LPC_HOST_EVENT_SMI, 0);
-		lpc_set_host_event_mask(LPC_HOST_EVENT_SCI, 0);
-		lpc_set_host_event_mask(LPC_HOST_EVENT_WAKE, 0);
-	}
-	/* Store port 80 event so we know where resume happened */
-	port_80_write(PORT_80_EVENT_RESUME);
-}
-DECLARE_HOOK(HOOK_CHIPSET_RESUME, lpc_resume, HOOK_PRIO_DEFAULT);
-
-
 
 static void lpc_init(void)
 {
@@ -326,9 +277,6 @@ static void lpc_init(void)
 	memset(lpc_get_memmap_range(), 0, EC_MEMMAP_SIZE);
 
 	setup_lpc();
-
-	/* Restore event masks if needed */
-	lpc_post_sysjump();
 }
 /*
  * Set prio to higher than default; this way LPC memory mapped data is ready
@@ -347,7 +295,7 @@ DECLARE_DEFERRED(lpc_chipset_reset);
 void girq19_interrupt(void)
 {
 	/* Check interrupt result for LRESET# trigger */
-	if (MEC1322_INT_RESULT(19) & (1 << 1)) {
+	if (MEC1322_INT_RESULT(19) & BIT(1)) {
 		/* Initialize LPC module when LRESET# is deasserted */
 		if (!lpc_get_pltrst_asserted()) {
 			setup_lpc();
@@ -365,7 +313,7 @@ void girq19_interrupt(void)
 			lpc_get_pltrst_asserted() ? "" : "de");
 
 		/* Clear interrupt source */
-		MEC1322_INT_SOURCE(19) = 1 << 1;
+		MEC1322_INT_SOURCE(19) = BIT(1);
 	}
 }
 DECLARE_IRQ(MEC1322_IRQ_GIRQ19, girq19_interrupt, 1);
@@ -475,7 +423,7 @@ void kb_ibf_interrupt(void)
 {
 	if (lpc_keyboard_input_pending())
 		keyboard_host_write(MEC1322_8042_H2E,
-				    MEC1322_8042_STS & (1 << 3));
+				    MEC1322_8042_STS & BIT(3));
 	task_wake(TASK_ID_KEYPROTO);
 }
 DECLARE_IRQ(MEC1322_IRQ_8042EM_IBF, kb_ibf_interrupt, 1);
@@ -489,12 +437,12 @@ DECLARE_IRQ(MEC1322_IRQ_8042EM_OBF, kb_obf_interrupt, 1);
 
 int lpc_keyboard_has_char(void)
 {
-	return (MEC1322_8042_STS & (1 << 0)) ? 1 : 0;
+	return (MEC1322_8042_STS & BIT(0)) ? 1 : 0;
 }
 
 int lpc_keyboard_input_pending(void)
 {
-	return (MEC1322_8042_STS & (1 << 1)) ? 1 : 0;
+	return (MEC1322_8042_STS & BIT(1)) ? 1 : 0;
 }
 
 void lpc_keyboard_put_char(uint8_t chr, int send_irq)
@@ -506,63 +454,15 @@ void lpc_keyboard_put_char(uint8_t chr, int send_irq)
 
 void lpc_keyboard_clear_buffer(void)
 {
-	volatile char dummy __attribute__((unused));
+	volatile char unused __attribute__((unused));
 
-	dummy = MEC1322_8042_OBF_CLR;
+	unused = MEC1322_8042_OBF_CLR;
 }
 
 void lpc_keyboard_resume_irq(void)
 {
 	if (lpc_keyboard_has_char())
 		keyboard_irq_assert();
-}
-
-void lpc_set_host_event_state(uint32_t mask)
-{
-	if (mask != host_events) {
-		host_events = mask;
-		update_host_event_status();
-	}
-}
-
-int lpc_query_host_event_state(void)
-{
-	const uint32_t any_mask = event_mask[0] | event_mask[1] | event_mask[2];
-	int evt_index = 0;
-	int i;
-
-	for (i = 0; i < 32; i++) {
-		const uint32_t e = (1 << i);
-
-		if (host_events & e) {
-			host_clear_events(e);
-
-			/*
-			 * If host hasn't unmasked this event, drop it.  We do
-			 * this at query time rather than event generation time
-			 * so that the host has a chance to unmask events
-			 * before they're dropped by a query.
-			 */
-			if (!(e & any_mask))
-				continue;
-
-			evt_index = i + 1;	/* Events are 1-based */
-			break;
-		}
-	}
-
-	return evt_index;
-}
-
-void lpc_set_host_event_mask(enum lpc_host_event_type type, uint32_t mask)
-{
-	event_mask[type] = mask;
-	update_host_event_status();
-}
-
-uint32_t lpc_get_host_event_mask(enum lpc_host_event_type type)
-{
-	return event_mask[type];
 }
 
 void lpc_set_acpi_status_mask(uint8_t mask)
@@ -601,12 +501,12 @@ static int lpc_command_init(int argc, char **argv)
 DECLARE_CONSOLE_COMMAND(lpcinit, lpc_command_init, NULL, NULL);
 
 /* Get protocol information */
-static int lpc_get_protocol_info(struct host_cmd_handler_args *args)
+static enum ec_status lpc_get_protocol_info(struct host_cmd_handler_args *args)
 {
 	struct ec_response_get_protocol_info *r = args->response;
 
 	memset(r, 0, sizeof(*r));
-	r->protocol_versions = (1 << 3);
+	r->protocol_versions = BIT(3);
 	r->max_request_packet_size = EC_LPC_HOST_PACKET_SIZE;
 	r->max_response_packet_size = EC_LPC_HOST_PACKET_SIZE;
 	r->flags = 0;
@@ -618,50 +518,3 @@ static int lpc_get_protocol_info(struct host_cmd_handler_args *args)
 DECLARE_HOST_COMMAND(EC_CMD_GET_PROTOCOL_INFO,
 		lpc_get_protocol_info,
 		EC_VER_MASK(0));
-
-#ifdef CONFIG_POWER_S0IX
-static void lpc_clear_host_events(void)
-{
-	while (lpc_query_host_event_state() != 0);
-}
-
-/*
- * In AP S0 -> S3 & S0ix transitions,
- * the chipset_suspend is called.
- *
- * The chipset_in_state(CHIPSET_STATE_STANDBY | CHIPSET_STATE_ON)
- * is used to detect the S0ix transition.
- *
- * During S0ix entry, the wake mask for lid open is enabled.
- *
- */
-void lpc_enable_wake_mask_for_lid_open(void)
-{
-	if ((chipset_in_state(CHIPSET_STATE_STANDBY | CHIPSET_STATE_ON)) ||
-				chipset_in_state(CHIPSET_STATE_STANDBY)) {
-		uint32_t mask = 0;
-
-		mask = ((lpc_get_host_event_mask(LPC_HOST_EVENT_WAKE)) |
-			EC_HOST_EVENT_MASK(EC_HOST_EVENT_LID_OPEN));
-
-		lpc_set_host_event_mask(LPC_HOST_EVENT_WAKE, mask);
-}	}
-
-/*
- * In AP S0ix & S3 -> S0 transitions,
- * the chipset_resume hook is called.
- *
- * During S0ix exit, the wake mask for lid open is disabled.
- * All pending events are cleared
- *
- */
-void lpc_disable_wake_mask_for_lid_open(void)
-{
-	if ((chipset_in_state(CHIPSET_STATE_STANDBY | CHIPSET_STATE_ON)) ||
-				chipset_in_state(CHIPSET_STATE_ON)) {
-		lpc_set_host_event_mask(LPC_HOST_EVENT_WAKE, 0);
-		lpc_clear_host_events();
-	}
-}
-
-#endif

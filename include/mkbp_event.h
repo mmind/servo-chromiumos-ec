@@ -9,6 +9,15 @@
 #define __CROS_EC_MKBP_EVENT_H
 
 /*
+ * Last time the host received an interrupt.
+ *
+ * Retrieved via __hw_clock_source_read() as close as possible
+ * to the interrupt source. Intended to be virtually the same time the
+ * first line of the AP hard irq for the EC interrupt.
+ */
+extern uint32_t mkbp_last_event_time;
+
+/*
  * Sends an event to the AP.
  *
  * When this is called, the event data must be ready for query.  Otherwise,
@@ -18,6 +27,13 @@
  * @return   True if event succeeded to generate host interrupt.
  */
 int mkbp_send_event(uint8_t event_type);
+
+/*
+ * Communicate an MKBP event to the AP via custom method.
+ *
+ * This can be used if a board has a custom method.
+ */
+int mkbp_set_host_active_via_custom(int active, uint32_t *timestamp);
 
 /*
  * The struct to store the event source definition.  The get_data routine is
@@ -31,7 +47,8 @@ struct mkbp_event_source {
 };
 
 #define DECLARE_EVENT_SOURCE(type, func)                       \
-	const struct mkbp_event_source __keep __evt_src_##type \
+	const struct mkbp_event_source __keep		       \
+	__no_sanitize_address _evt_src_##type		       \
 	__attribute__((section(".rodata.evtsrcs")))            \
 		 = {type, func}
 

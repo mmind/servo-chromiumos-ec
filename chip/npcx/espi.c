@@ -8,6 +8,7 @@
 #include "registers.h"
 #include "system.h"
 #include "task.h"
+#include "chipset.h"
 #include "console.h"
 #include "uart.h"
 #include "util.h"
@@ -60,13 +61,13 @@ struct vw_event_t {
 
 /* Default settings of VWEVMS registers (Please refer Table.43/44) */
 static const struct vwevms_config_t espi_in_list[] = {
-	/* IDX EN ENPL ENESP IE             VW Event Bit 0 - 3 (M->S)         */
-	{0x02,  1,  0,  0,  0},  /* SLP_S3#,   SLP_S4#,    SLP_S5,    Reserve */
-	{0x03,  1,  0,  1,  0},  /* SUS_STAT#, PLTRST#,    ORST_WARN, Reserve */
-	{0x07,  1,  1,  1,  0},  /* HRST_WARN, SMIOUT#,    NMIOUT#,   Reserve */
-	{0x41,  1,  0,  1,  0},  /* SUS_WARN#, SPWRDN_ACK, Reserve,   SLP_A#  */
-	{0x42,  1,  0,  0,  0},  /* SLP_LAN#,  SLP_WAN#,   Reserve,   Reserve */
-	{0x47,  1,  1,  1,  0},  /* HOST_C10,  Reserve,    Reserve,   Reserve */
+	/* IDX EN ENPL ENESP IE/WE          VW Event Bit 0 - 3 (M->S)         */
+	{0x02,  1,  0,  0,  1},  /* SLP_S3#,   SLP_S4#,    SLP_S5#,   Reserve */
+	{0x03,  1,  0,  1,  1},  /* SUS_STAT#, PLTRST#,    ORST_WARN, Reserve */
+	{0x07,  1,  1,  1,  1},  /* HRST_WARN, SMIOUT#,    NMIOUT#,   Reserve */
+	{0x41,  1,  0,  1,  1},  /* SUS_WARN#, SPWRDN_ACK, Reserve,   SLP_A#  */
+	{0x42,  1,  0,  0,  1},  /* SLP_LAN#,  SLP_WAN#,   Reserve,   Reserve */
+	{0x47,  1,  1,  1,  1},  /* HOST_C10,  Reserve,    Reserve,   Reserve */
 };
 
 /* Default settings of VWEVSM registers (Please refer Table.43/44) */
@@ -85,7 +86,7 @@ static const struct vwevsm_config_t espi_out_list[] = {
 /* eSPI interrupts used in MIWU */
 static const struct host_wui_item espi_vw_int_list[] = {
 	/* ESPI_RESET  */
-	{MIWU_TABLE_0, MIWU_GROUP_5, 5, MIWU_EDGE_RISING},
+	{MIWU_TABLE_0, MIWU_GROUP_5, 5, MIWU_EDGE_FALLING},
 	/* SLP_S3 */
 	{MIWU_TABLE_2, MIWU_GROUP_1, 0, MIWU_EDGE_ANYING},
 	/* SLP_S4 */
@@ -189,8 +190,8 @@ static void espi_vw_config_out(const struct vwevsm_config_t *config)
 			index = VWEVSM_IDX_GET(NPCX_VWEVSM(i));
 			/* Set VW output register */
 			if (index == config->idx) {
-				/* Get Wire field */
-				val = NPCX_VWEVSM(i) & 0x0F;
+				/* Preserve WIRE(3-0) and HW_WIRE (27-24). */
+				val = NPCX_VWEVSM(i) & 0x0F00000F;
 				val |= VWEVSM_FIELD(config->idx,
 						config->idx_en,
 						config->valid,
@@ -232,6 +233,9 @@ static void espi_enable_vw_int(const struct host_wui_item *vwire_int)
 		/* enable Any Edge */
 		SET_BIT(NPCX_WKAEDG(table, group), num);
 
+	/* Clear the pending bit */
+	NPCX_WKPCL(table, group) = BIT(num);
+
 	/* Enable wake-up input sources */
 	SET_BIT(NPCX_WKEN(table, group), num);
 }
@@ -256,8 +260,9 @@ static int espi_vw_get_signal_index(enum espi_vw_signal event)
 /* The ISRs of VW signals which used for power sequences */
 void espi_vw_power_signal_interrupt(enum espi_vw_signal signal)
 {
-	/* TODO: Add VW handler in power/common.c */
-	power_signal_interrupt((enum gpio_signal) signal);
+	if (IS_ENABLED(CONFIG_HOST_ESPI_VW_POWER_SIGNAL))
+		/* TODO: Add VW handler in power/common.c */
+		power_signal_interrupt((enum gpio_signal) signal);
 }
 
 /*****************************************************************************/
@@ -272,7 +277,8 @@ void espi_vw_power_signal_interrupt(enum espi_vw_signal signal)
  */
 int espi_vw_set_wire(enum espi_vw_signal signal, uint8_t level)
 {
-	uint8_t offset, sig_idx, value;
+	uint8_t offset, value;
+	int sig_idx;
 
 	/* Get index of vw signal list by signale name */
 	sig_idx = espi_vw_get_signal_index(signal);
@@ -313,7 +319,8 @@ int espi_vw_set_wire(enum espi_vw_signal signal, uint8_t level)
  */
 int espi_vw_get_wire(enum espi_vw_signal signal)
 {
-	uint8_t offset, sig_idx, value;
+	uint8_t offset, value;
+	int sig_idx;
 
 	/* Get index of vw signal list by signale name */
 	sig_idx = espi_vw_get_signal_index(signal);
@@ -500,7 +507,7 @@ void __espi_wk2a_interrupt(void)
 	if (IS_BIT_SET(pending_bits, 6))
 		espi_vw_evt_oobrst();
 }
-DECLARE_IRQ(NPCX_IRQ_WKINTA_2, __espi_wk2a_interrupt, 2);
+DECLARE_IRQ(NPCX_IRQ_WKINTA_2, __espi_wk2a_interrupt, 3);
 
 /* Handle eSPI virtual wire interrupt 2 */
 void __espi_wk2b_interrupt(void)
@@ -516,7 +523,7 @@ void __espi_wk2b_interrupt(void)
 	if (IS_BIT_SET(pending_bits, 0))
 		espi_vw_evt_hostrst_warn();
 }
-DECLARE_IRQ(NPCX_IRQ_WKINTB_2, __espi_wk2b_interrupt, 2);
+DECLARE_IRQ(NPCX_IRQ_WKINTB_2, __espi_wk2b_interrupt, 3);
 
 /* Interrupt handler for eSPI status changed */
 void espi_interrupt(void)
@@ -524,7 +531,15 @@ void espi_interrupt(void)
 	int chan;
 	uint32_t mask, status;
 
+#if NPCX_FAMILY_VERSION >= NPCX_FAMILY_NPCX7
+	/*
+	 * Bit 17 of ESPIIE is reserved. We need to set the same bit in mask
+	 * in case bit 17 in ESPISTS of npcx7 is not cleared in ISR.
+	 */
+	mask = NPCX_ESPIIE | BIT(NPCX_ESPISTS_VWUPDW);
+#else
 	mask = NPCX_ESPIIE;
+#endif
 	status = NPCX_ESPISTS & mask;
 
 	while (status) {
@@ -542,6 +557,7 @@ void espi_interrupt(void)
 		} /* eSPI reset (from eSPI_rst pin) */
 		else if (IS_BIT_SET(status, NPCX_ESPISTS_ESPIRST)) {
 			CPRINTS("eSPI RST");
+			chipset_handle_espi_reset_assert();
 			espi_reset_recovery();
 		}
 
@@ -583,7 +599,7 @@ void espi_interrupt(void)
 		status = NPCX_ESPISTS & mask;
 	}
 }
-DECLARE_IRQ(NPCX_IRQ_ESPI, espi_interrupt, 3);
+DECLARE_IRQ(NPCX_IRQ_ESPI, espi_interrupt, 4);
 
 /*****************************************************************************/
 /* eSPI Initialization functions */
@@ -595,12 +611,12 @@ void espi_init(void)
 	NPCX_ESPICFG |= ESPI_SUPP_CH_ALL;
 
 	/* Support all I/O modes */
-	SET_FIELD(NPCX_ESPICFG, NPCX_ESPICFG_IOMODE_FILED,
+	SET_FIELD(NPCX_ESPICFG, NPCX_ESPICFG_IOMODE_FIELD,
 		NPCX_ESPI_IO_MODE_ALL);
 
-	/* Max freq 66 MHz of eSPI */
-	SET_FIELD(NPCX_ESPICFG, NPCX_ESPICFG_MAXFREQ_FILED,
-			NPCX_ESPI_MAXFREQ_66);
+	/* Set eSPI speed to max supported */
+	SET_FIELD(NPCX_ESPICFG, NPCX_ESPICFG_MAXFREQ_FIELD,
+		  NPCX_ESPI_MAXFREQ_MAX);
 
 	/* Configure Master-to-Slave Virtual Wire indexes (Inputs) */
 	for (i = 0; i < ARRAY_SIZE(espi_in_list); i++)
@@ -651,7 +667,7 @@ static int command_espi(int argc, char **argv)
 
 		if (*e)
 			return EC_ERROR_PARAM2;
-		if (m < 0 || m > 4)
+		if (m > 4)
 			return EC_ERROR_PARAM2;
 		else if (m == 4)
 			chan = 0x0F;
@@ -670,4 +686,3 @@ static int command_espi(int argc, char **argv)
 DECLARE_CONSOLE_COMMAND(espi, command_espi,
 			"cfg/vms/vsm/en/dis [channel]",
 			"eSPI configurations");
-

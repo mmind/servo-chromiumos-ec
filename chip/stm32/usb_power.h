@@ -11,60 +11,64 @@
 #include "compile_time_macros.h"
 #include "hooks.h"
 #include "usb_descriptor.h"
-#include "usb_dwc_hw.h"
+#include "usb_hw.h"
 
 /*
  * Command:
+ *
+ *     Commands are a 16 bit value, with optional command dependent data.
  *     +--------------+-----------------------------------+
  *     | command : 2B |					  |
  *     +--------------+-----------------------------------+
  *
- *     command:	2 bytes
+ *     Responses are an 8 bit status value, with optional data.
+ *     +----------+-----------------------------------+
+ *     | res : 1B |				      |
+ *     +----------+-----------------------------------+
  *
  *     reset:	0x0000
- *
  *     +--------+
  *     | 0x0000 |
  *     +--------+
  *
  *     stop:	0x0001
- *
  *     +--------+
  *     | 0x0001 |
  *     +--------+
  *
  *     addina:	0x0002
- *
- *     +--------+--------------------------+-------------+--------------+-----------+-------------+--------+
- *     | 0x0002 | 1B: 4b: extender 4b: bus | 1B:INA type | 1B: INA addr | 1B: extra | 4B: voltage | 4B: Rs |
- *     +--------+--------------------------+-------------+--------------+-----------+-------------+--------+
+ *     +--------+--------------------------+-------------+--------------+-----------+--------+
+ *     | 0x0002 | 1B: 4b: extender 4b: bus | 1B:INA type | 1B: INA addr | 1B: extra | 4B: Rs |
+ *     +--------+--------------------------+-------------+--------------+-----------+--------+
  *
  *     start:	0x0003
- *
  *     +--------+----------------------+
  *     | 0x0003 | 4B: integration time |
  *     +--------+----------------------+
  *
- *     next:	0x0004
+ *     start response:
+ *     +-------------+-----------------------------+
+ *     | status : 1B | Actual integration time: 4B |
+ *     +-------------+-----------------------------+
  *
+ *     next:	0x0004
  *     +--------+
  *     | 0x0004 |
  *     +--------+
  *
- *     settime:	0x0005
+ *     next response:
+ *     +-------------+----------+----------------+----------------------------+
+ *     | status : 1B | size: 1B | timestamp : 8B | payload : may span packets |
+ *     +-------------+----------+----------------+----------------------------+
  *
+ *     settime:	0x0005
  *     +--------+---------------------+
  *     | 0x0005 | 8B: Wall clock time |
  *     +--------+---------------------+
  *
  *
+ *     Status: 1 byte status
  *
- * Response:
- *     +-------------+----------+----------------+------------------+
- *     | status : 1B | size: 1B | timestamp : 8B | payload : <= 58B | Pad to multiple of 4 byte.
- *     +-------------+----------+----------------+------------------+
- *
- *     status: 1 byte status
  *	 0x00: Success
  *	 0x01: I2C Error
  *	 0x02: Overflow
@@ -75,16 +79,16 @@
  *	 0x06: Busy, outgoing queue is empty.
  *	 0x07: Size, command length is incorrect for command type..
  *	 0x08: More INAs specified than board limit.
+ *	 0x09: Invalid input, eg. invalid INA type.
  *	 0x80: Unknown error
  *
  *     size: 1 byte incoming INA reads count
  *
  *     timestamp: 4 byte timestamp associated with these samples
  *
- *     read payload: up to 58 bytes of data, 29x INA reads of current
- *
  */
 
+/* 8b status field. */
 enum usb_power_error {
 	USB_POWER_SUCCESS		= 0x00,
 	USB_POWER_ERROR_I2C		= 0x01,
@@ -95,9 +99,11 @@ enum usb_power_error {
 	USB_POWER_ERROR_BUSY		= 0x06,
 	USB_POWER_ERROR_READ_SIZE	= 0x07,
 	USB_POWER_ERROR_FULL		= 0x08,
+	USB_POWER_ERROR_INVAL		= 0x09,
 	USB_POWER_ERROR_UNKNOWN		= 0x80,
 };
 
+/* 16b command field. */
 enum usb_power_command {
 	USB_POWER_CMD_RESET	= 0x0000,
 	USB_POWER_CMD_STOP	= 0x0001,
@@ -107,6 +113,15 @@ enum usb_power_command {
 	USB_POWER_CMD_SETTIME	= 0x0005,
 };
 
+/* Addina "INA Type" field. */
+enum usb_power_ina_type {
+	USBP_INA231_POWER	= 0x01,
+	USBP_INA231_BUSV	= 0x02,
+	USBP_INA231_CURRENT	= 0x03,
+	USBP_INA231_SHUNTV	= 0x04,
+};
+
+/* Internal state machine values */
 enum usb_power_states {
 	USB_POWER_STATE_OFF	= 0,
 	USB_POWER_STATE_SETUP,
@@ -123,7 +138,7 @@ struct usb_power_ina_cfg {
 	/* i2c bus. TODO(nsanders): specify what kind of index. */
 	int port;
 	/* 7-bit i2c addr */
-	int addr;
+	uint16_t addr_flags;
 
 	/* Base voltage. mV */
 	int mv;
@@ -132,6 +147,11 @@ struct usb_power_ina_cfg {
 	int rs;
 	/* uA per div as reported from INA */
 	int scale;
+
+	/* Is this power, shunt voltage, bus voltage, or current? */
+	int type;
+	/* Is this INA returning the one value only and can use readagain? */
+	int shared;
 };
 
 
@@ -223,7 +243,7 @@ struct __attribute__ ((__packed__)) usb_power_command_addina {
 	uint16_t command;
 	uint8_t port;
 	uint8_t type;
-	uint8_t addr;
+	uint8_t addr_flags;
 	uint8_t extra;
 	uint32_t rs;
 };
@@ -324,14 +344,14 @@ union usb_power_command_data {
 	};								\
 	static void CONCAT2(NAME, _ep_tx_)   (void) { usb_epN_tx(ENDPOINT); } \
 	static void CONCAT2(NAME, _ep_rx_)   (void) { usb_epN_rx(ENDPOINT); } \
-	static void CONCAT2(NAME, _ep_reset_)(void)			\
+	static void CONCAT2(NAME, _ep_event_)(enum usb_ep_event evt)	\
 	{								\
-			usb_power_reset(&NAME);				\
+			usb_power_event(&NAME, evt);			\
 	}								\
 	USB_DECLARE_EP(ENDPOINT,					\
 		       CONCAT2(NAME, _ep_tx_),				\
 		       CONCAT2(NAME, _ep_rx_),				\
-		       CONCAT2(NAME, _ep_reset_));			\
+		       CONCAT2(NAME, _ep_event_));			\
 	static void CONCAT2(NAME, _deferred_tx_)(void)			\
 	{ usb_power_deferred_tx(&NAME); }				\
 	static void CONCAT2(NAME, _deferred_rx_)(void)			\
@@ -353,7 +373,8 @@ void usb_power_deferred_cap(struct usb_power_config const *config);
  */
 void usb_power_tx(struct usb_power_config const *config);
 void usb_power_rx(struct usb_power_config const *config);
-void usb_power_reset(struct usb_power_config const *config);
+void usb_power_event(struct usb_power_config const *config,
+		enum usb_ep_event evt);
 
 
 

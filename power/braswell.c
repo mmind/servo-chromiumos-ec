@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -53,9 +53,10 @@
 static int throttle_cpu;      /* Throttle CPU? */
 static int forcing_shutdown;  /* Forced shutdown in progress? */
 
-void chipset_force_shutdown(void)
+void chipset_force_shutdown(enum chipset_shutdown_reason reason)
 {
-	CPRINTS("%s()", __func__);
+	CPRINTS("%s(%d)", __func__, reason);
+	report_ap_reset(reason);
 
 	/*
 	 * Force power off. This condition will reset once the state machine
@@ -68,42 +69,27 @@ void chipset_force_shutdown(void)
 	forcing_shutdown = 1;
 }
 
-void chipset_reset(int cold_reset)
+void chipset_reset(enum chipset_reset_reason reason)
 {
-	CPRINTS("%s(%d)", __func__, cold_reset);
-	if (cold_reset) {
-		/*
-		 * Drop and restore PWROK.  This causes the PCH to reboot,
-		 * regardless of its after-G3 setting.  This type of reboot
-		 * causes the PCH to assert PLTRST#, SLP_S3#, and SLP_S5#, so
-		 * we actually drop power to the rest of the system (hence, a
-		 * "cold" reboot).
-		 */
+	CPRINTS("%s: %d", __func__, reason);
+	report_ap_reset(reason);
 
-		/* Ignore if PWROK is already low */
-		if (gpio_get_level(GPIO_PCH_SYS_PWROK) == 0)
-			return;
-
-		/* PWROK must deassert for at least 3 RTC clocks = 91 us */
-		gpio_set_level(GPIO_PCH_SYS_PWROK, 0);
-		udelay(100);
-		gpio_set_level(GPIO_PCH_SYS_PWROK, 1);
-
-	} else {
-		/*
-		 * Send a reset pulse to the PCH.  This just causes it to
-		 * assert INIT# to the CPU without dropping power or asserting
-		 * PLTRST# to reset the rest of the system.  The PCH uses a 16
-		 * ms debounce time, so assert the signal for twice that.
-		 */
-		gpio_set_level(GPIO_PCH_RCIN_L, 0);
-		usleep(32 * MSEC);
-		gpio_set_level(GPIO_PCH_RCIN_L, 1);
-	}
+	/*
+	 * Send a reset pulse to the PCH.  This just causes it to
+	 * assert INIT# to the CPU without dropping power or asserting
+	 * PLTRST# to reset the rest of the system.  The PCH uses a 16
+	 * ms debounce time, so assert the signal for twice that.
+	 */
+	gpio_set_level(GPIO_PCH_RCIN_L, 0);
+	usleep(32 * MSEC);
+	gpio_set_level(GPIO_PCH_RCIN_L, 1);
 }
 
 void chipset_throttle_cpu(int throttle)
 {
+#ifdef CONFIG_CPU_PROCHOT_ACTIVE_LOW
+	throttle = !throttle;
+#endif /* CONFIG_CPU_PROCHOT_ACTIVE_LOW */
 	if (chipset_in_state(CHIPSET_STATE_ON))
 		gpio_set_level(GPIO_CPU_PROCHOT, throttle);
 }
@@ -154,7 +140,7 @@ enum power_state power_handle_state(enum power_state state)
 		CPRINTS("Exit SOC G3");
 
 		if (power_wait_signals(IN_PGOOD_S5)) {
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_WAIT);
 			return POWER_G3;
 		}
 
@@ -181,7 +167,7 @@ enum power_state power_handle_state(enum power_state state)
 		/* Check for state transitions */
 		if (!power_has_signals(IN_PGOOD_S3)) {
 			/* Required rail went away */
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_POWERFAIL);
 			return POWER_S3S5;
 		} else if (gpio_get_level(GPIO_PCH_SLP_S3_L) == 1) {
 			/* Power up to next state */
@@ -198,7 +184,7 @@ enum power_state power_handle_state(enum power_state state)
 		/*wireless_set_state(WIRELESS_ON);*/
 
 		if (!power_has_signals(IN_PGOOD_S3)) {
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_POWERFAIL);
 
 		/*wireless_set_state(WIRELESS_OFF);*/
 			return POWER_S3S5;
@@ -223,7 +209,11 @@ enum power_state power_handle_state(enum power_state state)
 		 * Throttle CPU if necessary.  This should only be asserted
 		 * when +VCCP is powered (it is by now).
 		 */
+#ifdef CONFIG_CPU_PROCHOT_ACTIVE_LOW
+		gpio_set_level(GPIO_CPU_PROCHOT, !throttle_cpu);
+#else
 		gpio_set_level(GPIO_CPU_PROCHOT, throttle_cpu);
+#endif /* CONFIG_CPU_PROCHOT_ACTIVE_LOW */
 
 		/* Set SYS and CORE PWROK */
 		gpio_set_level(GPIO_PCH_SYS_PWROK, 1);
@@ -234,7 +224,7 @@ enum power_state power_handle_state(enum power_state state)
 	case POWER_S0:
 
 		if (!power_has_signals(IN_PGOOD_ALWAYS_ON)) {
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_POWERFAIL);
 			return POWER_S0S3;
 		}
 
@@ -278,6 +268,9 @@ enum power_state power_handle_state(enum power_state state)
 		hook_notify(HOOK_CHIPSET_SHUTDOWN);
 
 		/*wireless_set_state(WIRELESS_OFF);*/
+
+		/* Call hooks after we remove power rails */
+		hook_notify(HOOK_CHIPSET_SHUTDOWN_COMPLETE);
 
 		/* Start shutting down */
 		return power_get_pause_in_s5() ? POWER_S5 : POWER_S5G3;

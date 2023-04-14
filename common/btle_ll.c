@@ -152,7 +152,7 @@ uint8_t ll_reset(void)
 	ll_state = UNINITIALIZED;
 	radio_disable();
 
-	ble_radio_clear_white_list();
+	ble_radio_clear_allow_list();
 
 	return HCI_SUCCESS;
 }
@@ -312,35 +312,35 @@ uint8_t initialize_connection(void)
 	return HCI_SUCCESS;
 }
 
-/* White List */
-uint8_t ll_clear_white_list(void)
+/* Allow List */
+uint8_t ll_clear_allow_list(void)
 {
-	if (ble_radio_clear_white_list() == EC_SUCCESS)
+	if (ble_radio_clear_allow_list() == EC_SUCCESS)
 		return HCI_SUCCESS;
 	else
 		return HCI_ERR_Hardware_Failure;
 }
 
-uint8_t ll_read_white_list_size(uint8_t *return_params)
+uint8_t ll_read_allow_list_size(uint8_t *return_params)
 {
-	if (ble_radio_read_white_list_size(return_params) == EC_SUCCESS)
+	if (ble_radio_read_allow_list_size(return_params) == EC_SUCCESS)
 		return HCI_SUCCESS;
 	else
 		return HCI_ERR_Hardware_Failure;
 }
 
-uint8_t ll_add_device_to_white_list(uint8_t *params)
+uint8_t ll_add_device_to_allow_list(uint8_t *params)
 {
-	if (ble_radio_add_device_to_white_list(&params[1], params[0]) ==
+	if (ble_radio_add_device_to_allow_list(&params[1], params[0]) ==
 			EC_SUCCESS)
 		return HCI_SUCCESS;
 	else
 		return HCI_ERR_Host_Rejected_Due_To_Limited_Resources;
 }
 
-uint8_t ll_remove_device_from_white_list(uint8_t *params)
+uint8_t ll_remove_device_from_allow_list(uint8_t *params)
 {
-	if (ble_radio_remove_device_from_white_list(&params[1], params[0]) ==
+	if (ble_radio_remove_device_from_allow_list(&params[1], params[0]) ==
 			EC_SUCCESS)
 		return HCI_SUCCESS;
 	else
@@ -619,10 +619,10 @@ int ble_ll_adv(int chan)
 int ble_ll_adv_event(void)
 {
 	int chan_idx;
-	int rv;
+	int rv = EC_SUCCESS;
 
 	for (chan_idx = 0; chan_idx < 3; chan_idx++) {
-		if (ll_adv_params.advChannelMap & (1 << chan_idx)) {
+		if (ll_adv_params.advChannelMap & BIT(chan_idx)) {
 			rv = ble_ll_adv(chan_idx + 37);
 			if (rv != EC_SUCCESS)
 				return rv;
@@ -644,7 +644,7 @@ void print_connection_state(void)
 	CPRINTF("interval(hex): %x\n", conn_params.interval);
 	CPRINTF("latency(hex): %x\n", conn_params.latency);
 	CPRINTF("timeout(hex): %x\n", conn_params.timeout);
-	CPRINTF("channel_map(hex): %lx\n", conn_params.channel_map);
+	CPRINTF("channel_map(hex): %llx\n", conn_params.channel_map);
 	CPRINTF("hop(hex): %x\n", conn_params.hop_increment);
 	CPRINTF("SCA(hex): %x\n", conn_params.sleep_clock_accuracy);
 	CPRINTF("transmitWindowOffset: %d\n", conn_params.transmitWindowOffset);
@@ -766,7 +766,7 @@ void bluetooth_ll_task(void)
 		case ADVERTISING:
 
 			if (deadline.val == 0) {
-				CPRINTS("ADV @%p", &ll_adv_pdu);
+				CPRINTS("ADV @%pP", &ll_adv_pdu);
 				deadline.val = get_time().val +
 					(uint32_t)ll_adv_timeout_us;
 				ll_adv_events = 0;
@@ -846,7 +846,7 @@ void bluetooth_ll_task(void)
 
 			if (ll_state == STANDBY) {
 				CPRINTF("Exiting connection state/Entering "
-					"Standby state after %d connections ",
+					"Standby state after %d connections "
 					"events\n", ll_conn_events);
 				print_connection_state();
 			}

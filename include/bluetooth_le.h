@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -139,7 +139,7 @@ struct ble_adv_header {
 
 /* LL SCA Values.  They are shifted left 5 bits for Hop values */
 #define BLE_LL_SCA_251_PPM_TO_500_PPM    (0 << 5)
-#define BLE_LL_SCA_151_PPM_TO_250_PPM    (1 << 5)
+#define BLE_LL_SCA_151_PPM_TO_250_PPM    BIT(5)
 #define BLE_LL_SCA_101_PPM_TO_150_PPM    (2 << 5)
 #define BLE_LL_SCA_076_PPM_TO_100_PPM    (3 << 5)
 #define BLE_LL_SCA_051_PPM_TO_075_PPM    (4 << 5)
@@ -382,11 +382,11 @@ void dump_ble_addr(uint8_t *mem, char *name);
 
 void dump_ble_packet(struct ble_pdu *ble_p);
 
-/* Radio-specific white list handling */
-int ble_radio_clear_white_list(void);
-int ble_radio_read_white_list_size(uint8_t *ret_size);
-int ble_radio_add_device_to_white_list(const uint8_t *addr_ptr, uint8_t rand);
-int ble_radio_remove_device_from_white_list(const uint8_t *addr_ptr,
+/* Radio-specific allow list handling */
+int ble_radio_clear_allow_list(void);
+int ble_radio_read_allow_list_size(uint8_t *ret_size);
+int ble_radio_add_device_to_allow_list(const uint8_t *addr_ptr, uint8_t rand);
+int ble_radio_remove_device_from_allow_list(const uint8_t *addr_ptr,
 					    uint8_t rand);
 
 #endif /* __CROS_EC_BLE_H */

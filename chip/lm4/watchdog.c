@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -48,7 +48,7 @@ void IRQ_HANDLER(LM4_IRQ_WATCHDOG)(void)
 		     "b task_resched_if_needed\n"
 			: : [irq] "i" (LM4_IRQ_WATCHDOG));
 }
-const struct irq_priority IRQ_PRIORITY(LM4_IRQ_WATCHDOG)
+const struct irq_priority __keep IRQ_PRIORITY(LM4_IRQ_WATCHDOG)
 	__attribute__((section(".rodata.irqprio")))
 		= {LM4_IRQ_WATCHDOG, 0}; /* put the watchdog at the highest
 					    priority */
@@ -65,7 +65,7 @@ void watchdog_reload(void)
 	if (status) {
 		LM4_WATCHDOG_ICR(0) = status;
 		/* That doesn't seem to unpend the watchdog interrupt (even if
-		 * we do dummy writes to force the write to be committed), so
+		 * we do writes to force the write to be committed), so
 		 * explicitly unpend the interrupt before re-enabling it. */
 		task_clear_pending_irq(LM4_IRQ_WATCHDOG);
 		task_enable_irq(LM4_IRQ_WATCHDOG);
@@ -101,7 +101,7 @@ int watchdog_init(void)
 	LM4_WATCHDOG_LOCK(0) = LM4_WATCHDOG_MAGIC_WORD;
 
 	/* De-activate the watchdog when the JTAG stops the CPU */
-	LM4_WATCHDOG_TEST(0) |= 1 << 8;
+	LM4_WATCHDOG_TEST(0) |= BIT(8);
 
 	/* Reset after 2 time-out, activate the watchdog and lock the control
 	 * register. */

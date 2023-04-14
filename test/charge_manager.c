@@ -26,6 +26,8 @@ const int supplier_priority[] = {
 	[CHARGE_SUPPLIER_TEST6] = 3,
 	[CHARGE_SUPPLIER_TEST7] = 5,
 	[CHARGE_SUPPLIER_TEST8] = 6,
+	[CHARGE_SUPPLIER_TEST9] = 6,
+	[CHARGE_SUPPLIER_TEST10] = 7,
 };
 BUILD_ASSERT((int)CHARGE_SUPPLIER_COUNT == (int)CHARGE_SUPPLIER_TEST_COUNT);
 BUILD_ASSERT(ARRAY_SIZE(supplier_priority) == CHARGE_SUPPLIER_COUNT);
@@ -33,13 +35,19 @@ BUILD_ASSERT(ARRAY_SIZE(supplier_priority) == CHARGE_SUPPLIER_COUNT);
 static unsigned int active_charge_limit = CHARGE_SUPPLIER_NONE;
 static unsigned int active_charge_port = CHARGE_PORT_NONE;
 static unsigned int charge_port_to_reject = CHARGE_PORT_NONE;
-static int new_power_request[CONFIG_USB_PD_PORT_COUNT];
-static int power_role[CONFIG_USB_PD_PORT_COUNT];
+static int new_power_request[CONFIG_USB_PD_PORT_MAX_COUNT];
+static enum pd_power_role power_role[CONFIG_USB_PD_PORT_MAX_COUNT];
 
 /* Callback functions called by CM on state change */
-void board_set_charge_limit(int port, int supplier, int charge_ma, int max_ma)
+void board_set_charge_limit(int port, int supplier, int charge_ma,
+			    int max_ma, int charge_mv)
 {
 	active_charge_limit = charge_ma;
+}
+
+__override uint8_t board_get_usb_pd_port_count(void)
+{
+	return CONFIG_USB_PD_PORT_MAX_COUNT;
 }
 
 /* Sets a charge port that will be rejected as the active port. */
@@ -67,15 +75,10 @@ void pd_set_new_power_request(int port)
 	new_power_request[port] = 1;
 }
 
-enum battery_present battery_is_present(void)
-{
-	return BP_YES;
-}
-
 static void clear_new_power_requests(void)
 {
 	int i;
-	for (i = 0; i < CONFIG_USB_PD_PORT_COUNT; ++i)
+	for (i = 0; i < board_get_usb_pd_port_count(); ++i)
 		new_power_request[i] = 0;
 }
 
@@ -84,7 +87,7 @@ static void pd_set_role(int port, int role)
 	power_role[port] = role;
 }
 
-int pd_get_role(int port)
+enum pd_power_role pd_get_power_role(int port)
 {
 	return power_role[port];
 }
@@ -112,7 +115,7 @@ static void initialize_charge_table(int current, int voltage, int ceil)
 	charge.current = current;
 	charge.voltage = voltage;
 
-	for (i = 0; i < CONFIG_USB_PD_PORT_COUNT; ++i) {
+	for (i = 0; i < board_get_usb_pd_port_count(); ++i) {
 		for (j = 0; j < CEIL_REQUESTOR_COUNT; ++j)
 			charge_manager_set_ceil(i, j, ceil);
 		charge_manager_update_dualrole(i, CAP_DEDICATED);
@@ -138,12 +141,12 @@ static int test_initialization(void)
 
 	/* Initialize all supplier/port pairs, except for the last one */
 	for (i = 0; i < CHARGE_SUPPLIER_COUNT; ++i)
-		for (j = 0; j < CONFIG_USB_PD_PORT_COUNT; ++j) {
+		for (j = 0; j < board_get_usb_pd_port_count(); ++j) {
 			if (i == 0)
 				charge_manager_update_dualrole(j,
 							       CAP_DEDICATED);
 			if (i == CHARGE_SUPPLIER_COUNT - 1 &&
-			    j == CONFIG_USB_PD_PORT_COUNT - 1)
+			    j == board_get_usb_pd_port_count() - 1)
 				break;
 			charge_manager_update_charge(i, j, &charge);
 		}
@@ -154,11 +157,53 @@ static int test_initialization(void)
 
 	/* Update last pair and verify a charge port has been selected */
 	charge_manager_update_charge(CHARGE_SUPPLIER_COUNT-1,
-				     CONFIG_USB_PD_PORT_COUNT-1,
+				     board_get_usb_pd_port_count()-1,
 				     &charge);
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port != CHARGE_PORT_NONE);
 
+	return EC_SUCCESS;
+}
+
+static int test_safe_mode(void)
+{
+	int port = 0;
+	struct charge_port_info charge;
+
+	/* Initialize table to no charge */
+	initialize_charge_table(0, 5000, 5000);
+
+	/*
+	 * Set a 2A non-dedicated charger on port 0 and verify that
+	 * it is selected, due to safe mode.
+	 */
+	charge_manager_update_dualrole(port, CAP_DUALROLE);
+	charge.current = 2000;
+	charge.voltage = 5000;
+	charge_manager_update_charge(CHARGE_SUPPLIER_TEST2, port, &charge);
+	wait_for_charge_manager_refresh();
+	TEST_ASSERT(active_charge_port == port);
+	TEST_ASSERT(active_charge_limit == 2000);
+
+	/* Verify ceil is ignored, due to safe mode. */
+	charge_manager_set_ceil(port, 0, 500);
+	wait_for_charge_manager_refresh();
+	TEST_ASSERT(active_charge_limit == 2000);
+
+	/*
+	 * Leave safe mode and verify normal port selection rules go
+	 * into effect.
+	 */
+	charge_manager_leave_safe_mode();
+	wait_for_charge_manager_refresh();
+#ifdef CONFIG_CHARGE_MANAGER_DRP_CHARGING
+	TEST_ASSERT(active_charge_port == port);
+	TEST_ASSERT(active_charge_limit == 500);
+#else
+	TEST_ASSERT(active_charge_port == CHARGE_PORT_NONE);
+#endif
+
+	/* For subsequent tests, safe mode is exited. */
 	return EC_SUCCESS;
 }
 
@@ -287,6 +332,14 @@ static int test_charge_ceil(void)
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == 1);
 	TEST_ASSERT(active_charge_limit == 2500);
+
+	/* Verify forced ceil takes effect immediately */
+	charge_manager_force_ceil(1, 500);
+	TEST_ASSERT(active_charge_port == 1);
+	TEST_ASSERT(active_charge_limit == 500);
+	wait_for_charge_manager_refresh();
+	TEST_ASSERT(active_charge_port == 1);
+	TEST_ASSERT(active_charge_limit == 500);
 
 	return EC_SUCCESS;
 }
@@ -417,7 +470,7 @@ static int test_override(void)
 	charge_manager_update_dualrole(0, CAP_DUALROLE);
 	charge_manager_set_override(OVERRIDE_DONT_CHARGE);
 	wait_for_charge_manager_refresh();
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SOURCE);
 
 	/*
 	 * Verify that an override request to a dual-role source port
@@ -430,14 +483,14 @@ static int test_override(void)
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == 0);
 	TEST_ASSERT(active_charge_limit == 200);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SINK);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SINK);
 
 	/* Set override to "don't charge", then verify we're not charging */
 	charge_manager_set_override(OVERRIDE_DONT_CHARGE);
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == CHARGE_PORT_NONE);
 	TEST_ASSERT(active_charge_limit == 0);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SOURCE);
 
 	/* Update a charge supplier, verify that we still aren't charging */
 	charge.current = 200;
@@ -445,14 +498,14 @@ static int test_override(void)
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == CHARGE_PORT_NONE);
 	TEST_ASSERT(active_charge_limit == 0);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SOURCE);
 
 	/* Turn override off, verify that we go back to the correct charge */
 	charge_manager_set_override(OVERRIDE_OFF);
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == 1);
 	TEST_ASSERT(active_charge_limit == 500);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SOURCE);
 
 	return EC_SUCCESS;
 }
@@ -485,7 +538,7 @@ static int test_dual_role(void)
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == 0);
 	TEST_ASSERT(active_charge_limit == 500);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SINK);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SINK);
 
 	/* Remove override and verify we go back to previous state */
 	charge_manager_set_override(OVERRIDE_OFF);
@@ -496,7 +549,7 @@ static int test_dual_role(void)
 #else
 	TEST_ASSERT(active_charge_port == CHARGE_PORT_NONE);
 	TEST_ASSERT(active_charge_limit == 0);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SOURCE);
 #endif
 
 	/* Mark P0 as the override port, verify that we again charge. */
@@ -506,7 +559,7 @@ static int test_dual_role(void)
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == 0);
 	TEST_ASSERT(active_charge_limit == 550);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SINK);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SINK);
 
 	/*
 	 * Insert a dual-role charger into P1 and set the override. Verify
@@ -519,8 +572,8 @@ static int test_dual_role(void)
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == 1);
 	TEST_ASSERT(active_charge_limit == 500);
-	TEST_ASSERT(pd_get_role(1) == PD_ROLE_SINK);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(1) == PD_ROLE_SINK);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SOURCE);
 
 	/* Set override back to P0 and verify switch */
 	charge_manager_set_override(0);
@@ -529,8 +582,8 @@ static int test_dual_role(void)
 	wait_for_charge_manager_refresh();
 	TEST_ASSERT(active_charge_port == 0);
 	TEST_ASSERT(active_charge_limit == 600);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SINK);
-	TEST_ASSERT(pd_get_role(1) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SINK);
+	TEST_ASSERT(pd_get_power_role(1) == PD_ROLE_SOURCE);
 
 	/* Insert a dedicated charger and verify override is removed */
 	charge.current = 0;
@@ -546,7 +599,7 @@ static int test_dual_role(void)
 #else
 	TEST_ASSERT(active_charge_port == 1);
 	TEST_ASSERT(active_charge_limit == 400);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SOURCE);
 #endif
 
 	/*
@@ -585,7 +638,7 @@ static int test_dual_role(void)
 	 */
 	TEST_ASSERT(active_charge_port == 1);
 	TEST_ASSERT(active_charge_limit == 200);
-	TEST_ASSERT(pd_get_role(0) == PD_ROLE_SOURCE);
+	TEST_ASSERT(pd_get_power_role(0) == PD_ROLE_SOURCE);
 #endif
 
 	return EC_SUCCESS;
@@ -734,11 +787,12 @@ static int test_unknown_dualrole_capability(void)
 	return EC_SUCCESS;
 }
 
-void run_test(void)
+void run_test(int argc, char **argv)
 {
 	test_reset();
 
 	RUN_TEST(test_initialization);
+	RUN_TEST(test_safe_mode);
 	RUN_TEST(test_priority);
 	RUN_TEST(test_charge_ceil);
 	RUN_TEST(test_new_power_request);

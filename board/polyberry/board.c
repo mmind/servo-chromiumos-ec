@@ -16,9 +16,9 @@
 #include "update_fw.h"
 #include "usb_descriptor.h"
 #include "util.h"
-#include "usb_dwc_hw.h"
 #include "usb_dwc_console.h"
 #include "usb_dwc_update.h"
+#include "usb_hw.h"
 
 /******************************************************************************
  * Define the strings used in our USB descriptors.
@@ -46,25 +46,6 @@ struct dwc_usb usb_ctl = {
 	.dma_en = 1,
 	.irq = STM32_IRQ_OTG_HS,
 };
-
-/******************************************************************************
- * Support firmware upgrade over USB. We can update whichever section is not
- * the current section.
- */
-
-/*
- * This array defines possible sections available for the firmware update.
- * The section which does not map the current executing code is picked as the
- * valid update area. The values are offsets into the flash space.
- */
-const struct section_descriptor board_rw_sections[] = {
-	{CONFIG_RO_MEM_OFF,
-	 CONFIG_RO_MEM_OFF + CONFIG_RO_SIZE},
-	{CONFIG_RW_MEM_OFF,
-	 CONFIG_RW_MEM_OFF + CONFIG_RW_SIZE},
-};
-const struct section_descriptor * const rw_sections = board_rw_sections;
-const int num_rw_sections = ARRAY_SIZE(board_rw_sections);
 
 #define GPIO_SET_HS(bank, number)	\
 	(STM32_GPIO_OSPEEDR(GPIO_##bank) |= (0x3 << ((number) * 2)))

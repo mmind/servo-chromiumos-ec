@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -9,12 +9,31 @@
 #define __CROS_EC_BATTERY_H
 
 #include "common.h"
+#include "host_command.h"
+
+/* Battery index, only used with CONFIG_BATTERY_V2. */
+enum battery_index {
+	BATT_IDX_INVALID = -1,
+	BATT_IDX_MAIN = 0,
+	BATT_IDX_BASE = 1,
+};
+
+#ifdef CONFIG_BATTERY_V2
+extern struct ec_response_battery_static_info_v1
+	battery_static[CONFIG_BATTERY_COUNT];
+extern struct ec_response_battery_dynamic_info
+	battery_dynamic[CONFIG_BATTERY_COUNT];
+#endif
 
 /* Stop charge when charging and battery level >= this percentage */
 #define BATTERY_LEVEL_FULL		100
 
 /* Tell host we're charged when battery level >= this percentage */
+#ifdef CONFIG_BATTERY_LEVEL_NEAR_FULL
+#define BATTERY_LEVEL_NEAR_FULL		 CONFIG_BATTERY_LEVEL_NEAR_FULL
+#else
 #define BATTERY_LEVEL_NEAR_FULL		 97
+#endif
 
 /*
  * Send battery-low host event when discharging and battery level <= this level
@@ -38,6 +57,7 @@
  * wait until we've been able to talk to the battery.
  */
 enum battery_present {
+	BP_NOT_INIT = -1,
 	BP_NO = 0,
 	BP_YES = 1,
 	BP_NOT_SURE,
@@ -65,10 +85,21 @@ struct batt_params {
 	int desired_current;  /* Charging current desired by battery (mA) */
 	int remaining_capacity;  /* Remaining capacity in mAh */
 	int full_capacity;    /* Capacity in mAh (might change occasionally) */
+	int display_charge;   /* Display charge in 10ths of a % (1000=100.0%) */
 	int status;	      /* Battery status */
 	enum battery_present is_present; /* Is the battery physically present */
 	int flags;            /* Flags */
 };
+
+/*
+ * Provide a 1 minute average of the current and voltage on the battery.
+ * Does not check for flags or whether those values are bad readings.
+ * See driver/battery/[your_driver].h/c for details on implementation and
+ * how the average is calculated.
+ */
+
+int battery_get_avg_current(void); /* in mA */
+int battery_get_avg_voltage(void); /* in mV */
 
 /* Flags for batt_params */
 
@@ -88,15 +119,23 @@ struct batt_params {
 #define BATT_FLAG_BAD_REMAINING_CAPACITY	0x00000100
 #define BATT_FLAG_BAD_FULL_CAPACITY		0x00000200
 #define BATT_FLAG_BAD_STATUS			0x00000400
+#define BATT_FLAG_IMBALANCED_CELL		0x00000800
 /* All of the above BATT_FLAG_BAD_* bits */
 #define BATT_FLAG_BAD_ANY			0x000007fc
 
 /* Battery constants */
 struct battery_info {
-	/* Design voltage in mV */
+	/* Operation voltage in mV */
 	int voltage_max;
 	int voltage_normal;
 	int voltage_min;
+	/* (TODO(chromium:756700): add desired_charging_current */
+	/**
+	 * Pre-charge to fast charge threshold in mV,
+	 * default to voltage_min if not specified.
+	 * This option is only available on isl923x and rt946x.
+	 */
+	int precharge_voltage;
 	/* Pre-charge current in mA */
 	int precharge_current;
 	/* Working temperature ranges in degrees C */
@@ -129,12 +168,31 @@ void battery_get_params(struct batt_params *batt);
  */
 void battery_override_params(struct batt_params *batt);
 
+#if defined(CONFIG_BATTERY) || defined(CONFIG_BATTERY_PRESENT_CUSTOM)
 /**
  * Check for presence of battery.
  *
  * @return Whether there is a battery attached or not, or if we can't tell.
  */
 enum battery_present battery_is_present(void);
+#else
+/*
+ * If battery support is not enabled and the board does not specifically
+ * provide its own implementation, assume a battery is never present.
+ */
+static inline enum battery_present battery_is_present(void)
+{
+	return BP_NO;
+}
+#endif
+
+/**
+ * Check for physical presence of battery.
+ *
+ * @return Whether there is a battery physically present, but possibly
+ * in a disconnected or cut off state, or if we can't tell;
+ */
+enum battery_present battery_hw_present(void);
 
 /**
  * Check for battery initialization status.
@@ -245,6 +303,16 @@ int battery_status(int *status);
 int battery_cycle_count(int *count);
 
 /**
+ * Read battery manufacture date.
+ *
+ * @param year		Destination for year
+ * @param month		Destination for month
+ * @param day		Destination for day
+ * @return non-zero if error.
+ */
+int battery_manufacture_date(int *year, int *month, int *day);
+
+/**
  * Read battery serial number.
  *
  * @param serial	Destination for serial number.
@@ -260,6 +328,17 @@ int battery_serial_number(int *serial);
  * @return non-zero if error.
  */
 int battery_manufacturer_name(char *dest, int size);
+
+/**
+ * Read manufacturer name.
+ *
+ * This can be overridden to return a chip or board custom string.
+ *
+ * @param dest		Destination buffer.
+ * @param size		Length of destination buffer in chars.
+ * @return non-zero if error.
+ */
+int get_battery_manufacturer_name(char *dest, int size);
 
 /**
  * Read device name.
@@ -288,6 +367,12 @@ int battery_device_chemistry(char *dest, int size);
  * @return non-zero if error.
  */
 int battery_manufacturer_date(int *year, int *month, int *day);
+
+/**
+ * Report the absolute difference between the highest and lowest cell voltage in
+ * the battery pack, in millivolts.  On error or unimplemented, returns '0'.
+ */
+int battery_imbalance_mv(void);
 
 /**
  * Call board-specific cut-off function.
@@ -340,8 +425,50 @@ void print_battery_debug(void);
  */
 enum battery_disconnect_state battery_get_disconnect_state(void);
 
+#ifdef CONFIG_BATTERY_V2
+/**
+ * Refresh battery information in host memory mapped region, if index is
+ * currently presented.
+ */
+void battery_memmap_refresh(enum battery_index index);
+
+/**
+ * Set which index to present in host memory mapped region.
+ */
+void battery_memmap_set_index(enum battery_index index);
+#endif /* CONFIG_BATTERY_V2 */
+
 #ifdef CONFIG_CMD_I2C_STRESS_TEST_BATTERY
 extern struct i2c_stress_test_dev battery_i2c_stress_test_dev;
 #endif
+
+/*
+ * If remaining charge is more than x% of the full capacity, the
+ * remaining charge is raised to the full capacity before it's
+ * reported to the rest of the system.
+ *
+ * Some batteries don't update full capacity timely or don't update it
+ * at all. On such systems, compensation is required to guarantee
+ * the remaining charge will be equal to the full capacity eventually.
+ *
+ * On some systems, Rohm charger generates audio noise when the battery
+ * is fully charged and AC is plugged. A workaround is to do charge-
+ * discharge cycles between 93 and 100%. On such systems, compensation
+ * was also applied to mask this cycle from users.
+ *
+ * This used to be done in ACPI, thus, all software components except EC
+ * was seeing the compensated charge. Now we do it in EC. It has more
+ * knowledge on the charger and the battery. So, it can perform more
+ * granular and precise compensation.
+ *
+ * TODO: Currently, this is applied only to smart battery. Apply it to other
+ *       battery drivers as needed.
+ */
+void battery_compensate_params(struct batt_params *batt);
+
+/**
+ * board-specific battery_compensate_params
+ */
+__override_proto void board_battery_compensate_params(struct batt_params *batt);
 
 #endif /* __CROS_EC_BATTERY_H */

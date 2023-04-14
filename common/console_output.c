@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -10,6 +10,7 @@
 #include "usb_console.h"
 #include "util.h"
 
+#ifdef CONFIG_CONSOLE_CHANNEL
 /* Default to all channels active */
 #ifndef CC_DEFAULT
 #define CC_DEFAULT CC_ALL
@@ -28,12 +29,13 @@ static uint32_t channel_mask_saved = CC_DEFAULT;
  */
 static const char * const channel_names[] = {
 	#define CONSOLE_CHANNEL(enumeration, string) string,
-	#include "include/console_channel.inc"
+	#include "console_channel.inc"
 	#undef CONSOLE_CHANNEL
 };
 BUILD_ASSERT(ARRAY_SIZE(channel_names) == CC_CHANNEL_COUNT);
 /* ensure that we are not silently masking additional channels */
 BUILD_ASSERT(CC_CHANNEL_COUNT <= 8*sizeof(uint32_t));
+#endif /* CONFIG_CONSOLE_CHANNEL */
 
 /*****************************************************************************/
 /* Channel-based console output */
@@ -42,9 +44,11 @@ int cputs(enum console_channel channel, const char *outstr)
 {
 	int rv1, rv2;
 
+#ifdef CONFIG_CONSOLE_CHANNEL
 	/* Filter out inactive channels */
 	if (!(CC_MASK(channel) & channel_mask))
 		return EC_SUCCESS;
+#endif
 
 	rv1 = usb_puts(outstr);
 	rv2 = uart_puts(outstr);
@@ -57,9 +61,11 @@ int cprintf(enum console_channel channel, const char *format, ...)
 	int rv1, rv2;
 	va_list args;
 
+#ifdef CONFIG_CONSOLE_CHANNEL
 	/* Filter out inactive channels */
 	if (!(CC_MASK(channel) & channel_mask))
 		return EC_SUCCESS;
+#endif
 
 	usb_va_start(args, format);
 	rv1 = usb_vprintf(format, args);
@@ -77,11 +83,13 @@ int cprints(enum console_channel channel, const char *format, ...)
 	int r, rv;
 	va_list args;
 
+#ifdef CONFIG_CONSOLE_CHANNEL
 	/* Filter out inactive channels */
 	if (!(CC_MASK(channel) & channel_mask))
 		return EC_SUCCESS;
+#endif
 
-	rv = cprintf(channel, "[%T ");
+	rv = cprintf(channel, "[%pT ", PRINTF_TIMESTAMP_NOW);
 
 	va_start(args, format);
 	r = uart_vprintf(format, args);
@@ -107,6 +115,7 @@ void cflush(void)
 /*****************************************************************************/
 /* Console commands */
 
+#ifdef CONFIG_CONSOLE_CHANNEL
 /* Set active channels */
 static int command_ch(int argc, char **argv)
 {
@@ -146,6 +155,7 @@ static int command_ch(int argc, char **argv)
 	}
 	return EC_SUCCESS;
 };
-DECLARE_CONSOLE_COMMAND(chan, command_ch,
-			"[ save | restore | <mask> ]",
-			"Save, restore, get or set console channel mask");
+DECLARE_SAFE_CONSOLE_COMMAND(chan, command_ch,
+			     "[ save | restore | <mask> ]",
+			     "Save, restore, get or set console channel mask");
+#endif /* CONFIG_CONSOLE_CHANNEL */

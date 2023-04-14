@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+ * Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -60,7 +60,7 @@ static const struct keyscan_item *keyscan_seq_get(void)
 		ksi++;
 	}
 
-	ccprintf("%T: keyscan_seq done, upto=%d\n", keyscan_seq_upto);
+	ccprints("keyscan_seq done, upto=%d", keyscan_seq_upto);
 	keyscan_seq_upto = -1;
 	keyscan_seq_cur = NULL;
 	return NULL;
@@ -78,7 +78,7 @@ uint8_t keyscan_seq_get_scan(int column, uint8_t scan)
 			int c;
 
 			scan = 0;
-			for (c = 0; c < KEYBOARD_COLS; c++)
+			for (c = 0; c < keyboard_cols; c++)
 				scan |= item->scan[c];
 		} else {
 			scan = item->scan[column];
@@ -157,7 +157,7 @@ static int keyscan_seq_collect(struct ec_params_keyscan_seq_ctrl *req,
 	return sizeof(*resp) + resp->collect.num_items;
 }
 
-static int keyscan_seq_ctrl(struct host_cmd_handler_args *args)
+static enum ec_status keyscan_seq_ctrl(struct host_cmd_handler_args *args)
 {
 	struct ec_params_keyscan_seq_ctrl req, *msg;
 	struct keyscan_item *ksi;

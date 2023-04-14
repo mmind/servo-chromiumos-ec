@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -250,15 +250,12 @@ enum battery_disconnect_state battery_get_disconnect_state(void)
 
 	if (extpower_is_present()) {
 		/* Check if battery charging + discharging is disabled. */
-		rv = sb_write(SB_MANUFACTURER_ACCESS, PARAM_OPERATION_STATUS);
+		rv = sb_read_mfgacc(PARAM_OPERATION_STATUS,
+				SB_ALT_MANUFACTURER_ACCESS, data, sizeof(data));
 		if (rv)
 			return BATTERY_DISCONNECT_ERROR;
-
-		rv = sb_read_string(I2C_PORT_BATTERY, BATTERY_ADDR,
-				    SB_ALT_MANUFACTURER_ACCESS, data, 6);
-
-		if (rv || !(data[3] & BATTERY_DISCHARGING_DISABLED) ||
-		    !(data[3] & BATTERY_CHARGING_DISABLED)) {
+		if (~data[3] & (BATTERY_DISCHARGING_DISABLED |
+				BATTERY_CHARGING_DISABLED)) {
 			not_disconnected = 1;
 			return BATTERY_NOT_DISCONNECTED;
 		}
@@ -267,13 +264,8 @@ enum battery_disconnect_state battery_get_disconnect_state(void)
 		 * Battery is neither charging nor discharging. Verify that
 		 * we didn't enter this state due to a safety fault.
 		 */
-		rv = sb_write(SB_MANUFACTURER_ACCESS, PARAM_SAFETY_STATUS);
-		if (rv)
-			return BATTERY_DISCONNECT_ERROR;
-
-		rv = sb_read_string(I2C_PORT_BATTERY, BATTERY_ADDR,
-				    SB_ALT_MANUFACTURER_ACCESS, data, 6);
-
+		rv = sb_read_mfgacc(PARAM_SAFETY_STATUS,
+				SB_ALT_MANUFACTURER_ACCESS, data, sizeof(data));
 		if (rv || data[2] || data[3] || data[4] || data[5])
 			return BATTERY_DISCONNECT_ERROR;
 		else
@@ -298,10 +290,10 @@ int board_cut_off_battery(void)
 	buf[2] = PARAM_CUT_OFF_HIGH;
 
 	i2c_lock(I2C_PORT_BATTERY, 1);
-	rv = i2c_xfer(I2C_PORT_BATTERY, BATTERY_ADDR, buf, 3, NULL, 0,
-		      I2C_XFER_SINGLE);
-	rv |= i2c_xfer(I2C_PORT_BATTERY, BATTERY_ADDR, buf, 3, NULL, 0,
-		      I2C_XFER_SINGLE);
+	rv = i2c_xfer_unlocked(I2C_PORT_BATTERY, BATTERY_ADDR_FLAGS,
+			       buf, 3, NULL, 0, I2C_XFER_SINGLE);
+	rv |= i2c_xfer_unlocked(I2C_PORT_BATTERY, BATTERY_ADDR_FLAGS,
+				buf, 3, NULL, 0, I2C_XFER_SINGLE);
 	i2c_lock(I2C_PORT_BATTERY, 0);
 
 	return rv;

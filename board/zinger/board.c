@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -9,6 +9,7 @@
 #include "ec_commands.h"
 #include "registers.h"
 #include "rsa.h"
+#include "rwsig.h"
 #include "sha256.h"
 #include "system.h"
 #include "task.h"
@@ -69,7 +70,7 @@ static int check_rw_valid(void *rw_hash)
 	return 1;
 }
 
-extern void pd_task(void);
+extern void pd_task(void *u);
 
 int main(void)
 {
@@ -96,7 +97,7 @@ int main(void)
 		jump_to_rw();
 
 	/* background loop for PD events */
-	pd_task();
+	pd_task(NULL);
 
 	debug_printf("EXIT!\n");
 	/* we should never reach that point */

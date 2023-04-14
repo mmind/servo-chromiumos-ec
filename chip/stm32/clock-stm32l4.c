@@ -29,7 +29,7 @@ enum clock_osc {
 	OSC_PLL,	/* PLL */
 };
 
-static int freq;
+static int freq = STM32_MSI_CLOCK;
 static int current_osc;
 
 int clock_get_freq(void)
@@ -37,16 +37,21 @@ int clock_get_freq(void)
 	return freq;
 }
 
+int clock_get_timer_freq(void)
+{
+	return clock_get_freq();
+}
+
 void clock_wait_bus_cycles(enum bus_type bus, uint32_t cycles)
 {
-	volatile uint32_t dummy __attribute__((unused));
+	volatile uint32_t unused __attribute__((unused));
 
 	if (bus == BUS_AHB) {
 		while (cycles--)
-			dummy = STM32_DMA1_REGS->isr;
+			unused = STM32_DMA1_REGS->isr;
 	} else { /* APB */
 		while (cycles--)
-			dummy = STM32_USART_BRR(STM32_USART1_BASE);
+			unused = STM32_USART_BRR(STM32_USART1_BASE);
 	}
 }
 
@@ -78,13 +83,8 @@ static void clock_enable_osc(enum clock_osc osc)
 		return;
 	}
 
-	if (!(STM32_RCC_CR & ready)) {
-		/* Enable HSI */
-		STM32_RCC_CR |= on;
-		/* Wait for HSI to be ready */
-		while (!(STM32_RCC_CR & ready))
-			;
-	}
+	/* Enable HSI and wait for HSI to be ready */
+	wait_for_ready(&STM32_RCC_CR, on, ready);
 }
 
 /* Switch system clock oscillator */
@@ -319,9 +319,9 @@ void clock_enable_module(enum module_id module, int enable)
 	int new_mask;
 
 	if (enable)
-		new_mask = clock_mask | (1 << module);
+		new_mask = clock_mask | BIT(module);
 	else
-		new_mask = clock_mask & ~(1 << module);
+		new_mask = clock_mask & ~BIT(module);
 
 	/* Only change clock if needed */
 	if ((!!new_mask) != (!!clock_mask)) {
@@ -372,6 +372,9 @@ static int command_clock(int argc, char **argv)
 			clock_set_osc(OSC_HSE, OSC_INIT);
 		else if (!strcasecmp(argv[1], "pll"))
 			clock_set_osc(OSC_PLL, OSC_HSE);
+#else
+		else if (!strcasecmp(argv[1], "pll"))
+			clock_set_osc(OSC_PLL, OSC_HSI);
 #endif
 		else
 			return EC_ERROR_PARAM1;

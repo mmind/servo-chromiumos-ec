@@ -13,6 +13,8 @@
 
 #define CONFIG_BOARD_POST_GPIO_INIT
 
+#define CONFIG_FLASH_WRITE_SIZE STM32_FLASH_WRITE_SIZE_3300
+
 /* Enable console recasting of GPIO type. */
 #define CONFIG_CMD_GPIO_EXTENDED
 
@@ -25,7 +27,7 @@
 #define CONFIG_UART_RX_REQ_CH 4
 
 #define CONFIG_I2C
-#define CONFIG_I2C_MASTER
+#define CONFIG_I2C_CONTROLLER
 #define I2C_PORT_0 0
 #define FMPI2C_PORT_3 3
 

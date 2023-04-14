@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -10,7 +10,7 @@
 #include "host_command.h"
 #include "util.h"
 
-int pstore_command_get_info(struct host_cmd_handler_args *args)
+enum ec_status pstore_command_get_info(struct host_cmd_handler_args *args)
 {
 	struct ec_response_pstore_info *r = args->response;
 
@@ -26,12 +26,12 @@ DECLARE_HOST_COMMAND(EC_CMD_PSTORE_INFO,
 		     pstore_command_get_info,
 		     EC_VER_MASK(0));
 
-int pstore_command_read(struct host_cmd_handler_args *args)
+enum ec_status pstore_command_read(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_pstore_read *p = args->params;
 	char *dest = args->response;
 	int block_size = eeprom_get_block_size();
-	int block = p->offset / block_size + EEPROM_BLOCK_COUNT_PSTORE;
+	int block = p->offset / block_size + EEPROM_BLOCK_START_PSTORE;
 	int offset = p->offset % block_size;
 	int bytes_left = p->size;
 
@@ -63,13 +63,13 @@ DECLARE_HOST_COMMAND(EC_CMD_PSTORE_READ,
 		     pstore_command_read,
 		     EC_VER_MASK(0));
 
-int pstore_command_write(struct host_cmd_handler_args *args)
+enum ec_status pstore_command_write(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_pstore_write *p = args->params;
 
 	const char *src = p->data;
 	int block_size = eeprom_get_block_size();
-	int block = p->offset / block_size + EEPROM_BLOCK_COUNT_PSTORE;
+	int block = p->offset / block_size + EEPROM_BLOCK_START_PSTORE;
 	int offset = p->offset % block_size;
 	int bytes_left = p->size;
 

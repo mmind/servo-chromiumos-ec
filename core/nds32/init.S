@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -20,13 +20,15 @@ __entry_\()\name:
 	smw.adm $r15, [$sp], $r15, 0xb
 	/* r0-r5 are caller saved */
 	smw.adm $r0,  [$sp], $r5, 0
+	/* store link pointer register */
+	swi.gp  $lp, [ + ilp]
 	/* switch to system stack if we are called from process stack */
 	la $r3, stack_end
 	mov55 $fp, $sp
 	slt45 $r3, $sp /* if sp > end of system stack, then r15 = 1 and */
 	cmovn $sp, $r3, $r15 /* point sp to the top of the system stack */
 	/* save entry number of HW interrupt */
-	movi55  $r3, entry_number
+	movi55  $r3, \entry_number\()
 	swi.gp  $r3, [ + cpu_int_entry_number]
 	/* isr entry */
 	jal start_irq_handler
@@ -84,7 +86,13 @@ vector irq_15,   15	/* HW 15 */
 .balign 16
 .global eflash_sig
 eflash_sig:
-.byte 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xB4
+.byte 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5
+#ifdef CONFIG_HOSTCMD_ESPI
+.byte 0xA4 /* eSPI */
+#else
+.byte 0xA5 /* LPC */
+#endif
+.byte 0xB4 /* flag of signature */
 .byte 0x85, 0x12, 0x5A, 0x5A, 0xAA, 0xAA, 0x55, 0x55
 /* flags: internal oscillator + implicit location */
 
@@ -111,24 +119,35 @@ reset:
 	/* Set system stack pointer. */
 	la $sp, stack_end
 
+	/*
+	 * move content of lp into r5 and then store the content
+	 * into variable "ec_reset_lp" later after memory initialization.
+	 */
+	mov55 $r5, $lp
+
 	/* map/enable the 16kB of DLM at 0x00080000 */
 	li   $r0, 0x00080005
 	mtsr $r0, $mr7
 
+	/* Set ROM address at 0x80000 (disabled). */
+	li  $r1, 0x00F0109B
+	movi $r0, #0x8
+	sbi $r0, [$r1]
+
 	/* Enable DLM 8k~12K(bit2) and DLM 12k~16k(bit3) */
-	la  $r1, 0x00F02030
+	li  $r1, 0x00F02030
 	lbi $r0, [$r1]
 	ori $r0, $r0, 0x0C
 	sbi $r0, [$r1]
 
 	/* Enable DLM 16k~36K bit[2-6] */
-	la  $r1, 0x00F0203E
+	li  $r1, 0x00F0203E
 	lbi $r0, [$r1]
 	ori $r0, $r0, 0x7C
 	sbi $r0, [$r1]
 
 	/* Enable DLM 36k~48K bit[0-2] */
-	la  $r1, 0x00F02044
+	li  $r1, 0x00F02044
 	lbi $r0, [$r1]
 	ori $r0, $r0, 0x7
 	sbi $r0, [$r1]
@@ -148,12 +167,15 @@ bss_loop:
 	lwi  $r1, [$r0]
 	la $r0, _data_end
 	lwi  $r2, [$r0]
-	la $r0, _ro_end
+	la $r0, _data_lma_start
 	lwi  $r0, [$r0]
 data_loop:
 	lwi.bi $r3, [$r0], 4
 	swi.bi $r3, [$r1], 4
 	bne $r1, $r2, data_loop
+
+	/* store the content of r5 (lp after reset) into "ec_reset_lp" */
+	swi.gp  $r5, [ + ec_reset_lp]
 
 	/* we switch to our own exception vectors */
 	/* go back to it level 0 with HW interrupts globally disabled */
@@ -167,6 +189,8 @@ data_loop:
 	li   $r5, 0x00000007
 	mtsr $r5, $IVB
 
+	/* clear BRAM if it is not valid */
+	jal chip_bram_valid
 	/* Jump to C routine */
 	jal main
 
@@ -184,6 +208,17 @@ unhandled_irq:
 
 .global excep_handler
 excep_handler:
+#ifdef CONFIG_FPU
+	/*
+	 * We have to restore ALU so that we can continue the next
+	 * sequence if arithmetic instructions are used.
+	 * (Apply to floating point division by zero)
+	 */
+	sethi   $gp, 0x80
+	ori     $gp, $gp,0x9
+	mtsr    $gp, $dlmb
+	dsb
+#endif
 	/* safety: reload GP even though it should be already set */
 	la $gp, _SDA_BASE_
 	/* save r0 to free one register */
@@ -192,7 +227,7 @@ excep_handler:
 	la      $r0, saved_regs + 4
 	smw.bim $r1, [$r0], $r10, 0
 	smw.bim $r15,[$r0], $r15, 0xF
-	/* put a sane stack pointer */
+	/* put a valid stack pointer */
 	la $sp, stack_end
 	/* add IPC, IPSW to the context */
 	mfsr    $r1, $IPC
@@ -207,6 +242,7 @@ excep_handler:
 	/* we never return: exceptions are fatal */
 	j .
 
+.align 2
 _bss_start:
 .long __bss_start
 _bss_end:
@@ -215,8 +251,8 @@ _data_start:
 .long __data_start
 _data_end:
 .long __data_end
-_ro_end:
-.long __ro_end
+_data_lma_start:
+.long __data_lma_start
 
 /* Reserve space for system stack */
 .section .bss.system_stack

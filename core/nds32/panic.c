@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -8,6 +8,7 @@
 #include "cpu.h"
 #include "panic.h"
 #include "printf.h"
+#include "software_panic.h"
 #include "system.h"
 #include "task.h"
 #include "timer.h"
@@ -17,9 +18,6 @@
 #define SOFT_PANIC_GPR_REASON 6
 /* General purpose register (r7) for saving software panic information */
 #define SOFT_PANIC_GPR_INFO   7
-
-/* Panic data goes at the end of RAM. */
-static struct panic_data * const pdata_ptr = PANIC_DATA_PTR;
 
 #ifdef CONFIG_DEBUG_EXCEPTIONS
 /**
@@ -78,18 +76,6 @@ static const char * const itype_exc_type[16] = {
 #endif /* CONFIG_DEBUG_EXCEPTIONS */
 
 #ifdef CONFIG_SOFTWARE_PANIC
-/* Software panic reasons */
-static const char * const panic_sw_reasons[8] = {
-	"PANIC_SW_DIV_ZERO",
-	"PANIC_SW_STACK_OVERFLOW",
-	"PANIC_SW_PD_CRASH",
-	"PANIC_SW_ASSERT",
-	"PANIC_SW_WATCHDOG",
-	NULL,
-	NULL,
-	NULL,
-};
-
 void software_panic(uint32_t reason, uint32_t info)
 {
 	asm volatile ("mov55  $r6, %0" : : "r"(reason));
@@ -97,40 +83,50 @@ void software_panic(uint32_t reason, uint32_t info)
 	if (in_interrupt_context())
 		asm("j excep_handler");
 	else
-		asm("trap 0");
+		asm("break 0");
+	__builtin_unreachable();
 }
 
 void panic_set_reason(uint32_t reason, uint32_t info, uint8_t exception)
 {
-	uint32_t *regs = pdata_ptr->nds_n8.regs;
+	/*
+	 * It is safe to get pointer using get_panic_data_write().
+	 * If it was called earlier (eg. when saving nds_n8.ipc) calling it
+	 * once again won't remove any data
+	 */
+	struct panic_data * const pdata = get_panic_data_write();
 	uint32_t warning_ipc;
+	uint32_t *regs;
+
+	regs = pdata->nds_n8.regs;
 
 	/* Setup panic data structure */
 	if (reason != PANIC_SW_WATCHDOG) {
-		memset(pdata_ptr, 0, sizeof(*pdata_ptr));
+		memset(pdata, 0, CONFIG_PANIC_DATA_SIZE);
 	} else {
-		warning_ipc = pdata_ptr->nds_n8.ipc;
-		memset(pdata_ptr, 0, sizeof(*pdata_ptr));
-		pdata_ptr->nds_n8.ipc = warning_ipc;
+		warning_ipc = pdata->nds_n8.ipc;
+		memset(pdata, 0, CONFIG_PANIC_DATA_SIZE);
+		pdata->nds_n8.ipc = warning_ipc;
 	}
-	pdata_ptr->magic = PANIC_DATA_MAGIC;
-	pdata_ptr->struct_size = sizeof(*pdata_ptr);
-	pdata_ptr->struct_version = 2;
-	pdata_ptr->arch = PANIC_ARCH_NDS32_N8;
+	pdata->magic = PANIC_DATA_MAGIC;
+	pdata->struct_size = CONFIG_PANIC_DATA_SIZE;
+	pdata->struct_version = 2;
+	pdata->arch = PANIC_ARCH_NDS32_N8;
 
 	/* Log panic cause */
-	pdata_ptr->nds_n8.itype = exception;
+	pdata->nds_n8.itype = exception;
 	regs[SOFT_PANIC_GPR_REASON] = reason;
 	regs[SOFT_PANIC_GPR_INFO] = info;
 }
 
 void panic_get_reason(uint32_t *reason, uint32_t *info, uint8_t *exception)
 {
-	uint32_t *regs = pdata_ptr->nds_n8.regs;
+	struct panic_data * const pdata = panic_get_data();
+	uint32_t *regs;
 
-	if (pdata_ptr->magic == PANIC_DATA_MAGIC &&
-	    pdata_ptr->struct_version == 2) {
-		*exception = pdata_ptr->nds_n8.itype;
+	if (pdata && pdata->struct_version == 2) {
+		regs = pdata->nds_n8.regs;
+		*exception = pdata->nds_n8.itype;
 		*reason = regs[SOFT_PANIC_GPR_REASON];
 		*info = regs[SOFT_PANIC_GPR_INFO];
 	} else {
@@ -162,10 +158,11 @@ static void print_panic_information(uint32_t *regs, uint32_t itype,
 
 #ifdef CONFIG_DEBUG_EXCEPTIONS
 	panic_printf("SWID of ITYPE: %x\n", ((itype >> 16) & 0x7fff));
-	if ((regs[SOFT_PANIC_GPR_REASON] & 0xfffffff0) == PANIC_SW_BASE) {
+	if (panic_sw_reason_is_valid(regs[SOFT_PANIC_GPR_REASON])) {
 #ifdef CONFIG_SOFTWARE_PANIC
 		panic_printf("Software panic reason %s\n",
-			panic_sw_reasons[(regs[SOFT_PANIC_GPR_REASON] & 0x7)]);
+			panic_sw_reasons[(regs[SOFT_PANIC_GPR_REASON] -
+					  PANIC_SW_BASE)]);
 		panic_printf("Software panic info 0x%x\n",
 			regs[SOFT_PANIC_GPR_INFO]);
 #endif
@@ -173,7 +170,7 @@ static void print_panic_information(uint32_t *regs, uint32_t itype,
 		panic_printf("Exception type: General exception [%s]\n",
 			itype_exc_type[(itype & 0xf)]);
 		panic_printf("Exception is caused by %s\n",
-			itype_inst[(itype & (1 << 4))]);
+			itype_inst[(itype & BIT(4))]);
 	}
 #endif
 }
@@ -181,10 +178,10 @@ static void print_panic_information(uint32_t *regs, uint32_t itype,
 void report_panic(uint32_t *regs, uint32_t itype)
 {
 	int i;
-	struct panic_data *pdata = pdata_ptr;
+	struct panic_data * const pdata = get_panic_data_write();
 
 	pdata->magic = PANIC_DATA_MAGIC;
-	pdata->struct_size = sizeof(*pdata);
+	pdata->struct_size = CONFIG_PANIC_DATA_SIZE;
 	pdata->struct_version = 2;
 	pdata->arch = PANIC_ARCH_NDS32_N8;
 	pdata->flags = 0;

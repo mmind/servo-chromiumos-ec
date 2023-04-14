@@ -1,12 +1,14 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
 /* Veyron board-specific configuration */
 
 #include "battery.h"
+#include "battery_smart.h"
 #include "chipset.h"
 #include "common.h"
+#include "driver/charger/bq24715.h"
 #include "extpower.h"
 #include "gpio.h"
 #include "i2c.h"
@@ -27,8 +29,8 @@
 
 /* power signal list.  Must match order of enum power_signal. */
 const struct power_signal_info power_signal_list[] = {
-	{GPIO_SOC_POWER_GOOD, 1, "POWER_GOOD"},
-	{GPIO_SUSPEND_L,      1, "SUSPEND#_ASSERTED"},
+	{GPIO_SOC_POWER_GOOD, POWER_SIGNAL_ACTIVE_HIGH, "POWER_GOOD"},
+	{GPIO_SUSPEND_L,      POWER_SIGNAL_ACTIVE_HIGH, "SUSPEND#_ASSERTED"},
 };
 BUILD_ASSERT(ARRAY_SIZE(power_signal_list) == POWER_SIGNAL_COUNT);
 
@@ -45,10 +47,19 @@ const struct pwm_t pwm_channels[] = {
 };
 BUILD_ASSERT(ARRAY_SIZE(pwm_channels) == PWM_CH_COUNT);
 
+/* Charger chips */
+const struct charger_config_t chg_chips[] = {
+	{
+		.i2c_port = I2C_PORT_CHARGER,
+		.i2c_addr_flags = CHARGER_ADDR_FLAGS,
+		.drv = &bq24715_drv,
+	},
+};
+
 void board_config_pre_init(void)
 {
 	/* enable SYSCFG clock */
-	STM32_RCC_APB2ENR |= 1 << 0;
+	STM32_RCC_APB2ENR |= BIT(0);
 
 	/* Remap USART DMA to match the USART driver */
 	/*
@@ -58,5 +69,5 @@ void board_config_pre_init(void)
 	 *  Chan 4 : USART1_TX
 	 *  Chan 5 : USART1_RX
 	 */
-	STM32_SYSCFG_CFGR1 |= (1 << 9) | (1 << 10); /* Remap USART1 RX/TX DMA */
+	STM32_SYSCFG_CFGR1 |= BIT(9) | BIT(10); /* Remap USART1 RX/TX DMA */
 }

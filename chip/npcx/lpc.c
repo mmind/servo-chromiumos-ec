@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -13,15 +13,15 @@
 #include "gpio.h"
 #include "hooks.h"
 #include "host_command.h"
+#include "i8042_protocol.h"
 #include "keyboard_protocol.h"
 #include "lpc.h"
 #include "lpc_chip.h"
 #include "port80.h"
-#include "pwm.h"
 #include "registers.h"
 #include "system.h"
+#include "sib_chip.h"
 #include "task.h"
-#include "timer.h"
 #include "uart.h"
 #include "util.h"
 #include "system_chip.h"
@@ -35,20 +35,10 @@
 #define CPRINTS(format, args...) cprints(CC_LPC, format, ## args)
 #endif
 
-#define LPC_SYSJUMP_TAG 0x4c50          /* "LP" */
-
 /* PM channel definitions */
 #define PMC_ACPI     PM_CHAN_1
 #define PMC_HOST_CMD PM_CHAN_2
 
-/* Super-IO index and register definitions */
-#define SIO_OFFSET      0x4E
-#define INDEX_SID       0x20
-#define INDEX_CHPREV    0x24
-#define INDEX_SRID      0x27
-
-static uint32_t host_events;            /* Currently pending SCI/SMI events */
-static uint32_t event_mask[3];          /* Event masks for each type */
 static struct	host_packet lpc_packet;
 static struct	host_cmd_handler_args host_cmd_args;
 static uint8_t	host_cmd_flags;         /* Flags from host command */
@@ -58,8 +48,6 @@ static uint8_t	shm_memmap[256] __aligned(8);
 static uint8_t params_copy[EC_LPC_HOST_PACKET_SIZE] __aligned(4);
 static int init_done;
 
-static uint8_t * const cmd_params = (uint8_t *)shm_mem_host_cmd +
-		EC_LPC_ADDR_HOST_PARAM - EC_LPC_ADDR_HOST_ARGS;
 static struct ec_lpc_host_args * const lpc_host_args =
 		(struct ec_lpc_host_args *)shm_mem_host_cmd;
 
@@ -90,33 +78,39 @@ static void keyboard_irq_assert(void)
 
 static void lpc_task_enable_irq(void)
 {
+#ifdef HAS_TASK_KEYPROTO
 	task_enable_irq(NPCX_IRQ_KBC_IBF);
+#endif
 	task_enable_irq(NPCX_IRQ_PM_CHAN_IBF);
 	task_enable_irq(NPCX_IRQ_PORT80);
-#ifdef CONFIG_ESPI
+#ifdef CONFIG_HOSTCMD_ESPI
 	task_enable_irq(NPCX_IRQ_ESPI);
 	/* Virtual Wire: SLP_S3/4/5, SUS_STAT, PLTRST, OOB_RST_WARN */
 	task_enable_irq(NPCX_IRQ_WKINTA_2);
 	/* Virtual Wire: HOST_RST_WARN, SUS_WARN, SUS_PWRDN_ACK, SLP_A */
 	task_enable_irq(NPCX_IRQ_WKINTB_2);
-	/* Enable eSPI module interrupts */
+	/* Enable eSPI module interrupts and wake-up functionalities */
 	NPCX_ESPIIE |= (ESPIIE_GENERIC | ESPIIE_VW);
+	NPCX_ESPIWE |= (ESPIWE_GENERIC | ESPIWE_VW);
 #endif
 }
 
 static void lpc_task_disable_irq(void)
 {
+#ifdef HAS_TASK_KEYPROTO
 	task_disable_irq(NPCX_IRQ_KBC_IBF);
+#endif
 	task_disable_irq(NPCX_IRQ_PM_CHAN_IBF);
 	task_disable_irq(NPCX_IRQ_PORT80);
-#ifdef CONFIG_ESPI
+#ifdef CONFIG_HOSTCMD_ESPI
 	task_disable_irq(NPCX_IRQ_ESPI);
 	/* Virtual Wire: SLP_S3/4/5, SUS_STAT, PLTRST, OOB_RST_WARN */
 	task_disable_irq(NPCX_IRQ_WKINTA_2);
 	/* Virtual Wire: HOST_RST_WARN,SUS_WARN, SUS_PWRDN_ACK, SLP_A */
 	task_disable_irq(NPCX_IRQ_WKINTB_2);
-	/* Disable eSPI module interrupts */
+	/* Disable eSPI module interrupts and wake-up functionalities */
 	NPCX_ESPIIE &= ~(ESPIIE_GENERIC | ESPIIE_VW);
+	NPCX_ESPIWE &= ~(ESPIWE_GENERIC | ESPIWE_VW);
 #endif
 }
 /**
@@ -129,6 +123,8 @@ static void lpc_task_disable_irq(void)
  */
 static void lpc_generate_smi(void)
 {
+	host_event_t smi;
+
 #ifdef CONFIG_SCI_GPIO
 	/* Enforce signal-high for long enough to debounce high */
 	gpio_set_level(GPIO_PCH_SMI_L, 1);
@@ -138,7 +134,7 @@ static void lpc_generate_smi(void)
 	udelay(65);
 	/* Set signal high, now that we've generated the edge */
 	gpio_set_level(GPIO_PCH_SMI_L, 1);
-#elif defined(CONFIG_ESPI)
+#elif defined(CONFIG_HOSTCMD_ESPI)
 	/*
 	 * Don't use SET_BIT/CLEAR_BIT macro to toggle SMIB/SCIB to generate
 	 * virtual wire. Use NPCX_VW_SMI/NPCX_VW_SCI macro instead.
@@ -163,9 +159,9 @@ static void lpc_generate_smi(void)
 	/* Set signal high */
 	SET_BIT(NPCX_HIPMIC(PMC_ACPI), NPCX_HIPMIC_SMIB);
 #endif
-	if (host_events & event_mask[LPC_HOST_EVENT_SMI])
-		CPRINTS("smi 0x%08x",
-			host_events & event_mask[LPC_HOST_EVENT_SMI]);
+	smi = lpc_get_host_events_by_type(LPC_HOST_EVENT_SMI);
+	if (smi)
+		HOST_EVENT_CPRINTS("smi", smi);
 }
 
 /**
@@ -173,6 +169,8 @@ static void lpc_generate_smi(void)
  */
 static void lpc_generate_sci(void)
 {
+	host_event_t sci;
+
 #ifdef CONFIG_SCI_GPIO
 	/* Enforce signal-high for long enough to debounce high */
 	gpio_set_level(CONFIG_SCI_GPIO, 1);
@@ -182,7 +180,7 @@ static void lpc_generate_sci(void)
 	udelay(65);
 	/* Set signal high, now that we've generated the edge */
 	gpio_set_level(CONFIG_SCI_GPIO, 1);
-#elif defined(CONFIG_ESPI)
+#elif defined(CONFIG_HOSTCMD_ESPI)
 	/*
 	 * Don't use SET_BIT/CLEAR_BIT macro to toggle SMIB/SCIB to generate
 	 * virtual wire. Use NPCX_VW_SMI/NPCX_VW_SCI macro instead.
@@ -208,9 +206,9 @@ static void lpc_generate_sci(void)
 	SET_BIT(NPCX_HIPMIC(PMC_ACPI), NPCX_HIPMIC_SCIB);
 #endif
 
-	if (host_events & event_mask[LPC_HOST_EVENT_SCI])
-		CPRINTS("sci 0x%08x",
-			host_events & event_mask[LPC_HOST_EVENT_SCI]);
+	sci = lpc_get_host_events_by_type(LPC_HOST_EVENT_SCI);
+	if (sci)
+		HOST_EVENT_CPRINTS("sci", sci);
 }
 
 /**
@@ -218,7 +216,7 @@ static void lpc_generate_sci(void)
  *
  * @param wake_events	Currently asserted wake events
  */
-static void lpc_update_wake(uint32_t wake_events)
+static void lpc_update_wake(host_event_t wake_events)
 {
 	/*
 	 * Mask off power button event, since the AP gets that through a
@@ -302,7 +300,7 @@ int lpc_keyboard_input_pending(void)
 	return (NPCX_HIKMST&0x02) ? 1 : 0;
 }
 
-/* Put a char to host buffer and send IRQ if specified. */
+/* Put a char to host buffer by HIKDO and send IRQ if specified. */
 void lpc_keyboard_put_char(uint8_t chr, int send_irq)
 {
 	NPCX_HIKDO = chr;
@@ -316,14 +314,48 @@ void lpc_keyboard_put_char(uint8_t chr, int send_irq)
 	}
 }
 
+/* Put an aux char to host buffer by HIMDO and assert status bit 5. */
+void lpc_aux_put_char(uint8_t chr, int send_irq)
+{
+	if (send_irq)
+		SET_BIT(NPCX_HICTRL, NPCX_HICTRL_OBFMIE);
+	else
+		CLEAR_BIT(NPCX_HICTRL, NPCX_HICTRL_OBFMIE);
+
+	NPCX_HIKMST |= I8042_AUX_DATA;
+	NPCX_HIMDO = chr;
+	CPRINTS("AUX put %02x", chr);
+
+	/* Enable OBE interrupt to detect host read data out */
+	SET_BIT(NPCX_HICTRL, NPCX_HICTRL_OBECIE);
+	task_enable_irq(NPCX_IRQ_KBC_OBE);
+}
+
 void lpc_keyboard_clear_buffer(void)
 {
+	/*
+	 * Only npcx5 series need this bypass. The bug of FW_OBF is fixed in
+	 * npcx7 series and later npcx ec.
+	 */
+#ifdef CHIP_FAMILY_NPCX5
+	/* Clear OBF flag in host STATUS and HIKMST regs */
+	if (IS_BIT_SET(NPCX_HIKMST, NPCX_HIKMST_OBF)) {
+		/*
+		 * Setting HICTRL.FW_OBF clears the HIKMST.OBF and STATUS.OBF
+		 * but it does not deassert IRQ1 when it was already asserted.
+		 * Emulate a host read to clear these two flags and also
+		 * deassert IRQ1
+		 */
+		sib_read_kbc_reg(0x0);
+	}
+#else
 	/* Make sure the previous TOH and IRQ has been sent out. */
 	udelay(4);
 	/* Clear OBE flag in host STATUS  and HIKMST regs*/
 	SET_BIT(NPCX_HICTRL, NPCX_HICTRL_FW_OBF);
 	/* Ensure there is no TOH set in this period. */
 	udelay(4);
+#endif
 }
 
 void lpc_keyboard_resume_irq(void)
@@ -339,7 +371,7 @@ void lpc_keyboard_resume_irq(void)
  *   - SMI pulse via EC_SMI_L GPIO
  *   - SCI pulse via LPC0SCI
  */
-static void update_host_event_status(void)
+void lpc_update_host_event_status(void)
 {
 	int need_sci = 0;
 	int need_smi = 0;
@@ -349,7 +381,7 @@ static void update_host_event_status(void)
 
 	/* Disable LPC interrupt while updating status register */
 	lpc_task_disable_irq();
-	if (host_events & event_mask[LPC_HOST_EVENT_SMI]) {
+	if (lpc_get_host_events_by_type(LPC_HOST_EVENT_SMI)) {
 		/* Only generate SMI for first event */
 		if (!(NPCX_HIPMST(PMC_ACPI) & NPCX_HIPMST_ST2))
 			need_smi = 1;
@@ -357,7 +389,7 @@ static void update_host_event_status(void)
 	} else
 		CLEAR_BIT(NPCX_HIPMST(PMC_ACPI), NPCX_HIPMST_ST2);
 
-	if (host_events & event_mask[LPC_HOST_EVENT_SCI]) {
+	if (lpc_get_host_events_by_type(LPC_HOST_EVENT_SCI)) {
 		/* Generate SCI for every event */
 		need_sci = 1;
 		SET_BIT(NPCX_HIPMST(PMC_ACPI), NPCX_HIPMST_ST1);
@@ -365,12 +397,13 @@ static void update_host_event_status(void)
 		CLEAR_BIT(NPCX_HIPMST(PMC_ACPI), NPCX_HIPMST_ST1);
 
 	/* Copy host events to mapped memory */
-	*(uint32_t *)host_get_memmap(EC_MEMMAP_HOST_EVENTS) = host_events;
+	*(host_event_t *)host_get_memmap(EC_MEMMAP_HOST_EVENTS) =
+				lpc_get_host_events();
 
 	lpc_task_enable_irq();
 
 	/* Process the wake events. */
-	lpc_update_wake(host_events & event_mask[LPC_HOST_EVENT_WAKE]);
+	lpc_update_wake(lpc_get_host_events_by_type(LPC_HOST_EVENT_WAKE));
 
 	/* Send pulse on SMI signal if needed */
 	if (need_smi)
@@ -379,54 +412,6 @@ static void update_host_event_status(void)
 	/* ACPI 5.0-12.6.1: Generate SCI for SCI_EVT=1. */
 	if (need_sci)
 		lpc_generate_sci();
-}
-
-void lpc_set_host_event_state(uint32_t mask)
-{
-	if (mask != host_events) {
-		host_events = mask;
-		update_host_event_status();
-	}
-}
-
-int lpc_query_host_event_state(void)
-{
-	const uint32_t any_mask = event_mask[0] | event_mask[1] | event_mask[2];
-	int evt_index = 0;
-	int i;
-
-	for (i = 0; i < 32; i++) {
-		const uint32_t e = (1 << i);
-
-		if (host_events & e) {
-			host_clear_events(e);
-
-			/*
-			 * If host hasn't unmasked this event, drop it.  We do
-			 * this at query time rather than event generation time
-			 * so that the host has a chance to unmask events
-			 * before they're dropped by a query.
-			 */
-			if (!(e & any_mask))
-				continue;
-
-			evt_index = i + 1;	/* Events are 1-based */
-			break;
-		}
-	}
-
-	return evt_index;
-}
-
-void lpc_set_host_event_mask(enum lpc_host_event_type type, uint32_t mask)
-{
-	event_mask[type] = mask;
-	update_host_event_status();
-}
-
-uint32_t lpc_get_host_event_mask(enum lpc_host_event_type type)
-{
-	return event_mask[type];
 }
 
 void lpc_set_acpi_status_mask(uint8_t mask)
@@ -518,52 +503,9 @@ static void handle_host_write(int is_cmd)
 		host_packet_receive(&lpc_packet);
 		return;
 
-	} else if (host_cmd_flags & EC_HOST_ARGS_FLAG_FROM_HOST) {
-		/* Version 2 (link) style command */
-		int size = lpc_host_args->data_size;
-		int csum, i;
-
-		/* Clear processing flag */
-		CLEAR_BIT(NPCX_HIPMST(PMC_HOST_CMD), NPCX_HIPMST_F0);
-
-		host_cmd_args.version = lpc_host_args->command_version;
-		host_cmd_args.params = params_copy;
-		host_cmd_args.params_size = size;
-		host_cmd_args.response = cmd_params;
-		host_cmd_args.response_max = EC_PROTO2_MAX_PARAM_SIZE;
-		host_cmd_args.response_size = 0;
-
-		/* Verify params size */
-		if (size > EC_PROTO2_MAX_PARAM_SIZE) {
-			host_cmd_args.result = EC_RES_INVALID_PARAM;
-		} else {
-			const uint8_t *src = cmd_params;
-			uint8_t *copy = params_copy;
-
-			/*
-			 * Verify checksum and copy params out of LPC space.
-			 * This ensures the data acted on by the host command
-			 * handler can't be changed by host writes after the
-			 * checksum is verified.
-			 */
-			csum = host_cmd_args.command +
-					host_cmd_flags +
-					host_cmd_args.version +
-					host_cmd_args.params_size;
-
-			for (i = 0; i < size; i++) {
-				csum += *src;
-				*(copy++) = *(src++);
-			}
-
-			if ((uint8_t)csum != lpc_host_args->checksum)
-				host_cmd_args.result = EC_RES_INVALID_CHECKSUM;
-		}
 	} else {
 		/* Old style command, now unsupported */
 		host_cmd_args.result = EC_RES_INVALID_COMMAND;
-		/* Clear processing flag */
-		CLEAR_BIT(NPCX_HIPMST(PMC_HOST_CMD), NPCX_HIPMST_F0);
 	}
 
 	/* Hand off to host command handler */
@@ -576,13 +518,26 @@ static void handle_host_write(int is_cmd)
 /* KB controller input buffer full ISR */
 void lpc_kbc_ibf_interrupt(void)
 {
+	uint8_t status;
+	uint8_t ibf;
 	/* If "command" input 0, else 1*/
-	if (lpc_keyboard_input_pending())
-		keyboard_host_write(NPCX_HIKMDI, (NPCX_HIKMST & 0x08) ? 1 : 0);
-	CPRINTS("ibf isr %02x", NPCX_HIKMDI);
-	task_wake(TASK_ID_KEYPROTO);
+	if (lpc_keyboard_input_pending()) {
+		/*
+		 * Reading HIKMDI causes the IBF flag to deassert and allows
+		 * the host to write a new byte into the input buffer. So if we
+		 * don't capture the status before reading HIKMDI we will race
+		 * with the host and get an invalid value for HIKMST.A20.
+		 */
+		status = NPCX_HIKMST;
+		ibf = NPCX_HIKMDI;
+		keyboard_host_write(ibf, (status & 0x08) ? 1 : 0);
+		CPRINTS("ibf isr %02x", ibf);
+		task_wake(TASK_ID_KEYPROTO);
+	} else {
+		CPRINTS("ibf isr spurious");
+	}
 }
-DECLARE_IRQ(NPCX_IRQ_KBC_IBF, lpc_kbc_ibf_interrupt, 3);
+DECLARE_IRQ(NPCX_IRQ_KBC_IBF, lpc_kbc_ibf_interrupt, 4);
 
 /* KB controller output buffer empty ISR */
 void lpc_kbc_obe_interrupt(void)
@@ -592,9 +547,12 @@ void lpc_kbc_obe_interrupt(void)
 	task_disable_irq(NPCX_IRQ_KBC_OBE);
 
 	CPRINTS("obe isr %02x", NPCX_HIKMST);
+
+	NPCX_HIKMST &= ~I8042_AUX_DATA;
+
 	task_wake(TASK_ID_KEYPROTO);
 }
-DECLARE_IRQ(NPCX_IRQ_KBC_OBE, lpc_kbc_obe_interrupt, 3);
+DECLARE_IRQ(NPCX_IRQ_KBC_OBE, lpc_kbc_obe_interrupt, 4);
 #endif
 
 /* PM channel input buffer full ISR */
@@ -608,13 +566,13 @@ void lpc_pmc_ibf_interrupt(void)
 	else if (NPCX_HIPMST(PMC_HOST_CMD) & 0x02)
 		handle_host_write((NPCX_HIPMST(PMC_HOST_CMD)&0x08) ? 1 : 0);
 }
-DECLARE_IRQ(NPCX_IRQ_PM_CHAN_IBF, lpc_pmc_ibf_interrupt, 3);
+DECLARE_IRQ(NPCX_IRQ_PM_CHAN_IBF, lpc_pmc_ibf_interrupt, 4);
 
 /* PM channel output buffer empty ISR */
 void lpc_pmc_obe_interrupt(void)
 {
 }
-DECLARE_IRQ(NPCX_IRQ_PM_CHAN_OBE, lpc_pmc_obe_interrupt, 3);
+DECLARE_IRQ(NPCX_IRQ_PM_CHAN_OBE, lpc_pmc_obe_interrupt, 4);
 
 void lpc_port80_interrupt(void)
 {
@@ -631,7 +589,7 @@ void lpc_port80_interrupt(void)
 	/* Clear pending bit of host writing */
 	SET_BIT(NPCX_DP80STS, 5);
 }
-DECLARE_IRQ(NPCX_IRQ_PORT80, lpc_port80_interrupt, 3);
+DECLARE_IRQ(NPCX_IRQ_PORT80, lpc_port80_interrupt, 4);
 
 /**
  * Preserve event masks across a sysjump.
@@ -649,170 +607,58 @@ static void lpc_sysjump(void)
 	/* Reset base address for Win 1 and 2. */
 	NPCX_WIN_BASE(0) = 0xfffffff8;
 	NPCX_WIN_BASE(1) = 0xfffffff8;
-
-	system_add_jump_tag(LPC_SYSJUMP_TAG, 1,
-			sizeof(event_mask), event_mask);
 }
 DECLARE_HOOK(HOOK_SYSJUMP, lpc_sysjump, HOOK_PRIO_DEFAULT);
-
-/**
- * Restore event masks after a sysjump.
- */
-static void lpc_post_sysjump(void)
-{
-	const uint32_t *prev_mask;
-	int size, version;
-
-	prev_mask = (const uint32_t *)system_get_jump_tag(LPC_SYSJUMP_TAG,
-			&version, &size);
-	if (!prev_mask || version != 1 || size != sizeof(event_mask))
-		return;
-
-	memcpy(event_mask, prev_mask, sizeof(event_mask));
-}
-
-/* Super-IO read/write function */
-void lpc_sib_write_reg(uint8_t io_offset, uint8_t index_value,
-		uint8_t io_data)
-{
-	/* Disable interrupts */
-	interrupt_disable();
-
-	/* Lock host CFG module */
-	SET_BIT(NPCX_LKSIOHA, NPCX_LKSIOHA_LKCFG);
-	/* Enable Core-to-Host Modules Access */
-	SET_BIT(NPCX_SIBCTRL, NPCX_SIBCTRL_CSAE);
-	/* Enable Core access to CFG module */
-	SET_BIT(NPCX_CRSMAE, NPCX_CRSMAE_CFGAE);
-	/* Verify Core read/write to host modules is not in progress */
-	while (IS_BIT_SET(NPCX_SIBCTRL, NPCX_SIBCTRL_CSRD))
-		;
-	while (IS_BIT_SET(NPCX_SIBCTRL, NPCX_SIBCTRL_CSWR))
-		;
-
-	/* Specify the io_offset A0 = 0. the index register is accessed */
-	NPCX_IHIOA = io_offset;
-	/* Write the data. This starts the write access to the host module */
-	NPCX_IHD = index_value;
-	/* Wait while Core write operation is in progress */
-	while (IS_BIT_SET(NPCX_SIBCTRL, NPCX_SIBCTRL_CSWR))
-		;
-
-	/* Specify the io_offset A0 = 1. the data register is accessed */
-	NPCX_IHIOA = io_offset+1;
-	/* Write the data. This starts the write access to the host module */
-	NPCX_IHD = io_data;
-	/* Wait while Core write operation is in progress */
-	while (IS_BIT_SET(NPCX_SIBCTRL, NPCX_SIBCTRL_CSWR))
-		;
-
-	/* Disable Core access to CFG module */
-	CLEAR_BIT(NPCX_CRSMAE, NPCX_CRSMAE_CFGAE);
-	/* Disable Core-to-Host Modules Access */
-	CLEAR_BIT(NPCX_SIBCTRL, NPCX_SIBCTRL_CSAE);
-	/* unlock host CFG  module */
-	CLEAR_BIT(NPCX_LKSIOHA, NPCX_LKSIOHA_LKCFG);
-
-	/* Enable interrupts */
-	interrupt_enable();
-}
-
-uint8_t lpc_sib_read_reg(uint8_t io_offset, uint8_t index_value)
-{
-	uint8_t data_value;
-
-	/* Disable interrupts */
-	interrupt_disable();
-
-	/* Lock host CFG module */
-	SET_BIT(NPCX_LKSIOHA, NPCX_LKSIOHA_LKCFG);
-	/* Enable Core-to-Host Modules Access */
-	SET_BIT(NPCX_SIBCTRL, NPCX_SIBCTRL_CSAE);
-	/* Enable Core access to CFG module */
-	SET_BIT(NPCX_CRSMAE, NPCX_CRSMAE_CFGAE);
-	/* Verify Core read/write to host modules is not in progress */
-	while (IS_BIT_SET(NPCX_SIBCTRL, NPCX_SIBCTRL_CSRD))
-		;
-	while (IS_BIT_SET(NPCX_SIBCTRL, NPCX_SIBCTRL_CSWR))
-		;
-
-
-	/* Specify the io_offset A0 = 0. the index register is accessed */
-	NPCX_IHIOA = io_offset;
-	/* Write the data. This starts the write access to the host module */
-	NPCX_IHD = index_value;
-	/* Wait while Core write operation is in progress */
-	while (IS_BIT_SET(NPCX_SIBCTRL, NPCX_SIBCTRL_CSWR))
-		;
-
-	/* Specify the io_offset A0 = 1. the data register is accessed */
-	NPCX_IHIOA = io_offset+1;
-	/* Start a Core read from host module */
-	SET_BIT(NPCX_SIBCTRL, NPCX_SIBCTRL_CSRD);
-	/* Wait while Core read operation is in progress */
-	while (IS_BIT_SET(NPCX_SIBCTRL, NPCX_SIBCTRL_CSRD))
-		;
-	/* Read the data */
-	data_value = NPCX_IHD;
-
-	/* Disable Core access to CFG module */
-	CLEAR_BIT(NPCX_CRSMAE, NPCX_CRSMAE_CFGAE);
-	/* Disable Core-to-Host Modules Access */
-	CLEAR_BIT(NPCX_SIBCTRL, NPCX_SIBCTRL_CSAE);
-	/* unlock host CFG  module */
-	CLEAR_BIT(NPCX_LKSIOHA, NPCX_LKSIOHA_LKCFG);
-
-	/* Enable interrupts */
-	interrupt_enable();
-
-	return data_value;
-}
 
 /* For LPC host register initial via SIB module */
 void host_register_init(void)
 {
-	/* enable ACPI*/
-	lpc_sib_write_reg(SIO_OFFSET, 0x07, 0x11);
-	lpc_sib_write_reg(SIO_OFFSET, 0x30, 0x01);
+	/* Enable Core-to-Host Modules Access */
+	SET_BIT(NPCX_SIBCTRL, NPCX_SIBCTRL_CSAE);
 
-	/* enable KBC*/
-	lpc_sib_write_reg(SIO_OFFSET, 0x07, 0x06);
-	lpc_sib_write_reg(SIO_OFFSET, 0x30, 0x01);
+	/* enable ACPI*/
+	sib_write_reg(SIO_OFFSET, 0x07, 0x11);
+	sib_write_reg(SIO_OFFSET, 0x30, 0x01);
+
+	/* Enable kbc and mouse */
+#ifdef HAS_TASK_KEYPROTO
+	/* LDN = 0x06 : keyboard */
+	sib_write_reg(SIO_OFFSET, 0x07, 0x06);
+	sib_write_reg(SIO_OFFSET, 0x30, 0x01);
+
+	/* LDN = 0x05 : mouse */
+	if (IS_ENABLED(CONFIG_PS2)) {
+		sib_write_reg(SIO_OFFSET, 0x07, 0x05);
+		sib_write_reg(SIO_OFFSET, 0x30, 0x01);
+	}
+#endif
 
 	/* Setting PMC2 */
 	/* LDN register = 0x12(PMC2) */
-	lpc_sib_write_reg(SIO_OFFSET, 0x07, 0x12);
+	sib_write_reg(SIO_OFFSET, 0x07, 0x12);
 	/* CMD port is 0x200 */
-	lpc_sib_write_reg(SIO_OFFSET, 0x60, 0x02);
-	lpc_sib_write_reg(SIO_OFFSET, 0x61, 0x00);
+	sib_write_reg(SIO_OFFSET, 0x60, 0x02);
+	sib_write_reg(SIO_OFFSET, 0x61, 0x00);
 	/* Data port is 0x204 */
-	lpc_sib_write_reg(SIO_OFFSET, 0x62, 0x02);
-	lpc_sib_write_reg(SIO_OFFSET, 0x63, 0x04);
+	sib_write_reg(SIO_OFFSET, 0x62, 0x02);
+	sib_write_reg(SIO_OFFSET, 0x63, 0x04);
 	/* enable PMC2 */
-	lpc_sib_write_reg(SIO_OFFSET, 0x30, 0x01);
+	sib_write_reg(SIO_OFFSET, 0x30, 0x01);
 
 	/* Setting SHM */
 	/* LDN register = 0x0F(SHM) */
-	lpc_sib_write_reg(SIO_OFFSET, 0x07, 0x0F);
+	sib_write_reg(SIO_OFFSET, 0x07, 0x0F);
 	/* WIN1&2 mapping to IO */
-	lpc_sib_write_reg(SIO_OFFSET, 0xF1,
-			lpc_sib_read_reg(SIO_OFFSET, 0xF1) | 0x30);
-	/* Host Command on the IO:0x0800 */
-	lpc_sib_write_reg(SIO_OFFSET, 0xF7, 0x00);
-	lpc_sib_write_reg(SIO_OFFSET, 0xF6, 0x00);
-	lpc_sib_write_reg(SIO_OFFSET, 0xF5, 0x08);
-	lpc_sib_write_reg(SIO_OFFSET, 0xF4, 0x00);
+	sib_write_reg(SIO_OFFSET, 0xF1,
+			sib_read_reg(SIO_OFFSET, 0xF1) | 0x30);
 	/* WIN1 as Host Command on the IO:0x0800 */
-	lpc_sib_write_reg(SIO_OFFSET, 0xFB, 0x00);
-	lpc_sib_write_reg(SIO_OFFSET, 0xFA, 0x00);
+	sib_write_reg(SIO_OFFSET, 0xF5, 0x08);
+	sib_write_reg(SIO_OFFSET, 0xF4, 0x00);
 	/* WIN2 as MEMMAP on the IO:0x900 */
-	lpc_sib_write_reg(SIO_OFFSET, 0xF9, 0x09);
-	lpc_sib_write_reg(SIO_OFFSET, 0xF8, 0x00);
+	sib_write_reg(SIO_OFFSET, 0xF9, 0x09);
+	sib_write_reg(SIO_OFFSET, 0xF8, 0x00);
 	/* enable SHM */
-	lpc_sib_write_reg(SIO_OFFSET, 0x30, 0x01);
-
-	/* An active LRESET or PLTRST does not generate host domain reset */
-	SET_BIT(NPCX_RSTCTL, NPCX_RSTCTL_LRESET_PLTRST_MODE);
+	sib_write_reg(SIO_OFFSET, 0x30, 0x01);
 
 	CPRINTS("Host settings are done!");
 
@@ -832,34 +678,7 @@ int lpc_get_pltrst_asserted(void)
 	return IS_BIT_SET(NPCX_MSWCTL1, NPCX_MSWCTL1_PLTRST_ACT);
 }
 
-void lpc_host_reset(void)
-{
-	/* Host Reset Control will assert KBRST# (LPC) or RCIN# VW (eSPI) */
-#ifdef CONFIG_ESPI_VW_SIGNALS
-	int timeout = 100; /* 100 * 10us = 1ms */
-
-	/* Assert RCIN# VW to host */
-	SET_BIT(NPCX_MSWCTL1, NPCX_MSWCTL1_HRSTOB);
-
-	/* Poll for dirty bit to clear to indicate VW read by host */
-	while ((NPCX_VWEVSM(2) & VWEVSM_DIRTY(1))) {
-		if (!timeout--) {
-			CPRINTS("RCIN# VW Timeout");
-			break;
-		}
-		udelay(10);
-	}
-
-	/* Deassert RCIN# VW to host */
-	CLEAR_BIT(NPCX_MSWCTL1, NPCX_MSWCTL1_HRSTOB);
-#else
-	SET_BIT(NPCX_MSWCTL1, NPCX_MSWCTL1_HRSTOB);
-	udelay(10);
-	CLEAR_BIT(NPCX_MSWCTL1, NPCX_MSWCTL1_HRSTOB);
-#endif
-}
-
-#ifndef CONFIG_ESPI
+#ifndef CONFIG_HOSTCMD_ESPI
 /* Initialize host settings by interrupt */
 void lpc_lreset_pltrst_handler(void)
 {
@@ -874,8 +693,7 @@ void lpc_lreset_pltrst_handler(void)
 
 	pltrst_asserted = lpc_get_pltrst_asserted();
 
-	ccprintf("LPC RESET# %sasserted",
-		pltrst_asserted ? "" : "de");
+	CPRINTS("LPC RESET# %sasserted", pltrst_asserted ? "" : "de");
 
 	/*
 	 * Once LRESET is de-asserted (low -> high), we need to initialize lpc
@@ -885,6 +703,8 @@ void lpc_lreset_pltrst_handler(void)
 	if (!pltrst_asserted)
 		host_register_init();
 	else {
+		/* Clear processing flag when LRESET is asserted */
+		CLEAR_BIT(NPCX_HIPMST(PMC_HOST_CMD), NPCX_HIPMST_F0);
 #ifdef CONFIG_CHIPSET_RESET_HOOK
 		/* Notify HOOK_CHIPSET_RESET */
 		hook_call_deferred(&lpc_chipset_reset_data, MSEC);
@@ -901,11 +721,16 @@ static void lpc_init(void)
 	/* Enable clock for LPC peripheral */
 	clock_enable_peripheral(CGC_OFFSET_LPC, CGC_LPC_MASK,
 			CGC_MODE_RUN | CGC_MODE_SLEEP);
-#ifdef CONFIG_ESPI
-	/* Enable clock for eSPI peripheral */
-	clock_enable_peripheral(CGC_OFFSET_ESPI, CGC_ESPI_MASK,
-		CGC_MODE_RUN | CGC_MODE_SLEEP);
-	/* Initialize eSPI IP */
+	/*
+	 * In npcx5/7, the host interface type (HIF_TYP_SEL in the DEVCNT
+	 * register) is updated by booter after VCC1 Power-Up reset according to
+	 * VHIF voltage.
+	 * In npcx9, the booter will not do this anymore. The HIF_TYP_SEL
+	 * field should be set by firmware.
+	 */
+#ifdef CONFIG_HOSTCMD_ESPI
+	/* Initialize eSPI module */
+	NPCX_DEVCNT |= 0x08;
 	espi_init();
 #else
 	/* Switching to LPC interface */
@@ -919,7 +744,7 @@ static void lpc_init(void)
 	/* Clear Host Access Hold state */
 	NPCX_SMC_CTL = 0xC0;
 
-#ifndef CONFIG_ESPI
+#ifndef CONFIG_HOSTCMD_ESPI
 	/*
 	 * Set alternative pin from GPIO to CLKRUN no matter SERIRQ is under
 	 * continuous or quiet mode.
@@ -932,13 +757,13 @@ static void lpc_init(void)
 	 * valid if CONFIG_SCI_GPIO isn't defined. eSPI sends SMI/SCI through VW
 	 * automatically by toggling them, too. It's unnecessary to set pin mux.
 	 */
-#if !defined(CONFIG_SCI_GPIO) && !defined(CONFIG_ESPI)
+#if !defined(CONFIG_SCI_GPIO) && !defined(CONFIG_HOSTCMD_ESPI)
 	SET_BIT(NPCX_DEVALT(1), NPCX_DEVALT1_EC_SCI_SL);
 	SET_BIT(NPCX_DEVALT(1), NPCX_DEVALT1_SMI_SL);
 #endif
 
 	/* Initialize Hardware for UART Host */
-#if CONFIG_UART_HOST
+#ifdef CONFIG_UART_HOST
 	/* Init COMx LPC UART */
 	/* FMCLK have to using 50MHz */
 	NPCX_DEVALT(0xB) = 0xFF;
@@ -950,8 +775,6 @@ static void lpc_init(void)
 
 	/* Don't stall SHM transactions */
 	NPCX_SHM_CTL = NPCX_SHM_CTL & ~0x40;
-	/* Semaphore and Indirect access disable */
-	NPCX_SHCFG = 0xE0;
 	/* Disable Protect Win1&2*/
 	NPCX_WIN_WR_PROT(0) = 0;
 	NPCX_WIN_WR_PROT(1) = 0;
@@ -969,9 +792,14 @@ static void lpc_init(void)
 			EC_HOST_CMD_FLAG_LPC_ARGS_SUPPORTED |
 			EC_HOST_CMD_FLAG_VERSION_3;
 
+	/*
+	 * Clear processing flag before enabling lpc's interrupts in case
+	 * it's set by the other command during sysjump.
+	 */
+	CLEAR_BIT(NPCX_HIPMST(PMC_HOST_CMD), NPCX_HIPMST_F0);
+
 	/* Turn on PMC2 for Host Command usage */
 	SET_BIT(NPCX_HIPMCTL(PMC_HOST_CMD), 0);
-	SET_BIT(NPCX_HIPMCTL(PMC_HOST_CMD), 1);
 
 	/*
 	 * Set required control value (avoid setting HOSTWAIT bit at this stage)
@@ -980,23 +808,24 @@ static void lpc_init(void)
 	/* Clear status */
 	NPCX_SMC_STS = NPCX_SMC_STS;
 
-	/* Restore event masks if needed */
-	lpc_post_sysjump();
-
 	/* Create mailbox */
 
 	/*
 	 * Init KBC
 	 * Clear OBF status flag,
-	 * IBF(K&M) INT enable, OBE(K&M) empty INT enable ,
+	 * IBF(K&M) INT enable,
 	 * OBF Mouse Full INT enable and OBF KB Full INT enable
 	 */
-	NPCX_HICTRL = 0x8F;
+#ifdef HAS_TASK_KEYPROTO
+	lpc_keyboard_clear_buffer();
+	NPCX_HICTRL = 0x0B;
+#endif
+
 	/*
 	 * Turn on enhance mode on PM channel-1,
-	 * enable OBE/IBF core interrupt
+	 * enable IBF core interrupt
 	 */
-	NPCX_HIPMCTL(PMC_ACPI) |= 0x83;
+	NPCX_HIPMCTL(PMC_ACPI) |= 0x81;
 	/* Normally Polarity IRQ1,12 type (level + high) setting */
 	NPCX_HIIRQC = 0x00;
 
@@ -1004,7 +833,7 @@ static void lpc_init(void)
 	 * Init PORT80
 	 * Enable Port80, Enable Port80 function & Interrupt & Read auto
 	 */
-#ifdef CONFIG_ESPI
+#ifdef CONFIG_HOSTCMD_ESPI
 	NPCX_DP80CTL = 0x2b;
 #else
 	NPCX_DP80CTL = 0x29;
@@ -1025,7 +854,7 @@ static void lpc_init(void)
 	CLEAR_BIT(NPCX_HIPMIC(PMC_ACPI), NPCX_HIPMIC_SMIPOL);
 	/* Set SMIB/SCIB to make sure SMI/SCI are high at init */
 	NPCX_HIPMIC(PMC_ACPI) = NPCX_HIPMIC(PMC_ACPI)
-			| (1 << NPCX_HIPMIC_SMIB) | (1 << NPCX_HIPMIC_SCIB);
+			| BIT(NPCX_HIPMIC_SMIB) | BIT(NPCX_HIPMIC_SCIB);
 #ifndef CONFIG_SCI_GPIO
 	/*
 	 * Allow SMI/SCI generated from PM module.
@@ -1041,7 +870,7 @@ static void lpc_init(void)
 	init_done = 1;
 
 	/* Update host events now that we can copy them to memmap */
-	update_host_event_status();
+	lpc_update_host_event_status();
 
 	/*
 	 * TODO: For testing LPC with Chromebox, please make sure LPC_CLK is
@@ -1054,13 +883,23 @@ static void lpc_init(void)
 	/* initial IO port address via SIB-write modules */
 	host_register_init();
 #else
-	/* Initialize LRESET# interrupt */
+#ifndef CONFIG_HOSTCMD_ESPI
+	/*
+	 * Initialize LRESET# interrupt only in case of LPC. For eSPI, there is
+	 * no dedicated GPIO pin for LRESET/PLTRST. PLTRST is indicated as a VW
+	 * signal instead. WUI57 of table 0 is set when EC receives
+	 * LRESET/PLTRST from either VW or GPIO. Since WUI57 of table 0 and
+	 * WUI15 of table 2 are issued at the same time in case of eSPI, there
+	 * is no need to indicate LRESET/PLTRST via two sources. Thus, do not
+	 * initialize LRESET# interrupt in case of eSPI.
+	 */
 	/* Set detection mode to edge */
 	CLEAR_BIT(NPCX_WKMOD(MIWU_TABLE_0, MIWU_GROUP_5), 7);
 	/* Handle interrupting on any edge */
 	SET_BIT(NPCX_WKAEDG(MIWU_TABLE_0, MIWU_GROUP_5), 7);
 	/* Enable wake-up input sources */
 	SET_BIT(NPCX_WKEN(MIWU_TABLE_0, MIWU_GROUP_5), 7);
+#endif
 #endif
 }
 /*
@@ -1069,30 +908,13 @@ static void lpc_init(void)
  */
 DECLARE_HOOK(HOOK_INIT, lpc_init, HOOK_PRIO_INIT_LPC);
 
-static void lpc_resume(void)
-{
-#ifdef CONFIG_POWER_S0IX
-	if (chipset_in_state(CHIPSET_STATE_SUSPEND | CHIPSET_STATE_ON))
-#endif
-	{
-		/* Mask all host events until the host unmasks them itself.  */
-		lpc_set_host_event_mask(LPC_HOST_EVENT_SMI, 0);
-		lpc_set_host_event_mask(LPC_HOST_EVENT_SCI, 0);
-		lpc_set_host_event_mask(LPC_HOST_EVENT_WAKE, 0);
-	}
-
-	/* Store port 80 event so we know where resume happened */
-	port_80_write(PORT_80_EVENT_RESUME);
-}
-DECLARE_HOOK(HOOK_CHIPSET_RESUME, lpc_resume, HOOK_PRIO_DEFAULT);
-
 /* Get protocol information */
-static int lpc_get_protocol_info(struct host_cmd_handler_args *args)
+static enum ec_status lpc_get_protocol_info(struct host_cmd_handler_args *args)
 {
 	struct ec_response_get_protocol_info *r = args->response;
 
 	memset(r, 0, sizeof(*r));
-	r->protocol_versions = (1 << 2) | (1 << 3);
+	r->protocol_versions = BIT(3);
 	r->max_request_packet_size = EC_LPC_HOST_PACKET_SIZE;
 	r->max_response_packet_size = EC_LPC_HOST_PACKET_SIZE;
 	r->flags = 0;
@@ -1105,51 +927,22 @@ DECLARE_HOST_COMMAND(EC_CMD_GET_PROTOCOL_INFO,
 		lpc_get_protocol_info,
 		EC_VER_MASK(0));
 
-#ifdef CONFIG_POWER_S0IX
-static void lpc_clear_host_events(void)
+#if DEBUG_LPC
+static int command_lpc(int argc, char **argv)
 {
-	while (lpc_query_host_event_state() != 0)
-		;
+	if (argc == 1)
+		return EC_ERROR_PARAM1;
+
+	if (!strcasecmp(argv[1], "sci"))
+		lpc_generate_sci();
+	else if (!strcasecmp(argv[1], "smi"))
+		lpc_generate_smi();
+	else if (!strcasecmp(argv[1], "wake"))
+		lpc_update_wake(-1);
+	else
+		return EC_ERROR_PARAM1;
+	return EC_SUCCESS;
 }
+DECLARE_CONSOLE_COMMAND(lpc, command_lpc, "[sci|smi|wake]", "Trigger SCI/SMI");
 
-/*
- * In AP S0 -> S3 & S0ix transitions,
- * the chipset_suspend is called.
- *
- * The chipset_in_state(CHIPSET_STATE_STANDBY | CHIPSET_STATE_ON)
- * is used to detect the S0ix transiton.
- *
- * During S0ix entry, the wake mask for lid open is enabled.
- */
-void lpc_enable_wake_mask_for_lid_open(void)
-{
-	if (chipset_in_state(CHIPSET_STATE_STANDBY | CHIPSET_STATE_ON)) {
-		uint32_t mask;
-
-		mask = lpc_get_host_event_mask(LPC_HOST_EVENT_WAKE) |
-			EC_HOST_EVENT_MASK(EC_HOST_EVENT_LID_OPEN);
-
-		lpc_set_host_event_mask(LPC_HOST_EVENT_WAKE, mask);
-	}
-}
-
-/*
- * In AP S0ix & S3 -> S0 transitions,
- * the chipset_resume hook is called.
- *
- * During S0ix exit, the wake mask for lid open is disabled.
- * All pending events are cleared
- */
-void lpc_disable_wake_mask_for_lid_open(void)
-{
-	if (chipset_in_state(CHIPSET_STATE_STANDBY | CHIPSET_STATE_ON)) {
-		uint32_t mask;
-
-		mask = lpc_get_host_event_mask(LPC_HOST_EVENT_WAKE) &
-			~EC_HOST_EVENT_MASK(EC_HOST_EVENT_LID_OPEN);
-
-		lpc_set_host_event_mask(LPC_HOST_EVENT_WAKE, mask);
-		lpc_clear_host_events();
-	}
-}
 #endif

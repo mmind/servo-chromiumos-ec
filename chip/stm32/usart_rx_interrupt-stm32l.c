@@ -1,4 +1,4 @@
-/* Copyright (c) 2015 The Chromium OS Authors. All rights reserved.
+/* Copyright 2015 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -39,14 +39,14 @@ static void usart_rx_interrupt_handler(struct usart_config const *config)
 		if (!(status & STM32_USART_SR_RXNE))
 			(void)STM32_USART_RDR(config->hw->base);
 
-		atomic_add(&config->state->rx_overrun, 1);
+		atomic_add((uint32_t *)&(config->state->rx_overrun), 1);
 	}
 
 	if (status & STM32_USART_SR_RXNE) {
 		uint8_t byte = STM32_USART_RDR(base);
 
 		if (!queue_add_unit(config->producer.queue, &byte))
-			atomic_add(&config->state->rx_dropped, 1);
+			atomic_add((uint32_t *)&(config->state->rx_dropped), 1);
 	}
 }
 

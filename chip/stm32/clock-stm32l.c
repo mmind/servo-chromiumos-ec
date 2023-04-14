@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -33,8 +33,8 @@ static int fake_hibernate;
  * because it's the lowest clock rate we can still run 115200 baud serial
  * for the debug console.
  */
-#define MSI_2MHZ_CLOCK (1 << 21)
-#define MSI_1MHZ_CLOCK (1 << 20)
+#define MSI_2MHZ_CLOCK BIT(21)
+#define MSI_1MHZ_CLOCK BIT(20)
 
 enum clock_osc {
 	OSC_INIT = 0,	/* Uninitialized */
@@ -50,16 +50,21 @@ int clock_get_freq(void)
 	return freq;
 }
 
+int clock_get_timer_freq(void)
+{
+	return clock_get_freq();
+}
+
 void clock_wait_bus_cycles(enum bus_type bus, uint32_t cycles)
 {
-	volatile uint32_t dummy __attribute__((unused));
+	volatile uint32_t unused __attribute__((unused));
 
 	if (bus == BUS_AHB) {
 		while (cycles--)
-			dummy = STM32_DMA1_REGS->isr;
+			unused = STM32_DMA1_REGS->isr;
 	} else { /* APB */
 		while (cycles--)
-			dummy = STM32_USART_BRR(STM32_USART1_BASE);
+			unused = STM32_USART_BRR(STM32_USART1_BASE);
 	}
 }
 
@@ -81,13 +86,8 @@ static void clock_set_osc(enum clock_osc osc)
 	switch (osc) {
 	case OSC_HSI:
 		/* Ensure that HSI is ON */
-		if (!(STM32_RCC_CR & STM32_RCC_CR_HSIRDY)) {
-			/* Enable HSI */
-			STM32_RCC_CR |= STM32_RCC_CR_HSION;
-			/* Wait for HSI to be ready */
-			while (!(STM32_RCC_CR & STM32_RCC_CR_HSIRDY))
-				;
-		}
+		wait_for_ready(&STM32_RCC_CR,
+			       STM32_RCC_CR_HSION, STM32_RCC_CR_HSIRDY);
 
 		/* Disable LPSDSR */
 		STM32_PWR_CR &= ~STM32_PWR_CR_LPSDSR;
@@ -137,13 +137,8 @@ static void clock_set_osc(enum clock_osc osc)
 			(STM32_RCC_ICSCR & ~STM32_RCC_ICSCR_MSIRANGE_MASK) |
 			STM32_RCC_ICSCR_MSIRANGE_1MHZ;
 		/* Ensure that MSI is ON */
-		if (!(STM32_RCC_CR & STM32_RCC_CR_MSIRDY)) {
-			/* Enable MSI */
-			STM32_RCC_CR |= STM32_RCC_CR_MSION;
-			/* Wait for MSI to be ready */
-			while (!(STM32_RCC_CR & STM32_RCC_CR_MSIRDY))
-				;
-		}
+		wait_for_ready(&STM32_RCC_CR,
+			       STM32_RCC_CR_MSION, STM32_RCC_CR_MSIRDY);
 
 		/* Switch to MSI */
 		STM32_RCC_CFGR = STM32_RCC_CFGR_SW_MSI;
@@ -206,9 +201,9 @@ void clock_enable_module(enum module_id module, int enable)
 	int new_mask;
 
 	if (enable)
-		new_mask = clock_mask | (1 << module);
+		new_mask = clock_mask | BIT(module);
 	else
-		new_mask = clock_mask & ~(1 << module);
+		new_mask = clock_mask & ~BIT(module);
 
 	/* Only change clock if needed */
 	if ((!!new_mask) != (!!clock_mask)) {
@@ -276,7 +271,7 @@ void __enter_hibernate(uint32_t seconds, uint32_t microseconds)
 	 *
 	 * A little hacky to do this here.
 	 */
-	for (i = GPIO_KB_OUT00; i < GPIO_KB_OUT00 + KEYBOARD_COLS; i++)
+	for (i = GPIO_KB_OUT00; i < GPIO_KB_OUT00 + KEYBOARD_COLS_MAX; i++)
 		gpio_set_flags(i, GPIO_INPUT);
 
 	ccprints("fake hibernate. waits for power button/lid/RTC/AC");

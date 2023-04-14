@@ -4,16 +4,11 @@
  */
 
 #include "common.h"
-#include "uart.h"
-#include "timer.h"
-#include "watchdog.h"
-#include "dut_common.h"
 #include "cts_common.h"
-
-enum cts_rc debug_test(void)
-{
-	return CTS_RC_SUCCESS;
-}
+#include "task.h"
+#include "timer.h"
+#include "uart.h"
+#include "watchdog.h"
 
 enum cts_rc success_test(void)
 {
@@ -35,17 +30,12 @@ enum cts_rc fail_both_test(void)
 	return CTS_RC_FAILURE;
 }
 
-enum cts_rc bad_sync_and_success_test(void)
+enum cts_rc bad_sync_test(void)
 {
-	return CTS_RC_BAD_SYNC;
+	return CTS_RC_SUCCESS;
 }
 
 enum cts_rc bad_sync_both_test(void)
-{
-	return CTS_RC_BAD_SYNC;
-}
-
-enum cts_rc bad_sync_failure_test(void)
 {
 	return CTS_RC_BAD_SYNC;
 }
@@ -60,7 +50,7 @@ enum cts_rc hang_test(void)
 	return CTS_RC_SUCCESS;
 }
 
-enum cts_rc post_corruption_success(void)
+enum cts_rc did_not_start_test(void)
 {
 	return CTS_RC_SUCCESS;
 }
@@ -69,21 +59,6 @@ enum cts_rc post_corruption_success(void)
 
 void cts_task(void)
 {
-	enum cts_rc result;
-	int i;
-
-	cflush();
-	for (i = 0; i < CTS_TEST_ID_COUNT; i++) {
-		sync();
-		result = tests[i].run();
-		CPRINTF("\n%s %d\n", tests[i].name, result);
-		cflush();
-	}
-
-	CPRINTS("GPIO test suite finished");
-	cflush();
-	while (1) {
-		watchdog_reload();
-		sleep(1);
-	}
+	cts_main_loop(tests, "Meta");
+	task_wait_event(-1);
 }

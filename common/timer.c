@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -6,6 +6,7 @@
 /* Timer module for Chrome EC operating system */
 
 #include "atomic.h"
+#include "common.h"
 #include "console.h"
 #include "hooks.h"
 #include "hwtimer.h"
@@ -13,11 +14,19 @@
 #include "util.h"
 #include "task.h"
 #include "timer.h"
+#include "watchdog.h"
+
+#ifdef CONFIG_ZEPHYR
+#include <kernel.h> /* For k_usleep() */
+#else
+extern __error("k_usleep() should only be called from Zephyr code")
+int32_t k_usleep(int32_t);
+#endif /* CONFIG_ZEPHYR */
 
 #define TIMER_SYSJUMP_TAG 0x4d54  /* "TM" */
 
-/* High word of the 64-bit timestamp counter  */
-static volatile uint32_t clksrc_high;
+/* High 32-bits of the 64-bit timestamp counter. */
+STATIC_IF_NOT(CONFIG_HWTIMER_64BIT) uint32_t clksrc_high;
 
 /* Bitmap of currently running timers */
 static uint32_t timer_running;
@@ -32,9 +41,9 @@ static int timer_irq;
 static void expire_timer(task_id_t tskid)
 {
 	/* we are done with this timer */
-	atomic_clear(&timer_running, 1 << tskid);
+	atomic_clear_bits(&timer_running, 1 << tskid);
 	/* wake up the taks waiting for this timer */
-	task_set_event(tskid, TASK_EVENT_TIMER, 0);
+	task_set_event(tskid, TASK_EVENT_TIMER);
 }
 
 int timestamp_expired(timestamp_t deadline, const timestamp_t *now)
@@ -55,7 +64,7 @@ void process_timers(int overflow)
 	timestamp_t next;
 	timestamp_t now;
 
-	if (overflow)
+	if (!IS_ENABLED(CONFIG_HWTIMER_64BIT) && overflow)
 		clksrc_high++;
 
 	do {
@@ -76,7 +85,7 @@ void process_timers(int overflow)
 					  next.le.lo))
 					next.val = timer_deadline[tskid].val;
 
-				check_timer &= ~(1 << tskid);
+				check_timer &= ~BIT(tskid);
 			}
 		/* if there is a new timer, let's retry */
 		} while (timer_running & ~running_t0);
@@ -113,19 +122,21 @@ void udelay(unsigned us)
 }
 #endif
 
-int timer_arm(timestamp_t tstamp, task_id_t tskid)
+int timer_arm(timestamp_t event, task_id_t tskid)
 {
+	timestamp_t now = get_time();
+
 	ASSERT(tskid < TASK_ID_COUNT);
 
-	if (timer_running & (1<<tskid))
+	if (timer_running & BIT(tskid))
 		return EC_ERROR_BUSY;
 
-	timer_deadline[tskid] = tstamp;
-	atomic_or(&timer_running, 1<<tskid);
+	timer_deadline[tskid] = event;
+	atomic_or(&timer_running, BIT(tskid));
 
 	/* Modify the next event if needed */
-	if ((tstamp.le.hi < clksrc_high) ||
-	    ((tstamp.le.hi == clksrc_high) && (tstamp.le.lo <= next_deadline)))
+	if ((event.le.hi < now.le.hi) ||
+	    ((event.le.hi == now.le.hi) && (event.le.lo <= next_deadline)))
 		task_trigger_irq(timer_irq);
 
 	return EC_SUCCESS;
@@ -135,7 +146,7 @@ void timer_cancel(task_id_t tskid)
 {
 	ASSERT(tskid < TASK_ID_COUNT);
 
-	atomic_clear(&timer_running, 1 << tskid);
+	atomic_clear_bits(&timer_running, BIT(tskid));
 	/*
 	 * Don't need to cancel the hardware timer interrupt, instead do
 	 * timer-related housekeeping when the next timer interrupt fires.
@@ -151,7 +162,15 @@ void timer_cancel(task_id_t tskid)
 void usleep(unsigned us)
 {
 	uint32_t evt = 0;
-	uint32_t t0 = __hw_clock_source_read();
+	uint32_t t0;
+
+	if (IS_ENABLED(CONFIG_ZEPHYR)) {
+		while (us)
+			us = k_usleep(us);
+		return;
+	}
+
+	t0 = __hw_clock_source_read();
 
 	/* If task scheduling has not started, just delay */
 	if (!task_start_called()) {
@@ -174,12 +193,18 @@ void usleep(unsigned us)
 timestamp_t get_time(void)
 {
 	timestamp_t ts;
-	ts.le.hi = clksrc_high;
-	ts.le.lo = __hw_clock_source_read();
-	if (ts.le.hi != clksrc_high) {
+
+	if (IS_ENABLED(CONFIG_HWTIMER_64BIT)) {
+		ts.val = __hw_clock_source_read64();
+	} else {
 		ts.le.hi = clksrc_high;
 		ts.le.lo = __hw_clock_source_read();
+		if (ts.le.hi != clksrc_high) {
+			ts.le.hi = clksrc_high;
+			ts.le.lo = __hw_clock_source_read();
+		}
 	}
+
 	return ts;
 }
 
@@ -191,38 +216,57 @@ clock_t clock(void)
 
 void force_time(timestamp_t ts)
 {
-	clksrc_high = ts.le.hi;
-	__hw_clock_source_set(ts.le.lo);
+	if (IS_ENABLED(CONFIG_HWTIMER_64BIT)) {
+		__hw_clock_source_set64(ts.val);
+	} else {
+		clksrc_high = ts.le.hi;
+		__hw_clock_source_set(ts.le.lo);
+	}
+
 	/* some timers might be already expired : process them */
 	task_trigger_irq(timer_irq);
 }
 
-#ifdef CONFIG_CMD_TIMERINFO
+/*
+ * Define versions of __hw_clock_source_read and __hw_clock_source_set
+ * that wrap the 64-bit versions for chips with CONFIG_HWTIMER_64BIT.
+ */
+#ifdef CONFIG_HWTIMER_64BIT
+__overridable uint32_t __hw_clock_source_read(void)
+{
+	return (uint32_t)__hw_clock_source_read64();
+}
+
+void __hw_clock_source_set(uint32_t ts)
+{
+	uint64_t current = __hw_clock_source_read64();
+
+	__hw_clock_source_set64(((current >> 32) << 32) | ts);
+}
+#endif /* CONFIG_HWTIMER_64BIT */
+
 void timer_print_info(void)
 {
-	uint64_t t = get_time().val;
-	uint64_t deadline = (uint64_t)clksrc_high << 32 |
+	timestamp_t t = get_time();
+	uint64_t deadline = (uint64_t)t.le.hi << 32 |
 		__hw_clock_event_get();
 	int tskid;
 
-	ccprintf("Time:     0x%016lx us\n"
-		 "Deadline: 0x%016lx -> %11.6ld s from now\n"
+	ccprintf("Time:     0x%016llx us, %11.6lld s\n"
+		 "Deadline: 0x%016llx -> %11.6lld s from now\n"
 		 "Active timers:\n",
-		 t, deadline, deadline - t);
+		 t.val, t.val, deadline, deadline - t.val);
 	cflush();
 
 	for (tskid = 0; tskid < TASK_ID_COUNT; tskid++) {
-		if (timer_running & (1<<tskid)) {
-			ccprintf("  Tsk %2d  0x%016lx -> %11.6ld\n", tskid,
+		if (timer_running & BIT(tskid)) {
+			ccprintf("  Tsk %2d  0x%016llx -> %11.6lld\n", tskid,
 				 timer_deadline[tskid].val,
-				 timer_deadline[tskid].val - t);
+				 timer_deadline[tskid].val - t.val);
 			cflush();
 		}
 	}
 }
-#else
-void timer_print_info(void) { }
-#endif
 
 void timer_init(void)
 {
@@ -235,11 +279,17 @@ void timer_init(void)
 	ts = (const timestamp_t *)system_get_jump_tag(TIMER_SYSJUMP_TAG,
 						      &version, &size);
 	if (ts && version == 1 && size == sizeof(timestamp_t)) {
-		clksrc_high = ts->le.hi;
-		timer_irq = __hw_clock_source_init(ts->le.lo);
+		if (IS_ENABLED(CONFIG_HWTIMER_64BIT)) {
+			timer_irq = __hw_clock_source_init64(ts->val);
+		} else {
+			clksrc_high = ts->le.hi;
+			timer_irq = __hw_clock_source_init(ts->le.lo);
+		}
 	} else {
-		clksrc_high = 0;
-		timer_irq = __hw_clock_source_init(0);
+		if (IS_ENABLED(CONFIG_HWTIMER_64BIT))
+			timer_irq = __hw_clock_source_init64(0);
+		else
+			timer_irq = __hw_clock_source_init(0);
 	}
 }
 
@@ -265,16 +315,35 @@ static int command_wait(int argc, char **argv)
 	if (*e)
 		return EC_ERROR_PARAM1;
 
+	/*
+	 * Reload the watchdog so that issuing multiple small waitms commands
+	 * quickly one after the other will not cause a reset.
+	 *
+	 * Reloading before waiting also allows for testing watchdog.
+	 */
+	watchdog_reload();
+
+	/*
+	 * Waiting for too long (e.g. 3s) will cause the EC to reset due to a
+	 * watchdog timeout. This is intended behaviour and is in fact used by
+	 * a FAFT test to check that the watchdog timer is working.
+	 */
 	udelay(i * 1000);
 
 	return EC_SUCCESS;
 }
+/* Typically a large delay (e.g. 3s) will cause a reset */
 DECLARE_CONSOLE_COMMAND(waitms, command_wait,
 			"msec",
-			"Busy-wait for msec");
+			"Busy-wait for msec (large delays will reset)");
 #endif
 
 #ifdef CONFIG_CMD_FORCETIME
+/*
+ * Force the hwtimer to a given time. This may have undesired consequences,
+ * especially when going "backward" in time, because task deadlines are
+ * left un-adjusted.
+ */
 static int command_force_time(int argc, char **argv)
 {
 	char *e;
@@ -291,7 +360,7 @@ static int command_force_time(int argc, char **argv)
 	if (*e)
 		return EC_ERROR_PARAM2;
 
-	ccprintf("Time: 0x%016lx = %.6ld s\n", new.val, new.val);
+	ccprintf("Time: 0x%016llx = %.6lld s\n", new.val, new.val);
 	force_time(new);
 
 	return EC_SUCCESS;
@@ -301,16 +370,18 @@ DECLARE_CONSOLE_COMMAND(forcetime, command_force_time,
 			"Force current time");
 #endif
 
+#ifdef CONFIG_CMD_GETTIME
 static int command_get_time(int argc, char **argv)
 {
 	timestamp_t ts = get_time();
-	ccprintf("Time: 0x%016lx = %.6ld s\n", ts.val, ts.val);
+	ccprintf("Time: 0x%016llx = %.6lld s\n", ts.val, ts.val);
 
 	return EC_SUCCESS;
 }
 DECLARE_SAFE_CONSOLE_COMMAND(gettime, command_get_time,
 			     NULL,
 			     "Print current time");
+#endif
 
 #ifdef CONFIG_CMD_TIMERINFO
 int command_timer_info(int argc, char **argv)

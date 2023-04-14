@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -53,5 +53,20 @@ void power_button_pch_release(void);
  * For x86 systems, force a pulse of the power button signal to the PCH.
  */
 void power_button_pch_pulse(void);
+
+/**
+ * Returns the time when DSW_PWROK was asserted. It should be customized
+ * by each board. See CONFIG_DELAY_DSW_PWROK_TO_PWRBTN for details.
+ *
+ * @return time in usec when DSW_PWROK was asserted.
+ */
+int64_t get_time_dsw_pwrok(void);
+
+/**
+ * This must be defined when CONFIG_POWER_BUTTON_TO_PCH_CUSTOM is defined. This
+ * allows a board to override the default behavior of
+ * gpio_set_level(GPIO_PCH_PWRBTN_L, level).
+ */
+void board_pwrbtn_to_pch(int level);
 
 #endif  /* __CROS_EC_POWER_BUTTON_H */

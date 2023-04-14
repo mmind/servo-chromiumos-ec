@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -17,13 +17,17 @@
 #include "hooks.h"
 #include "task.h"
 #include "timer.h"
+#include "usb_pd.h"
 #include "util.h"
 #include "spi.h"
 
 /* Indices for hibernate data registers (RAM backed by VBAT) */
 enum hibdata_index {
 	HIBDATA_INDEX_SCRATCHPAD = 0,    /* General-purpose scratchpad */
-	HIBDATA_INDEX_SAVED_RESET_FLAGS  /* Saved reset flags */
+	HIBDATA_INDEX_SAVED_RESET_FLAGS, /* Saved reset flags */
+	HIBDATA_INDEX_PD0,               /* USB-PD0 saved port state */
+	HIBDATA_INDEX_PD1,               /* USB-PD1 saved port state */
+	HIBDATA_INDEX_PD2,               /* USB-PD2 saved port state */
 };
 
 static void check_reset_cause(void)
@@ -42,16 +46,16 @@ static void check_reset_cause(void)
 	* BIT[6] determine VCC1 reset
 	*/
 	if (rst_sts & MEC1322_PWR_RST_STS_VCC1)
-		flags |= RESET_FLAG_RESET_PIN;
+		flags |= EC_RESET_FLAG_RESET_PIN;
 
 
 	flags |= MEC1322_VBAT_RAM(HIBDATA_INDEX_SAVED_RESET_FLAGS);
 	MEC1322_VBAT_RAM(HIBDATA_INDEX_SAVED_RESET_FLAGS) = 0;
 
-	if ((status & MEC1322_VBAT_STS_WDT) && !(flags & (RESET_FLAG_SOFT |
-					    RESET_FLAG_HARD |
-					    RESET_FLAG_HIBERNATE)))
-		flags |= RESET_FLAG_WATCHDOG;
+	if ((status & MEC1322_VBAT_STS_WDT) && !(flags & (EC_RESET_FLAG_SOFT |
+					    EC_RESET_FLAG_HARD |
+					    EC_RESET_FLAG_HIBERNATE)))
+		flags |= EC_RESET_FLAG_WATCHDOG;
 
 	system_set_reset_flags(flags);
 }
@@ -66,12 +70,12 @@ int system_is_reboot_warm(void)
 	check_reset_cause();
 	reset_flags = system_get_reset_flags();
 
-	if ((reset_flags & RESET_FLAG_RESET_PIN) ||
-		(reset_flags & RESET_FLAG_POWER_ON) ||
-		(reset_flags & RESET_FLAG_WATCHDOG) ||
-		(reset_flags & RESET_FLAG_HARD) ||
-		(reset_flags & RESET_FLAG_SOFT) ||
-		(reset_flags & RESET_FLAG_HIBERNATE))
+	if ((reset_flags & EC_RESET_FLAG_RESET_PIN) ||
+		(reset_flags & EC_RESET_FLAG_POWER_ON) ||
+		(reset_flags & EC_RESET_FLAG_WATCHDOG) ||
+		(reset_flags & EC_RESET_FLAG_HARD) ||
+		(reset_flags & EC_RESET_FLAG_SOFT) ||
+		(reset_flags & EC_RESET_FLAG_HIBERNATE))
 		return 0;
 	else
 		return 1;
@@ -86,16 +90,22 @@ void system_pre_init(void)
 	MEC1322_EC_TRACE_EN &= ~1;
 
 	/* Deassert nSIO_RESET */
-	MEC1322_PCR_PWR_RST_CTL &= ~(1 << 0);
+	MEC1322_PCR_PWR_RST_CTL &= ~BIT(0);
 
 	spi_enable(CONFIG_SPI_FLASH_PORT, 1);
 }
 
-void chip_save_reset_flags(int flags)
+void chip_save_reset_flags(uint32_t flags)
 {
 	MEC1322_VBAT_RAM(HIBDATA_INDEX_SAVED_RESET_FLAGS) = flags;
 }
 
+uint32_t chip_read_reset_flags(void)
+{
+	return MEC1322_VBAT_RAM(HIBDATA_INDEX_SAVED_RESET_FLAGS);
+}
+
+noreturn
 void _system_reset(int flags, int wake_from_hibernate)
 {
 	uint32_t save_flags = 0;
@@ -105,17 +115,17 @@ void _system_reset(int flags, int wake_from_hibernate)
 
 	/* Save current reset reasons if necessary */
 	if (flags & SYSTEM_RESET_PRESERVE_FLAGS)
-		save_flags = system_get_reset_flags() | RESET_FLAG_PRESERVED;
+		save_flags = system_get_reset_flags() | EC_RESET_FLAG_PRESERVED;
 
 	if (flags & SYSTEM_RESET_LEAVE_AP_OFF)
-		save_flags |= RESET_FLAG_AP_OFF;
+		save_flags |= EC_RESET_FLAG_AP_OFF;
 
 	if (wake_from_hibernate)
-		save_flags |= RESET_FLAG_HIBERNATE;
+		save_flags |= EC_RESET_FLAG_HIBERNATE;
 	else if (flags & SYSTEM_RESET_HARD)
-		save_flags |= RESET_FLAG_HARD;
+		save_flags |= EC_RESET_FLAG_HARD;
 	else
-		save_flags |= RESET_FLAG_SOFT;
+		save_flags |= EC_RESET_FLAG_SOFT;
 
 	chip_save_reset_flags(save_flags);
 
@@ -166,14 +176,40 @@ const char *system_get_chip_revision(void)
 	return buf;
 }
 
-int system_get_vbnvcontext(uint8_t *block)
+static int bbram_idx_lookup(enum system_bbram_idx idx)
 {
-	return EC_ERROR_UNIMPLEMENTED;
+	switch (idx) {
+	case SYSTEM_BBRAM_IDX_PD0:
+		return HIBDATA_INDEX_PD0;
+	case SYSTEM_BBRAM_IDX_PD1:
+		return HIBDATA_INDEX_PD1;
+	case SYSTEM_BBRAM_IDX_PD2:
+		return HIBDATA_INDEX_PD2;
+	default:
+		return -1;
+	}
 }
 
-int system_set_vbnvcontext(const uint8_t *block)
+int system_get_bbram(enum system_bbram_idx idx, uint8_t *value)
 {
-	return EC_ERROR_UNIMPLEMENTED;
+	int hibdata = bbram_idx_lookup(idx);
+
+	if (hibdata < 0)
+		return EC_ERROR_UNIMPLEMENTED;
+
+	*value = MEC1322_VBAT_RAM(hibdata);
+	return EC_SUCCESS;
+}
+
+int system_set_bbram(enum system_bbram_idx idx, uint8_t value)
+{
+	int hibdata = bbram_idx_lookup(idx);
+
+	if (hibdata < 0)
+		return EC_ERROR_UNIMPLEMENTED;
+
+	MEC1322_VBAT_RAM(hibdata) = value;
+	return EC_SUCCESS;
 }
 
 int system_set_scratchpad(uint32_t value)
@@ -257,20 +293,33 @@ void system_hibernate(uint32_t seconds, uint32_t microseconds)
 	if (board_hibernate_late)
 		board_hibernate_late();
 
-#ifdef CONFIG_USB_PD_PORT_COUNT
+#ifdef CONFIG_USB_PD_PORT_MAX_COUNT
 	/*
 	 * Leave USB-C charging enabled in hibernate, in order to
 	 * allow wake-on-plug. 5V enable must be pulled low.
 	 */
-#if CONFIG_USB_PD_PORT_COUNT > 0
-	gpio_set_flags(GPIO_USB_C0_5V_EN, GPIO_PULL_DOWN | GPIO_INPUT);
-	gpio_set_level(GPIO_USB_C0_CHARGE_EN_L, 0);
+	switch (board_get_usb_pd_port_count()) {
+#if CONFIG_USB_PD_PORT_MAX_COUNT >= 2
+	case 2:
+		gpio_set_flags(GPIO_USB_C1_5V_EN, GPIO_PULL_DOWN | GPIO_INPUT);
+		gpio_set_level(GPIO_USB_C1_CHARGE_EN_L, 0);
+		/* Fall through */
 #endif
-#if CONFIG_USB_PD_PORT_COUNT > 1
-	gpio_set_flags(GPIO_USB_C1_5V_EN, GPIO_PULL_DOWN | GPIO_INPUT);
-	gpio_set_level(GPIO_USB_C1_CHARGE_EN_L, 0);
+#if CONFIG_USB_PD_PORT_MAX_COUNT >= 1
+	case 1:
+		gpio_set_flags(GPIO_USB_C0_5V_EN, GPIO_PULL_DOWN | GPIO_INPUT);
+		gpio_set_level(GPIO_USB_C0_CHARGE_EN_L, 0);
+		/* Fall through */
 #endif
-#endif /* CONFIG_USB_PD_PORT_COUNT */
+	case 0:
+		/* Nothing to do but break */
+		break;
+	default:
+		/* More ports needs to be defined */
+		ASSERT(false);
+		break;
+	}
+#endif /* CONFIG_USB_PD_PORT_MAX_COUNT */
 
 	if (hibernate_wake_pins_used > 0) {
 		for (i = 0; i < hibernate_wake_pins_used; ++i) {
@@ -289,8 +338,8 @@ void system_hibernate(uint32_t seconds, uint32_t microseconds)
 	}
 
 	if (seconds || microseconds) {
-		MEC1322_INT_BLK_EN |= 1 << 17;
-		MEC1322_INT_ENABLE(17) |= 1 << 20;
+		MEC1322_INT_BLK_EN |= BIT(17);
+		MEC1322_INT_ENABLE(17) |= BIT(20);
 		interrupt_enable();
 		task_enable_irq(MEC1322_IRQ_HTIMER);
 		if (seconds > 2) {
@@ -324,7 +373,7 @@ void htimer_interrupt(void)
 }
 DECLARE_IRQ(MEC1322_IRQ_HTIMER, htimer_interrupt, 1);
 
-enum system_image_copy_t system_get_shrspi_image_copy(void)
+enum ec_image system_get_shrspi_image_copy(void)
 {
 	return MEC1322_VBAT_RAM(MEC1322_IMAGETYPE_IDX);
 }
@@ -337,8 +386,8 @@ uint32_t system_get_lfw_address(void)
 	return *(lfw_vector + 1);
 }
 
-void system_set_image_copy(enum system_image_copy_t copy)
+void system_set_image_copy(enum ec_image copy)
 {
-	MEC1322_VBAT_RAM(MEC1322_IMAGETYPE_IDX) = (copy == SYSTEM_IMAGE_RW) ?
-				SYSTEM_IMAGE_RW : SYSTEM_IMAGE_RO;
+	MEC1322_VBAT_RAM(MEC1322_IMAGETYPE_IDX) = (copy == EC_IMAGE_RW) ?
+				EC_IMAGE_RW : EC_IMAGE_RO;
 }

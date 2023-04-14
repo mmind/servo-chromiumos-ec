@@ -1,34 +1,43 @@
 #!/bin/bash
 #
-# Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+# Copyright 2014 The Chromium OS Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
-if [[ ! -e .tests-passed ]]; then
-  echo 'Unit tests have not passed. Please run "make buildall -j".'
+# Verify there is no CPRINTS("....\n", ...) statements added to the code.
+upstream_branch="$(git rev-parse --abbrev-ref --symbolic-full-name @{u} \
+    2>/dev/null)"
+if [[ -z ${upstream_branch} ]]; then
+  echo "Current branch does not have an upstream branch" >&2
+  exit 1
+fi
+# This will print the offending CPRINTS invocations, if any, and the names of
+# the files they are in.
+if git diff "${upstream_branch}" HEAD | grep -e '^+\(.*CPRINTS(.*\\n"\|++\)' |
+    grep CPRINTS -B1 >&2 ; then
+  echo "error: CPRINTS strings should not include newline characters" >&2
   exit 1
 fi
 
-changed=$(find ${PRESUBMIT_FILES} -newer .tests-passed)
-ec3po_files=$(echo "${PRESUBMIT_FILES}" | grep util/ec3po/)
-# Filter out ec3po files from changed files.
-changed=$(echo "${changed}" | grep -v util/ec3po/)
-if [[ -n "${changed}" ]]; then
-  echo "Files have changed since last time unit tests passed:"
-  echo "${changed}" | sed -e 's/^/  /'
-  echo 'Please run "make buildall -j".'
-  exit 1
-fi
+# Directories that need to be tested by separate unit tests.
+unittest_dirs="util/ec3po/ extra/stack_analyzer/"
 
-if [[ ! -e util/ec3po/.tests-passed ]] && [[ -n "${ec3po_files}" ]]; then
-  echo 'Unit tests have not passed.  Please run "util/ec3po/run_tests.sh".'
-  exit 1
-fi
+for dir in $unittest_dirs; do
+    dir_files=$(echo "${PRESUBMIT_FILES}" | grep "${dir}")
+    if [[ -z "${dir_files}" ]]; then
+        continue
+    fi
 
-changed_ec3po_files=$(find ${ec3po_files} -newer util/ec3po/.tests-passed)
-if [[ -n "${changed_ec3po_files}" ]] && [[ -n "${ec3po_files}" ]]; then
-  echo "Files have changed since last time EC-3PO unit tests passed:"
-  echo "${changed_ec3po_files}" | sed -e 's/^/  /'
-  echo 'Please run "util/ec3po/run_tests.sh".'
-  exit 1
-fi
+    if [[ ! -e "${dir}/.tests-passed" ]]; then
+        echo "Unit tests have not passed.  Please run \"${dir}run_tests.sh\"."
+        exit 1
+    fi
+
+    changed_files=$(find ${dir_files} -newer "${dir}/.tests-passed")
+    if [[ -n "${changed_files}" ]] && [[ -n "${dir_files}" ]]; then
+        echo "Files have changed since last time unit tests passed:"
+        echo "${changed_files}" | sed -e 's/^/  /'
+        echo "Please run \"${dir}run_tests.sh\"."
+        exit 1
+    fi
+done

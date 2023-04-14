@@ -17,10 +17,10 @@
 #include "watchdog.h"
 
 #ifdef CONFIG_SPI_NOR_DEBUG
-#define DEBUG_CPRINTS_DEVICE(spi_nor_device, string, args...) \
-	cprints(CC_SPI, "SPI NOR %s: " string, spi_nor_device->name, ## args)
+#define CPRINTS(dev, string, args...) \
+	cprints(CC_SPI, "SPI NOR %s: " string, (dev)->name, ## args)
 #else
-#define DEBUG_CPRINTS_DEVICE(spi_nor_device, string, args...)
+#define CPRINTS(dev, string, args...)
 #endif
 
 /* Time to sleep while serial NOR flash write is in progress. */
@@ -90,6 +90,62 @@ static int spi_nor_write_enable(const struct spi_nor_device_t *spi_nor_device)
 }
 
 /**
+ * Read from the extended address register.
+ * @param  spi_nor_device The Serial NOR Flash device to use.
+ * @param  value          The value to read to.
+ * @return                ec_error_list (non-zero on error and timeout).
+ */
+static int spi_nor_read_ear(const struct spi_nor_device_t *spi_nor_device,
+			    uint8_t *value)
+{
+	uint8_t command = SPI_NOR_OPCODE_RDEAR;
+
+	return spi_transaction(&spi_devices[spi_nor_device->spi_master],
+			&command, sizeof(command), value, 1);
+}
+
+int spi_nor_write_ear(const struct spi_nor_device_t *spi_nor_device,
+		      const uint8_t value)
+{
+	uint8_t buf[2];
+	int rv;
+	uint8_t ear;
+
+	mutex_lock(&driver_mutex);
+
+	rv = spi_nor_write_enable(spi_nor_device);
+	if (rv) {
+		CPRINTS(spi_nor_device, "Failed to write enable");
+		goto err_free;
+	}
+
+	buf[0] = SPI_NOR_OPCODE_WREAR;
+	buf[1] = value;
+
+	rv = spi_transaction(&spi_devices[spi_nor_device->spi_master],
+			     buf, sizeof(buf), NULL, 0);
+	if (rv) {
+		CPRINTS(spi_nor_device, "Failed to write EAR, rv=%d", rv);
+		goto err_free;
+	}
+
+	rv = spi_nor_read_ear(spi_nor_device, &ear);
+	if (rv)
+		goto err_free;
+
+	if (ear != value) {
+		CPRINTS(spi_nor_device,
+			"Write EAR error: write=%d, read=%d", value, ear);
+		rv = EC_ERROR_UNKNOWN;  /* WEL not set but should be. */
+		goto err_free;
+	}
+
+err_free:
+	mutex_unlock(&driver_mutex);
+	return rv;
+}
+
+/**
  * Block until the Serial NOR Flash clears the BUSY/WIP bit in its status reg.
  */
 static int spi_nor_wait(const struct spi_nor_device_t *spi_nor_device)
@@ -125,9 +181,10 @@ static int spi_nor_wait(const struct spi_nor_device_t *spi_nor_device)
 /**
  * Read the Manufacturer bank and ID out of the JEDEC ID.
  */
-static int spi_nor_read_jedec_id(const struct spi_nor_device_t *spi_nor_device,
-				 uint8_t *out_mfn_bank,
-				 uint8_t *out_mfn_id)
+static int spi_nor_read_jedec_mfn_id(
+		const struct spi_nor_device_t *spi_nor_device,
+		uint8_t *out_mfn_bank,
+		uint8_t *out_mfn_id)
 {
 	int rv = EC_SUCCESS;
 	uint8_t jedec_id[SPI_NOR_JEDEC_ID_BANKS];
@@ -171,7 +228,7 @@ static int spi_nor_read_sfdp_dword(
 	sfdp_cmd[1] = (sfdp_offset & 0xFF0000) >> 16;
 	sfdp_cmd[2] = (sfdp_offset & 0xFF00) >> 8;
 	sfdp_cmd[3] = (sfdp_offset & 0xFF);
-	sfdp_cmd[4] = 0;  /* Required dummy cycle. */
+	sfdp_cmd[4] = 0;  /* Required extra cycle. */
 	return spi_transaction(&spi_devices[spi_nor_device->spi_master],
 			       sfdp_cmd, 5, (uint8_t *)out_dw, 4);
 }
@@ -231,7 +288,7 @@ static int locate_sfdp_basic_parameter_table(
 	 * compatible, older basic parameter tables which are compatible with
 	 * this driver in the parameter headers. */
 	if (!SFDP_HEADER_DW1_SFDP_SIGNATURE_VALID(dw1)) {
-		DEBUG_CPRINTS_DEVICE(spi_nor_device, "SFDP signature invalid");
+		CPRINTS(spi_nor_device, "SFDP signature invalid");
 		return EC_ERROR_UNKNOWN;
 	}
 
@@ -239,15 +296,14 @@ static int locate_sfdp_basic_parameter_table(
 		SFDP_GET_BITFIELD(SFDP_HEADER_DW2_SFDP_MAJOR, dw2);
 	*out_sfdp_minor_rev =
 		SFDP_GET_BITFIELD(SFDP_HEADER_DW2_SFDP_MINOR, dw2);
-	DEBUG_CPRINTS_DEVICE(spi_nor_device, "SFDP v%d.%d discovered",
-			     *out_sfdp_major_rev, *out_sfdp_minor_rev);
+	CPRINTS(spi_nor_device, "SFDP v%d.%d discovered",
+		*out_sfdp_major_rev, *out_sfdp_minor_rev);
 
 	/* NPH is 0-based, so add 1. */
 	number_parameter_headers =
 		SFDP_GET_BITFIELD(SFDP_HEADER_DW2_NPH, dw2) + 1;
-	DEBUG_CPRINTS_DEVICE(spi_nor_device,
-			     "There are %d SFDP parameter headers",
-			     number_parameter_headers);
+	CPRINTS(spi_nor_device, "There are %d SFDP parameter headers",
+		number_parameter_headers);
 
 	/* Search for the newest, compatible basic flash parameter table. */
 	*out_table_major_rev = 0;
@@ -301,15 +357,13 @@ static int locate_sfdp_basic_parameter_table(
 	}
 
 	if (!table_found) {
-		DEBUG_CPRINTS_DEVICE(
-			spi_nor_device,
+		CPRINTS(spi_nor_device,
 			"No compatible Basic Flash Parameter Table found");
 		return EC_ERROR_UNKNOWN;
 	}
 
-	DEBUG_CPRINTS_DEVICE(spi_nor_device,
-			     "Using Basic Flash Parameter Table v%d.%d",
-			     *out_sfdp_major_rev, *out_sfdp_minor_rev);
+	CPRINTS(spi_nor_device, "Using Basic Flash Parameter Table v%d.%d",
+		*out_sfdp_major_rev, *out_sfdp_minor_rev);
 
 	return EC_SUCCESS;
 }
@@ -393,6 +447,46 @@ static int spi_nor_device_discover_sfdp_capacity(
 	return EC_SUCCESS;
 }
 
+static int spi_nor_read_internal(const struct spi_nor_device_t *spi_nor_device,
+				 uint32_t offset, size_t size, uint8_t *data)
+{
+	int rv;
+
+	/* Split up the read operation into multiple transactions if the size
+	 * is larger than the maximum read size.
+	 */
+	while (size > 0) {
+		size_t read_size =
+			MIN(size, CONFIG_SPI_NOR_MAX_READ_SIZE);
+		size_t read_command_size;
+
+		/* Set up the read command in the TX buffer. */
+		buf[0] = SPI_NOR_OPCODE_SLOW_READ;
+		if (spi_nor_device->in_4b_addressing_mode) {
+			buf[1] = (offset & 0xFF000000) >> 24;
+			buf[2] = (offset & 0xFF0000) >> 16;
+			buf[3] = (offset & 0xFF00) >> 8;
+			buf[4] = (offset & 0xFF);
+			read_command_size = 5;
+		} else {  /* in 3 byte addressing mode */
+			buf[1] = (offset & 0xFF0000) >> 16;
+			buf[2] = (offset & 0xFF00) >> 8;
+			buf[3] = (offset & 0xFF);
+			read_command_size = 4;
+		}
+
+		rv = spi_transaction(&spi_devices[spi_nor_device->spi_master],
+				     buf, read_command_size, data, read_size);
+		if (rv)
+			return rv;
+
+		data += read_size;
+		offset += read_size;
+		size -= read_size;
+	}
+	return EC_SUCCESS;
+}
+
 /******************************************************************************/
 /* External Serial NOR Flash API available to other modules. */
 
@@ -433,8 +527,8 @@ int spi_nor_init(void)
 		 * table, use the default capacity, page size, and addressing
 		 * mode values. */
 		if (rv == EC_SUCCESS) {
-			size_t page_size;
-			uint32_t capacity;
+			size_t page_size = 0;
+			uint32_t capacity = 0;
 
 			rv |= spi_nor_device_discover_sfdp_page_size(
 				spi_nor_device,
@@ -448,8 +542,7 @@ int spi_nor_init(void)
 				mutex_lock(&driver_mutex);
 				spi_nor_device->capacity = capacity;
 				spi_nor_device->page_size = page_size;
-				DEBUG_CPRINTS_DEVICE(
-					spi_nor_device,
+				CPRINTS(spi_nor_device,
 					"Updated to SFDP params: %dKiB w/ %dB pages",
 					spi_nor_device->capacity >> 10,
 					spi_nor_device->page_size);
@@ -508,12 +601,37 @@ int spi_nor_set_4b_mode(struct spi_nor_device_t *spi_nor_device,
 			enter_4b_addressing_mode;
 	}
 
-	DEBUG_CPRINTS_DEVICE(spi_nor_device,
-			     "Entered %s Addressing Mode",
-			     enter_4b_addressing_mode ? "4-Byte" : "3-Byte");
+	CPRINTS(spi_nor_device, "Entered %s Addressing Mode",
+		enter_4b_addressing_mode ? "4-Byte" : "3-Byte");
 
 	/* Release the driver mutex. */
 	mutex_unlock(&driver_mutex);
+	return rv;
+}
+
+/**
+ * Read JEDEC Identifier.
+ *
+ * @param spi_nor_device The Serial NOR Flash device to use.
+ * @param size Number of Bytes to read.
+ * @param data Destination buffer for data.
+ * @return ec_error_list (non-zero on error and timeout).
+ */
+int spi_nor_read_jedec_id(const struct spi_nor_device_t *spi_nor_device,
+			  size_t size, uint8_t *data) {
+	int rv;
+	uint8_t cmd = SPI_NOR_OPCODE_JEDEC_ID;
+
+	if (size > CONFIG_SPI_NOR_MAX_READ_SIZE)
+		return EC_ERROR_INVAL;
+	/* Claim the driver mutex. */
+	mutex_lock(&driver_mutex);
+	/* Read the JEDEC ID. */
+	rv = spi_transaction(&spi_devices[spi_nor_device->spi_master],
+			     &cmd, 1, data, size);
+	/* Release the driver mutex. */
+	mutex_unlock(&driver_mutex);
+
 	return rv;
 }
 
@@ -529,44 +647,11 @@ int spi_nor_set_4b_mode(struct spi_nor_device_t *spi_nor_device,
 int spi_nor_read(const struct spi_nor_device_t *spi_nor_device,
 		 uint32_t offset, size_t size, uint8_t *data)
 {
-	int rv = EC_SUCCESS;
+	int rv;
 
 	/* Claim the driver mutex. */
 	mutex_lock(&driver_mutex);
-
-	/* Split up the read operation into multiple transactions if the size
-	 * is larger than the maximum read size. */
-	while (size > 0) {
-		size_t read_size =
-			MIN(size, CONFIG_SPI_NOR_MAX_READ_SIZE);
-		size_t read_command_size;
-
-		/* Set up the read command in the TX buffer. */
-		buf[0] = SPI_NOR_OPCODE_SLOW_READ;
-		if (spi_nor_device->in_4b_addressing_mode) {
-			buf[1] = (offset & 0xFF000000) >> 24;
-			buf[2] = (offset & 0xFF0000) >> 16;
-			buf[3] = (offset & 0xFF00) >> 8;
-			buf[4] = (offset & 0xFF);
-			read_command_size = 5;
-		} else {  /* in 3 byte addressing mode */
-			buf[1] = (offset & 0xFF0000) >> 16;
-			buf[2] = (offset & 0xFF00) >> 8;
-			buf[3] = (offset & 0xFF);
-			read_command_size = 4;
-		}
-
-		rv = spi_transaction(&spi_devices[spi_nor_device->spi_master],
-				     buf, read_command_size, data, read_size);
-		if (rv)
-			goto err_free;
-
-		data += read_size;
-		offset += read_size;
-		size -= read_size;
-	}
-
-err_free:
+	rv = spi_nor_read_internal(spi_nor_device, offset, size, data);
 	/* Release the driver mutex. */
 	mutex_unlock(&driver_mutex);
 
@@ -587,7 +672,13 @@ int spi_nor_erase(const struct spi_nor_device_t *spi_nor_device,
 		  uint32_t offset, size_t size)
 {
 	int rv = EC_SUCCESS;
-	size_t erase_command_size;
+	size_t erase_command_size, erase_size;
+	uint8_t erase_opcode;
+#ifdef CONFIG_SPI_NOR_SMART_ERASE
+	BUILD_ASSERT((CONFIG_SPI_NOR_MAX_READ_SIZE % 4) == 0);
+	uint8_t buffer[CONFIG_SPI_NOR_MAX_READ_SIZE] __aligned(4);
+	size_t verify_offset, read_offset, read_size, read_left;
+#endif
 
 	/* Invalid input */
 	if ((offset % 4096 != 0) || (size % 4096 != 0) || (size < 4096))
@@ -597,18 +688,78 @@ int spi_nor_erase(const struct spi_nor_device_t *spi_nor_device,
 	mutex_lock(&driver_mutex);
 
 	while (size > 0) {
+		erase_opcode = SPI_NOR_DRIVER_SPECIFIED_OPCODE_4KIB_ERASE;
+		erase_size = 4096;
+
 		/* Wait for the previous operation to finish. */
 		rv = spi_nor_wait(spi_nor_device);
 		if (rv)
 			goto err_free;
 
+#ifdef CONFIG_SPI_NOR_BLOCK_ERASE
+		if (!(offset % 65536) && size >= 65536) {
+			erase_opcode =
+				SPI_NOR_DRIVER_SPECIFIED_OPCODE_64KIB_ERASE;
+			erase_size = 65536;
+		}
+#endif
+#ifdef CONFIG_SPI_NOR_SMART_ERASE
+		read_offset = offset;
+		read_left = erase_size;
+		while (read_left) {
+			read_size = MIN(read_left,
+					CONFIG_SPI_NOR_MAX_READ_SIZE);
+			/* Since CONFIG_SPI_NOR_MAX_READ_SIZE & erase_size are
+			 * both guaranteed to be multiples of 4.
+			 */
+			assert(read_size >= 4 && (read_size % 4) == 0);
+			rv = spi_nor_read_internal(spi_nor_device, read_offset,
+						   read_size, buffer);
+
+			/* Note: the return value here is lost below
+			 * at the write enable, this is not a problem,
+			 * as this code is only an optimisation, if it
+			 * fails, the full erase functionality still
+			 * gets done, and the error from that returned
+			 */
+			if (rv != EC_SUCCESS)
+				break;
+			/* Aligned word verify reduced the overall (read +
+			 * verify) time by ~20% (vs bytewise verify) on
+			 * an m3@24MHz & SPI@24MHz.
+			 */
+			verify_offset = 0;
+			while (verify_offset <= read_size - 4) {
+				if (*(uint32_t *)(buffer + verify_offset)
+				    != 0xffffffff) {
+					break;
+				}
+				verify_offset += 4;
+			}
+			if (verify_offset != read_size)
+				break;
+			read_offset += read_size;
+			read_left -= read_size;
+			watchdog_reload();
+		}
+		if (!read_left) {
+			/* Sector/block already erased. */
+			CPRINTS(spi_nor_device,
+				"Skipping erase [%x:%x] "
+				"(already erased)",
+				offset, erase_size);
+			offset += erase_size;
+			size -= erase_size;
+			continue;
+		}
+#endif
 		/* Enable writing to serial NOR flash. */
 		rv = spi_nor_write_enable(spi_nor_device);
 		if (rv)
 			goto err_free;
 
 		/* Set up the erase instruction. */
-		buf[0] = SPI_NOR_DRIVER_SPECIFIED_OPCODE_4KIB_ERASE;
+		buf[0] = erase_opcode;
 		if (spi_nor_device->in_4b_addressing_mode) {
 			buf[1] = (offset & 0xFF000000) >> 24;
 			buf[2] = (offset & 0xFF0000) >> 16;
@@ -628,8 +779,8 @@ int spi_nor_erase(const struct spi_nor_device_t *spi_nor_device,
 		if (rv)
 			goto err_free;
 
-		offset += 4096;
-		size -= 4096;
+		offset += erase_size;
+		size -= erase_size;
 	}
 
 	/* Wait for the previous operation to finish. */
@@ -731,7 +882,7 @@ static int command_spi_nor_info(int argc, char **argv)
 	uint8_t sfdp_major_rev, sfdp_minor_rev;
 	uint8_t table_major_rev, table_minor_rev;
 	uint32_t table_offset;
-	uint8_t mfn_bank, mfn_id;
+	uint8_t mfn_bank = 0, mfn_id = 0;
 	size_t table_size;
 	const struct spi_nor_device_t *spi_nor_device = 0;
 	int spi_nor_device_index = 0;
@@ -765,7 +916,8 @@ static int command_spi_nor_info(int argc, char **argv)
 			 spi_nor_device->page_size);
 
 		/* Get JEDEC ID info. */
-		rv = spi_nor_read_jedec_id(spi_nor_device, &mfn_bank, &mfn_id);
+		rv = spi_nor_read_jedec_mfn_id(spi_nor_device, &mfn_bank,
+					       &mfn_id);
 		if (rv != EC_SUCCESS)
 			return rv;
 		ccprintf("\tJEDEC ID bank %d manufacturing code 0x%x\n",

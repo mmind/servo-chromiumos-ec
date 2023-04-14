@@ -95,46 +95,27 @@ static void led_set_battery(void)
 {
 	static int battery_ticks;
 	static int suspend_ticks;
-	static int previous_state_suspend;
-	uint32_t chflags = charge_get_flags();
 
-	battery_ticks++;
-	suspend_ticks++;
 	switch (charge_get_state()) {
 	case PWR_STATE_CHARGE:
 		led_set_color_battery(LED_AMBER);
 		break;
-	case PWR_STATE_DISCHARGE:
-		/* Less than 3%, blink one second every two second */
-		if (!chipset_in_state(CHIPSET_STATE_ANY_OFF) &&
-			charge_get_percent() < CRITICAL_LOW_BATTERY_PERCENTAGE)
+	case PWR_STATE_DISCHARGE_FULL:
+		if (extpower_is_present()) {
+			led_set_color_battery(LED_BLUE);
+			break;
+		}
+		/* Intentional fall-through */
+	case PWR_STATE_DISCHARGE /* and PWR_STATE_DISCHARGE_FULL */:
+		if (chipset_in_state(CHIPSET_STATE_ON)) {
+			led_set_color_battery(LED_BLUE);
+		} else if (chipset_in_state(CHIPSET_STATE_ANY_SUSPEND)) {
+			/* Blink once every four seconds. */
 			led_set_color_battery(
-				(battery_ticks % LED_TOTAL_2SECS_TICKS <
-				 LED_ON_1SEC_TICKS) ? LED_AMBER : LED_OFF);
-		/* Less than 10%, blink one second every four seconds */
-		else if (!chipset_in_state(CHIPSET_STATE_ANY_OFF) &&
-			charge_get_percent() < LOW_BATTERY_PERCENTAGE)
-			led_set_color_battery(
-				(battery_ticks % LED_TOTAL_4SECS_TICKS <
-				 LED_ON_1SEC_TICKS) ? LED_AMBER : LED_OFF);
-		else {
-			if (chipset_in_state(CHIPSET_STATE_SUSPEND
-				| CHIPSET_STATE_STANDBY)) {
-				if (!previous_state_suspend)
-					suspend_ticks = 0;
-				/* Blink once every four seconds. */
-				led_set_color_battery(
-					(suspend_ticks % LED_TOTAL_4SECS_TICKS)
-					< LED_ON_1SEC_TICKS ?
-					LED_AMBER : LED_OFF);
-				previous_state_suspend = 1;
-				return;
-			}
-
-			if (chipset_in_state(CHIPSET_STATE_ON))
-				led_set_color_battery(LED_BLUE);
-			else
-				led_set_color_battery(LED_OFF);
+				(suspend_ticks % LED_TOTAL_4SECS_TICKS)
+				< LED_ON_1SEC_TICKS ? LED_AMBER : LED_OFF);
+		} else {
+			led_set_color_battery(LED_OFF);
 		}
 		break;
 	case PWR_STATE_ERROR:
@@ -146,7 +127,7 @@ static void led_set_battery(void)
 		led_set_color_battery(LED_BLUE);
 		break;
 	case PWR_STATE_IDLE: /* External power connected in IDLE */
-		if (chflags & CHARGE_FLAG_FORCE_IDLE)
+		if (charge_get_flags() & CHARGE_FLAG_FORCE_IDLE)
 			led_set_color_battery(
 				(battery_ticks % LED_TOTAL_4SECS_TICKS <
 				 LED_ON_2SECS_TICKS) ? LED_AMBER : LED_BLUE);
@@ -157,7 +138,8 @@ static void led_set_battery(void)
 		/* Other states don't alter LED behavior */
 		break;
 	}
-	previous_state_suspend = 0;
+	battery_ticks++;
+	suspend_ticks++;
 }
 
 /* Called by hook task every 1 sec */

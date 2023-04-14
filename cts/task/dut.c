@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -13,7 +13,7 @@
 static int repeat_count;
 static int wake_count[3];
 
-void clear_state(void)
+void clean_state(void)
 {
 	wake_count[0] = wake_count[1] = wake_count[2] = 0;
 }
@@ -34,10 +34,13 @@ void task_abc(void *data)
 
 	while (1) {
 		wake_count[id]++;
-		if (id == 2 && wake_count[id] == repeat_count)
-			task_set_event(TASK_ID_CTS, TASK_EVENT_WAKE, 1);
-		else
-			task_set_event(next, TASK_EVENT_WAKE, 1);
+		if (id == 2 && wake_count[id] == repeat_count) {
+			task_set_event(TASK_ID_CTS, TASK_EVENT_WAKE);
+			task_wait_event(-1);
+		} else {
+			task_set_event(next, TASK_EVENT_WAKE);
+			task_wait_event(-1);
+		}
 	}
 }
 
@@ -117,25 +120,25 @@ enum cts_rc test_task_priority(void)
 	return CTS_RC_SUCCESS;
 }
 
+static void recurse(int x)
+{
+	CPRINTS("+%d", x);
+	msleep(1);
+	recurse(x + 1);
+	CPRINTS("-%d", x);
+}
+
+enum cts_rc test_stack_overflow(void)
+{
+	recurse(0);
+	return CTS_RC_FAILURE;
+}
+
 #include "cts_testlist.h"
 
 void cts_task(void)
 {
-	enum cts_rc rc;
-	int i;
-
 	task_wake(TASK_ID_TICK);
-
-	for (i = 0; i < CTS_TEST_ID_COUNT; i++) {
-		clear_state();
-		rc = tests[i].run();
-		CPRINTF("\n%s %d\n", tests[i].name, rc);
-		cflush();
-	}
-
-	CPRINTS("Task test suite finished");
-	cflush();
-
-	/* Sleep forever */
+	cts_main_loop(tests, "Task");
 	task_wait_event(-1);
 }

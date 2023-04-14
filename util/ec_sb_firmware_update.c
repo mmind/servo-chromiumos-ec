@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -72,7 +72,8 @@ enum {
 	F_UPDATE        = 0x4, /* do firmware update */
 	F_NEED_UPDATE   = 0x8,  /* need firmware update */
 	F_POWERD_DISABLED = 0x10,  /* powerd is disabled */
-	F_LFCC_ZERO =       0x20  /* last full charge is zero */
+	F_LFCC_ZERO =       0x20,  /* last full charge is zero */
+	F_BATT_DISCHARGE =  0x40   /* battery discharging */
 };
 
 struct fw_update_ctrl {
@@ -468,9 +469,23 @@ static enum fw_update_state s1_read_battery_info(
 	if (!(fw_update->flags & F_AC_PRESENT)) {
 		fw_update->rv = 0;
 		log_msg(fw_update, S1_READ_INFO,
-			"Require AC Adapter Counnected.");
+			"Require AC Adapter Connected.");
 		return S10_TERMINAL;
 	}
+
+	if ((fw_update->flags & F_BATT_DISCHARGE) &&
+	    (fw_update->flags & F_AC_PRESENT)) {
+		/*
+		 * If battery discharge due to battery learning mode,
+		 * we can't update battery FW, because device will shutdown
+		 * during FW update.
+		 */
+		fw_update->rv = 0;
+		log_msg(fw_update, S1_READ_INFO,
+			"battery can't update in learning mode");
+		return S10_TERMINAL;
+	}
+
 	return S2_WRITE_PREPARE;
 }
 
@@ -568,7 +583,7 @@ static enum fw_update_state s6_write_block(struct fw_update_ctrl *fw_update)
 	}
 
 	/*
-	 * Add more detays after the last a few block (3) writes.
+	 * Add more delays after the last few (3) block writes.
 	 * 3 is chosen based on current test results.
 	 */
 	if ((offset + 3*fw_update->step_size) >= fw_update->size)
@@ -733,7 +748,7 @@ void usage(char *argv[])
 
 int main(int argc, char *argv[])
 {
-	int rv = 0, interfaces = COMM_ALL;
+	int rv = 0;
 	int op = OP_UNKNOWN;
 	uint8_t val = 0;
 
@@ -752,14 +767,14 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	if (acquire_gec_lock(GEC_LOCK_TIMEOUT_SECS) < 0) {
-		printf("Could not acquire GEC lock.\n");
+	if (comm_init_dev(NULL)) {
+		printf("Couldn't initialize /dev.\n");
 		return -1;
 	}
 
-	if (comm_init(interfaces, NULL)) {
-		printf("Couldn't find EC\n");
-		goto out;
+	if (comm_init_buffer()) {
+		fprintf(stderr, "Couldn't initialize buffers\n");
+		return -1;
 	}
 
 	fw_update.flags = 0;
@@ -790,6 +805,11 @@ int main(int argc, char *argv[])
 			printf("AC_PRESENT\n");
 		}
 	}
+
+	if (val & EC_BATT_FLAG_DISCHARGING) {
+		fw_update.flags |= F_BATT_DISCHARGE;
+		printf("Battery is in discharge state\n");
+	}
 	rv = ec_readmem(EC_MEMMAP_BATT_LFCC, sizeof(val), &val);
 	if (rv <= 0) {
 		printf("EC Memmap read error:%d\n", rv);
@@ -816,7 +836,6 @@ int main(int argc, char *argv[])
 	if (fw_update.flags & F_POWERD_DISABLED)
 		rv |= restore_power_management();
 out:
-	release_gec_lock();
 	if (rv)
 		return -1;
 	else

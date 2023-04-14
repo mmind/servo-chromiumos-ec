@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -119,8 +119,6 @@ struct ec2i_t {
 	/* data port */
 	uint8_t data_port;
 };
-
-extern const struct ec2i_t pnpcfg_settings[];
 
 /* EC2I write */
 enum ec2i_message ec2i_write(enum host_pnpcfg_index index, uint8_t data);

@@ -74,8 +74,9 @@
  * Bit 1 of 7-bit address: 0 - If SDO is connected to GND
  * Bit 1 of 7-bit address: 1 - If SDO is connected to Vddio
  */
-#define BMP280_I2C_ADDRESS1		((0x76) << 1)
-#define BMP280_I2C_ADDRESS2		((0x77) << 1)
+#define BMP280_I2C_ADDRESS1_FLAGS	0x76
+#define BMP280_I2C_ADDRESS2_FLAGS	0x77
+
 /*
  *     CHIP ID
  */
@@ -144,8 +145,8 @@
  */
 #define BMP280_COMPUTE_TIME \
 	((T_INIT_MAX + T_MEASURE_PER_OSRS_MAX * \
-	  (((1 << BMP280_OVERSAMP_TEMP) >> 1) + \
-	   ((1 << BMP280_OVERSAMP_PRES) >> 1)) + \
+	  ((BIT(BMP280_OVERSAMP_TEMP) >> 1) + \
+	   (BIT(BMP280_OVERSAMP_PRES) >> 1)) + \
 	  (BMP280_OVERSAMP_PRES ? T_SETUP_PRESSURE_MAX : 0) + 15) / 16)
 
 /*
@@ -159,6 +160,17 @@
 /*******************************************************/
 #define BMP280_GET_DATA(_s) \
 	((struct bmp280_drv_data_t *)(_s)->drv_data)
+
+/* Min and Max sampling frequency in mHz based on x4 oversampling used */
+/* FIXME - verify how chip is setup to make sure MAX is correct, manual says
+ * "Typical", not Max.
+ */
+#define BMP280_BARO_MIN_FREQ  75000
+#define BMP280_BARO_MAX_FREQ  87000
+#if (CONFIG_EC_MAX_SENSOR_FREQ_MILLIHZ <= BMP280_BARO_MAX_FREQ)
+#error "EC too slow for accelerometer"
+#endif
+
 /**************************************************************/
 /*	STRUCTURE and ENUM DEFINITIONS                        */
 /**************************************************************/
@@ -204,7 +216,6 @@ struct bmp280_drv_data_t {
 #define BMP280_RATE_SHIFT 1
 
 extern const struct accelgyro_drv bmp280_drv;
-extern struct bmp280_drv_data_t bmp280_drv_data;
 
 #ifdef CONFIG_CMD_I2C_STRESS_TEST_ACCEL
 extern struct i2c_stress_test_dev bmp280_i2c_stress_test_dev;

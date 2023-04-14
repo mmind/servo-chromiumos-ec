@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -28,17 +28,6 @@
 #define CPRINTS(format, args...) cprints(CC_PWM, format, ## args)
 #endif
 
-/* MFT model select */
-enum npcx_mft_mdsel {
-	NPCX_MFT_MDSEL_1,
-	NPCX_MFT_MDSEL_2,
-	NPCX_MFT_MDSEL_3,
-	NPCX_MFT_MDSEL_4,
-	NPCX_MFT_MDSEL_5,
-	/* Number of MFT modes */
-	NPCX_MFT_MDSEL_COUNT
-};
-
 /* Tacho measurement state */
 enum tacho_measure_state {
 	/* Tacho normal state */
@@ -52,7 +41,7 @@ enum tacho_fan_mode {
 	/* FAN rpm mode */
 	TACHO_FAN_RPM = 0,
 	/* FAN duty mode */
-	TACHO_FAN_DUTY = 0,
+	TACHO_FAN_DUTY,
 };
 
 /* Fan status data structure */
@@ -73,29 +62,38 @@ struct fan_status_t {
 
 /* Global variables */
 static volatile struct fan_status_t fan_status[FAN_CH_COUNT];
+static int rpm_pre[FAN_CH_COUNT];
 
-/* Fan encoder spec. */
-#define RPM_SCALE    1 /* Fan RPM is multiplier of actual RPM */
-#define RPM_EDGES    1 /* Fan number of edges - 1 */
-#define POLES        2 /* Pole number of fan */
-/* Rounds per second */
-#define ROUNDS ((60 / POLES) * RPM_EDGES * RPM_SCALE)
 /*
- * RPM = (n - 1) * m * f * 60 / poles / TACH
- *   n = Fan number of edges = (RPM_EDGES + 1)
- *   m = Fan multiplier defined by RANGE
- *   f = PWM and MFT operation freq
- *   poles = 2
+ * Fan specifications. If they (PULSES_ROUND and RPM_DEVIATION) cannot meet
+ * the followings, please replace them with correct one in board-level driver.
+ */
+
+/* Pulses per round */
+#ifndef PULSES_ROUND
+#define PULSES_ROUND 2 /* 4-phases pwm-type fan. (2-phases should be 1) */
+#endif
+
+/* Rpm deviation (Unit:percent) */
+#ifndef RPM_DEVIATION
+#define RPM_DEVIATION 7
+#endif
+
+/*
+ * RPM = 60 * f / (n * TACH)
+ *   n = Pulses per round
+ *   f = Tachometer (MFT) operation freq
+ *   TACH = Counts of tachometer
  */
 #define TACH_TO_RPM(ch, tach) \
-	((fan_status[ch].mft_freq * ROUNDS) / MAX((tach), 1))
+	((fan_status[ch].mft_freq * 60 / PULSES_ROUND) / MAX((tach), 1))
 
 /* MFT TCNT default count */
-#define TACHO_MAX_CNT ((1<<16)-1)
+#define TACHO_MAX_CNT (BIT(16) - 1)
 
-/* Smart fan control settings */
-#define RPM_MARGIN_PERCENT 3
-#define RPM_MARGIN_THRES(rpm_target) (((rpm_target)*RPM_MARGIN_PERCENT)/100)
+/* Margin of target rpm */
+#define RPM_MARGIN(rpm_target) (((rpm_target) * RPM_DEVIATION) / 100)
+
 /**
  * MFT get fan rpm value
  *
@@ -113,8 +111,6 @@ static int mft_fan_rpm(int ch)
 		/* Clear pending flags */
 		SET_BIT(NPCX_TECLR(mdl), NPCX_TECLR_TCCLR);
 
-		/* Need to avoid underflow state happen */
-		p_status->rpm_actual = 0;
 		/*
 		 * Flag TDPND means mft underflow happen,
 		 * but let MFT still can re-measure actual rpm
@@ -127,6 +123,13 @@ static int mft_fan_rpm(int ch)
 
 		return 0;
 	}
+
+	/* Check whether MFT capture flag is set, else return previous rpm */
+	if (IS_BIT_SET(NPCX_TECTRL(mdl), NPCX_TECTRL_TAPND))
+		/* Clear pending flags */
+		SET_BIT(NPCX_TECLR(mdl), NPCX_TECLR_TACLR);
+	else
+		return p_status->rpm_actual;
 
 	p_status->cur_state = TACHO_NORMAL;
 	/*
@@ -224,6 +227,55 @@ static void fan_config(int ch, int enable_mft_read_rpm)
 }
 
 /**
+ * Check all fans are stopped
+ *
+ * @return   1: all fans are stopped. 0: else.
+ */
+static int fan_all_disabled(void)
+{
+	int ch;
+
+	for (ch = 0; ch < fan_get_count(); ch++)
+		if (fan_status[ch].auto_status != FAN_STATUS_STOPPED)
+			return 0;
+	return 1;
+}
+
+/**
+ * Adjust fan duty by difference between target and actual rpm
+ *
+ * @param   ch        operation channel
+ * @param   rpm_diff  difference between target and actual rpm
+ * @param   duty      current fan duty
+ */
+static void fan_adjust_duty(int ch, int rpm_diff, int duty)
+{
+	int duty_step = 0;
+
+	/* Find suitable duty step */
+	if (ABS(rpm_diff) >= 2000)
+		duty_step = 20;
+	else if (ABS(rpm_diff) >= 1000)
+		duty_step = 10;
+	else if (ABS(rpm_diff) >= 500)
+		duty_step = 5;
+	else if (ABS(rpm_diff) >= 250)
+		duty_step = 3;
+	else
+		duty_step = 1;
+
+	/* Adjust fan duty step by step */
+	if (rpm_diff > 0)
+		duty = MIN(duty + duty_step, 100);
+	else
+		duty = MAX(duty - duty_step, 1);
+
+	fan_set_duty(ch, duty);
+
+	CPRINTS("fan%d: duty %d, rpm_diff %d", ch, duty, rpm_diff);
+}
+
+/**
  * Smart fan control function.
  *
  * @param   ch         operation channel
@@ -233,53 +285,36 @@ static void fan_config(int ch, int enable_mft_read_rpm)
  */
 enum fan_status fan_smart_control(int ch, int rpm_actual, int rpm_target)
 {
-	static int rpm_pre;
-	int duty, duty_diff, rpm_diff;
+	int duty, rpm_diff;
 
 	/* wait rpm is stable */
-	if (ABS(rpm_actual - rpm_pre) > RPM_MARGIN_THRES(rpm_target)/2) {
-		rpm_pre = rpm_actual;
+	if (ABS(rpm_actual - rpm_pre[ch]) > RPM_MARGIN(rpm_actual)) {
+		rpm_pre[ch] = rpm_actual;
 		return FAN_STATUS_CHANGING;
 	}
 
 	/* Record previous rpm */
-	rpm_pre = rpm_actual;
-
-	/* Find suitable duty step */
-	rpm_diff = rpm_target - rpm_actual;
-	if (ABS(rpm_diff) >= 2000)
-		duty_diff = 20;
-	else if (ABS(rpm_diff) >= 1000)
-		duty_diff = 10;
-	else if (ABS(rpm_diff) >= 500)
-		duty_diff = 5;
-	else if (ABS(rpm_diff) >= 250)
-		duty_diff = 3;
-	else
-		duty_diff = 1;
+	rpm_pre[ch] = rpm_actual;
 
 	/* Adjust PWM duty */
+	rpm_diff = rpm_target - rpm_actual;
 	duty = fan_get_duty(ch);
 	if (duty == 0 && rpm_target == 0)
 		return FAN_STATUS_STOPPED;
 
 	/* Increase PWM duty */
-	if (rpm_diff > RPM_MARGIN_THRES(rpm_target)) {
+	if (rpm_diff > RPM_MARGIN(rpm_target)) {
 		if (duty == 100)
 			return FAN_STATUS_FRUSTRATED;
 
-		fan_set_duty(ch, duty + duty_diff);
-		CPRINTS("duty=%d, threshold %d, rpm target %d, actual %d", duty,
-			RPM_MARGIN_THRES(rpm_target), rpm_target, rpm_actual);
+		fan_adjust_duty(ch, rpm_diff, duty);
 		return FAN_STATUS_CHANGING;
 	/* Decrease PWM duty */
-	} else if (rpm_diff < -RPM_MARGIN_THRES(rpm_target)) {
+	} else if (rpm_diff < -RPM_MARGIN(rpm_target)) {
 		if (duty == 1 && rpm_target != 0)
 			return FAN_STATUS_FRUSTRATED;
 
-		fan_set_duty(ch, duty - duty_diff);
-		CPRINTS("duty=%d, threshold %d, rpm target %d, actual %d", duty,
-			RPM_MARGIN_THRES(rpm_target), rpm_target, rpm_actual);
+		fan_adjust_duty(ch, rpm_diff, duty);
 		return FAN_STATUS_CHANGING;
 	}
 
@@ -299,9 +334,16 @@ void fan_tick_func(void)
 		volatile struct fan_status_t *p_status = fan_status + ch;
 		/* Make sure rpm mode is enabled */
 		if (p_status->fan_mode != TACHO_FAN_RPM) {
-			p_status->auto_status = FAN_STATUS_STOPPED;
-			return;
+		/* Fan in duty mode still want rpm_actual being updated. */
+			p_status->rpm_actual = mft_fan_rpm(ch);
+			if (p_status->rpm_actual > 0)
+				p_status->auto_status = FAN_STATUS_LOCKED;
+			else
+				p_status->auto_status = FAN_STATUS_STOPPED;
+			continue;
 		}
+		if (!fan_get_enabled(ch))
+			continue;
 		/* Get actual rpm */
 		p_status->rpm_actual = mft_fan_rpm(ch);
 		/* Do smart fan stuff */
@@ -328,16 +370,14 @@ void fan_set_duty(int ch, int percent)
 	/* duty is zero */
 	if (!percent) {
 		fan_status[ch].auto_status = FAN_STATUS_STOPPED;
-		enable_sleep(SLEEP_MASK_FAN);
+		if (fan_all_disabled())
+			enable_sleep(SLEEP_MASK_FAN);
 	} else
 		disable_sleep(SLEEP_MASK_FAN);
 
 	/* Set the duty cycle of PWM */
 	pwm_set_duty(pwm_id, percent);
 }
-/* ensure that only one fan used since ec enables sleep bit if duty is zero */
-BUILD_ASSERT(CONFIG_FANS <= 1);
-
 
 /**
  * Get fan duty cycle.
@@ -442,13 +482,18 @@ int fan_get_rpm_target(int ch)
  */
 void fan_set_rpm_target(int ch, int rpm)
 {
-	/* If rpm = 0, disable PWM */
-	if (rpm == 0)
+	if (rpm == 0) {
+		/* If rpm = 0, disable PWM immediately. Why?*/
 		fan_set_duty(ch, 0);
-	else if (rpm > fans[ch].rpm_max)
-		rpm = fans[ch].rpm_max;
-	else if (rpm < fans[ch].rpm_min)
-		rpm = fans[ch].rpm_min;
+	} else {
+		/* This is the counterpart of disabling PWM above. */
+		if (!fan_get_enabled(ch))
+			fan_set_enabled(ch, 1);
+		if (rpm > fans[ch].rpm->rpm_max)
+			rpm = fans[ch].rpm->rpm_max;
+		else if (rpm < fans[ch].rpm->rpm_min)
+			rpm = fans[ch].rpm->rpm_min;
+	}
 
 	/* Set target rpm */
 	fan_status[ch].rpm_target = rpm;
@@ -474,11 +519,8 @@ enum fan_status fan_get_status(int ch)
  */
 int fan_is_stalled(int ch)
 {
-	/* if fan is enabled but we didn't detect any tacho */
-	if (fan_get_enabled(ch) && fan_status[ch].cur_state == TACHO_UNDERFLOW)
-		return 1;
-	else
-		return 0;
+	return fan_get_enabled(ch) && fan_get_duty(ch) &&
+			fan_status[ch].cur_state == TACHO_UNDERFLOW;
 }
 
 /**

@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -17,9 +17,12 @@
 #include "timer.h"
 #include "util.h"
 
+#define FAN_RPM(fan)	fans[fan].rpm
 
 /*****************************************************************************/
 /* Tests */
+
+void set_thermal_control_enabled(int fan, int enable);
 
 static int test_fan(void)
 {
@@ -28,8 +31,10 @@ static int test_fan(void)
 
 	sleep(2);
 
-	/* With nothing else to do, fans default to full-on */
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_max);
+	/* Fans initialize disabled. */
+	TEST_ASSERT(fan_get_rpm_actual(0) == 0);
+
+	set_thermal_control_enabled(0, 1);
 
 	/*
 	 * fan_set_percent_needed() is normally called once a second by the
@@ -46,22 +51,22 @@ static int test_fan(void)
 
 	/* On, but just barely */
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_start);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_start);
 	/* fan is above min speed now, so should be set to min */
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_min);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_min);
 
 	/* Full speed */
 	fan_set_percent_needed(0, 100);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_max);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_max);
 	fan_set_percent_needed(0, 100);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_max);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_max);
 
 	/* Slow again */
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_min);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_min);
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_min);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_min);
 
 	/* Off */
 	fan_set_percent_needed(0, 0);
@@ -71,36 +76,36 @@ static int test_fan(void)
 
 	/* On, but just barely */
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_start);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_start);
 	/* Force the mock_rpm to be slow, to simulate dragging */
-	mock_rpm = fans[0].rpm_min - 105;
+	mock_rpm = FAN_RPM(0)->rpm_min - 105;
 	/* It should keep trying for the start speed */
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_start);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_start);
 	/* But we have to keep forcing the mock_rpm back down */
-	mock_rpm = fans[0].rpm_min - 105;
+	mock_rpm = FAN_RPM(0)->rpm_min - 105;
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_start);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_start);
 	/* Now let it turn just under rpm_min. Should be okay there. */
-	mock_rpm = fans[0].rpm_min - 10;
+	mock_rpm = FAN_RPM(0)->rpm_min - 10;
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_min);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_min);
 	/* Let it go a little faster, still okay */
-	mock_rpm = fans[0].rpm_min + 10;
+	mock_rpm = FAN_RPM(0)->rpm_min + 10;
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_min);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_min);
 	/* But if it drops too low, it should go back to the start speed */
-	mock_rpm = fans[0].rpm_min - 105;
+	mock_rpm = FAN_RPM(0)->rpm_min - 105;
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_start);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_start);
 	/* And then relax */
 	fan_set_percent_needed(0, 1);
-	TEST_ASSERT(fan_get_rpm_actual(0) == fans[0].rpm_min);
+	TEST_ASSERT(fan_get_rpm_actual(0) == FAN_RPM(0)->rpm_min);
 
 	return EC_SUCCESS;
 }
 
-void run_test(void)
+void run_test(int argc, char **argv)
 {
 	RUN_TEST(test_fan);
 

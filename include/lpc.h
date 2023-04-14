@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -9,6 +9,7 @@
 #define __CROS_EC_LPC_H
 
 #include "common.h"
+#include "host_command.h"
 
 /**
  * Return a pointer to the memory-mapped buffer.
@@ -33,6 +34,14 @@ int lpc_keyboard_input_pending(void);
  * @param send_irq	If non-zero, asserts IRQ
  */
 void lpc_keyboard_put_char(uint8_t chr, int send_irq);
+
+/**
+ * Send an aux byte to host via keyboard port 0x60.
+ *
+ * @param chr		Byte to send
+ * @param send_irq	If non-zero, asserts IRQ
+ */
+void lpc_aux_put_char(uint8_t chr, int send_irq);
 
 /**
  * Clear the keyboard buffer.
@@ -71,17 +80,21 @@ enum lpc_host_event_type {
 	LPC_HOST_EVENT_SMI = 0,
 	LPC_HOST_EVENT_SCI,
 	LPC_HOST_EVENT_WAKE,
+	LPC_HOST_EVENT_ALWAYS_REPORT,
+	LPC_HOST_EVENT_COUNT,
 };
 
 /**
- * Set the event state.
+ * Get current state of host events.
  */
-void lpc_set_host_event_state(uint32_t mask);
+host_event_t lpc_get_host_events(void);
 
 /**
- * Clear and return the lowest host event.
+ * Get host events that are set based on the type provided.
+ *
+ * @param type		Event type
  */
-int lpc_query_host_event_state(void);
+host_event_t lpc_get_host_events_by_type(enum lpc_host_event_type type);
 
 /**
  * Set the event mask for the specified event type.
@@ -89,12 +102,19 @@ int lpc_query_host_event_state(void);
  * @param type		Event type
  * @param mask		New event mask
  */
-void lpc_set_host_event_mask(enum lpc_host_event_type type, uint32_t mask);
+void lpc_set_host_event_mask(enum lpc_host_event_type type, host_event_t mask);
 
 /**
- * Return the event mask for the specified event type.
+ * Get host event mask based on the type provided.
+ *
+ * @param type		Event type
  */
-uint32_t lpc_get_host_event_mask(enum lpc_host_event_type type);
+host_event_t lpc_get_host_event_mask(enum lpc_host_event_type type);
+
+/**
+ * Clear and return the lowest host event.
+ */
+int lpc_get_next_host_event(void);
 
 /**
  * Set the EC_LPC_STATUS_* mask for the specified status.
@@ -113,18 +133,33 @@ void lpc_clear_acpi_status_mask(uint8_t mask);
  */
 int lpc_get_pltrst_asserted(void);
 
-/**
- * Reset the host with KBRST# or RCIN#
- */
-void lpc_host_reset(void);
-
 /* Disable LPC ACPI interrupts */
 void lpc_disable_acpi_interrupts(void);
 
 /* Enable LPC ACPI interrupts */
 void lpc_enable_acpi_interrupts(void);
 
-void lpc_enable_wake_mask_for_lid_open(void);
+/**
+ * Update host event status. This function is called whenever host event bits
+ * need to be updated based on initialization complete or host event mask
+ * update or when a new host event is set or cleared.
+ */
+void lpc_update_host_event_status(void);
 
-void lpc_disable_wake_mask_for_lid_open(void);
+/*
+ * This is a weak function defined in host_events_commands.c to override the
+ * LPC_HOST_EVENT_ALWAYS_REPORT mask. It can be implemented by boards if there
+ * is a need to use custom mask.
+ */
+host_event_t lpc_override_always_report_mask(void);
+
+/* Initialize LPC masks. */
+void lpc_init_mask(void);
+
+/*
+ * Clear LPC masks for SMI, SCI and wake upon resume from S3. This is done to
+ * mask these events until host unmasks them itself.
+ */
+void lpc_s3_resume_clear_masks(void);
+
 #endif  /* __CROS_EC_LPC_H */

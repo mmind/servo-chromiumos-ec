@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -16,7 +16,7 @@ enum als_id;
 
 /* Initialized in board.c */
 struct als_t {
-	const char const *name;
+	const char *const name;
 	int (*init)(void);
 	int (*read)(int *lux, int af);
 	int attenuation_factor;

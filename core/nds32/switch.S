@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -6,8 +6,9 @@
  */
 
 #include "config.h"
+#include "cpu.h"
 
-.text
+.section .ram_code
 
 /**
  * Task context switching
@@ -72,6 +73,7 @@ __switch_task:
 	/* restore PC and PSW */
 	iret
 
+.text
 /**
  * Start the task scheduling.
  *
@@ -80,7 +82,12 @@ __switch_task:
  */
 .global __task_start
 __task_start:
-	/* area used as dummy thread stack for the first switch */
+	/*
+	 * Disable global interrupt here to ensure below sequence won't be
+	 * broken. The "iret" instruction of ISR will enable GIE again.
+	 */
+	setgie.d
+	/* area used as thread stack for the first switch */
 	la $r3, scratchpad
 
 	movi55 $r4, 1
@@ -88,10 +95,11 @@ __task_start:
 	movi55 $r1, 0    /* syscall 2nd parameter : re-schedule nothing */
 	movi55 $r0, 0    /* syscall 1st parameter : de-schedule nothing */
 
-	/* put the dummy stack pointer at the top of the stack in scratchpad */
-	addi $sp, $r3, 4 * 18
+	/* put the stack pointer at the top of the stack in scratchpad */
+	addi $sp, $r3, 4 * TASK_SCRATCHPAD_SIZE
 	/* we are ready to re-schedule */
 	swi.gp  $r4, [ + need_resched]
+	swi.gp  $r4, [ + start_called]
 
 	/* trigger scheduling to execute the task with the highest priority */
 	syscall 0

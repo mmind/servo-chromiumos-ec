@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+ * Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -14,9 +14,10 @@
 #include "dma.h"
 #include "gpio.h"
 #include "hooks.h"
-#include "host_command.h"
+#include "link_defs.h"
 #include "registers.h"
 #include "spi.h"
+#include "stm32-dma.h"
 #include "system.h"
 #include "timer.h"
 #include "util.h"
@@ -26,15 +27,30 @@
 #define CPRINTS(format, args...) cprints(CC_SPI, format, ## args)
 #define CPRINTF(format, args...) cprintf(CC_SPI, format, ## args)
 
+/* SPI FIFO registers */
+#ifdef CHIP_FAMILY_STM32H7
+#define SPI_TXDR REG8(&STM32_SPI1_REGS->txdr)
+#define SPI_RXDR REG8(&STM32_SPI1_REGS->rxdr)
+#else
+#define SPI_TXDR STM32_SPI1_REGS->dr
+#define SPI_RXDR STM32_SPI1_REGS->dr
+#endif
+
 /* DMA channel option */
 static const struct dma_option dma_tx_option = {
-	STM32_DMAC_SPI1_TX, (void *)&STM32_SPI1_REGS->dr,
+	STM32_DMAC_SPI1_TX, (void *)&SPI_TXDR,
 	STM32_DMA_CCR_MSIZE_8_BIT | STM32_DMA_CCR_PSIZE_8_BIT
+#ifdef CHIP_FAMILY_STM32F4
+	| STM32_DMA_CCR_CHANNEL(STM32_SPI1_TX_REQ_CH)
+#endif
 };
 
 static const struct dma_option dma_rx_option = {
-	STM32_DMAC_SPI1_RX, (void *)&STM32_SPI1_REGS->dr,
+	STM32_DMAC_SPI1_RX, (void *)&SPI_RXDR,
 	STM32_DMA_CCR_MSIZE_8_BIT | STM32_DMA_CCR_PSIZE_8_BIT
+#ifdef CHIP_FAMILY_STM32F4
+	| STM32_DMA_CCR_CHANNEL(STM32_SPI1_RX_REQ_CH)
+#endif
 };
 
 /*
@@ -88,9 +104,9 @@ static const uint8_t out_preamble[4] = {
  * times in order to make sure it actually stays at the repeating byte after DMA
  * ends.
  *
- * See crbug.com/31390
+ * See crosbug.com/p/31390
  */
-#ifdef CHIP_FAMILY_STM32F0
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32L4)
 #define EC_SPI_PAST_END_LENGTH 4
 #else
 #define EC_SPI_PAST_END_LENGTH 1
@@ -101,8 +117,8 @@ static const uint8_t out_preamble[4] = {
  * message, including protocol overhead, and must be 32-bit aligned.
  */
 static uint8_t out_msg[SPI_MAX_RESPONSE_SIZE + sizeof(out_preamble) +
-	EC_SPI_PAST_END_LENGTH] __aligned(4);
-static uint8_t in_msg[SPI_MAX_REQUEST_SIZE] __aligned(4);
+	EC_SPI_PAST_END_LENGTH] __aligned(4) __uncached;
+static uint8_t in_msg[SPI_MAX_REQUEST_SIZE] __aligned(4) __uncached;
 static uint8_t enabled;
 #ifdef CONFIG_SPI_PROTOCOL_V2
 static struct host_cmd_handler_args args;
@@ -156,7 +172,7 @@ enum spi_state {
  * @param nss		GPIO signal for NSS control line
  * @return 0 if bytes received, -1 if we hit a timeout or NSS went high
  */
-static int wait_for_bytes(stm32_dma_chan_t *rxdma, int needed,
+static int wait_for_bytes(dma_chan_t *rxdma, int needed,
 			  enum gpio_signal nss)
 {
 	timestamp_t deadline;
@@ -214,7 +230,7 @@ static int wait_for_bytes(stm32_dma_chan_t *rxdma, int needed,
  *			SPI_PROTO2_OFFSET bytes into out_msg
  * @param msg_len	Number of message bytes to send
  */
-static void reply(stm32_dma_chan_t *txdma,
+static void reply(dma_chan_t *txdma,
 		  enum ec_status status, char *msg_ptr, int msg_len)
 {
 	char *msg = out_msg;
@@ -256,7 +272,7 @@ static void reply(stm32_dma_chan_t *txdma,
  * Sends a byte over SPI without DMA
  *
  * This is mostly used when we want to relay status bytes to the AP while we're
- * recieving the message and we're thinking about it.
+ * receiving the message and we're thinking about it.
  *
  * @note It may be sent 0, 1, or >1 times, depending on whether the host clocks
  * the bus or not. Basically, the EC is saying "if you ask me what my status is,
@@ -268,16 +284,18 @@ static void reply(stm32_dma_chan_t *txdma,
  */
 static void tx_status(uint8_t byte)
 {
-	stm32_spi_regs_t *spi = STM32_SPI1_REGS;
+	stm32_spi_regs_t *spi __attribute__((unused)) = STM32_SPI1_REGS;
 
-	spi->dr = byte;
-#ifdef CHIP_FAMILY_STM32F0
+	SPI_TXDR = byte;
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32L4)
 	/* It sends the byte 4 times in order to be sure it bypassed the FIFO
 	 * from the STM32F0 line.
 	 */
 	spi->dr = byte;
 	spi->dr = byte;
 	spi->dr = byte;
+#elif defined(CHIP_FAMILY_STM32H7)
+	spi->udrdr = byte;
 #endif
 }
 
@@ -289,14 +307,16 @@ static void tx_status(uint8_t byte)
  */
 static void setup_for_transaction(void)
 {
-	stm32_spi_regs_t *spi = STM32_SPI1_REGS;
-	volatile uint8_t dummy __attribute__((unused));
+	stm32_spi_regs_t *spi __attribute__((unused)) = STM32_SPI1_REGS;
+	volatile uint8_t unused __attribute__((unused));
 
 	/* clear this as soon as possible */
 	setup_transaction_later = 0;
 
+#ifndef CHIP_FAMILY_STM32H7 /* H7 is not ready to set status here */
 	/* Not ready to receive yet */
 	tx_status(EC_SPI_NOT_READY);
+#endif
 
 	/* We are no longer actively processing a transaction */
 	state = SPI_STATE_PREPARE_RX;
@@ -305,15 +325,15 @@ static void setup_for_transaction(void)
 	dma_disable(STM32_DMAC_SPI1_TX);
 
 	/*
-	 * Read dummy bytes in case there are some pending; this prevents the
+	 * Read unused bytes in case there are some pending; this prevents the
 	 * receive DMA from getting that byte right when we start it.
 	 */
-	dummy = spi->dr;
-#ifdef CHIP_FAMILY_STM32F0
+	unused = SPI_RXDR;
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32L4)
 	/* 4 Bytes makes sure the RX FIFO on the F0 is empty as well. */
-	dummy = spi->dr;
-	dummy = spi->dr;
-	dummy = spi->dr;
+	unused = spi->dr;
+	unused = spi->dr;
+	unused = spi->dr;
 #endif
 
 	/* Start DMA */
@@ -322,9 +342,13 @@ static void setup_for_transaction(void)
 	/* Ready to receive */
 	state = SPI_STATE_READY_TO_RX;
 	tx_status(EC_SPI_OLD_READY);
+
+#ifdef CHIP_FAMILY_STM32H7
+	spi->cr1 |= STM32_SPI_CR1_SPE;
+#endif
 }
 
-/* Forward declaraction */
+/* Forward declaration */
 static void spi_init(void);
 
 /*
@@ -354,7 +378,7 @@ static void check_setup_transaction_later(void)
 static void spi_send_response(struct host_cmd_handler_args *args)
 {
 	enum ec_status result = args->result;
-	stm32_dma_chan_t *txdma;
+	dma_chan_t *txdma;
 
 	/*
 	 * If we're not processing, then the AP has already terminated the
@@ -390,7 +414,7 @@ static void spi_send_response(struct host_cmd_handler_args *args)
  */
 static void spi_send_response_packet(struct host_packet *pkt)
 {
-	stm32_dma_chan_t *txdma;
+	dma_chan_t *txdma;
 
 	/*
 	 * If we're not processing, then the AP has already terminated the
@@ -403,9 +427,9 @@ static void spi_send_response_packet(struct host_packet *pkt)
 
 	/* Append our past-end byte, which we reserved space for. */
 	((uint8_t *)pkt->response)[pkt->response_size + 0] = EC_SPI_PAST_END;
-#ifdef CHIP_FAMILY_STM32F0
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32L4)
 	/* Make sure we are going to be outputting it properly when the DMA
-	 * ends due to the TX FIFO bug on the F0. See crbug.com/31390
+	 * ends due to the TX FIFO bug on the F0. See crosbug.com/p/31390
 	 */
 	((uint8_t *)pkt->response)[pkt->response_size + 1] = EC_SPI_PAST_END;
 	((uint8_t *)pkt->response)[pkt->response_size + 2] = EC_SPI_PAST_END;
@@ -417,6 +441,10 @@ static void spi_send_response_packet(struct host_packet *pkt)
 	dma_prepare_tx(&dma_tx_option, sizeof(out_preamble) + pkt->response_size
 		+ EC_SPI_PAST_END_LENGTH, out_msg);
 	dma_go(txdma);
+#ifdef CHIP_FAMILY_STM32H7
+	/* clear any previous underrun */
+	STM32_SPI1_REGS->ifcr = STM32_SPI_SR_UDR;
+#endif /* CHIP_FAMILY_STM32H7 */
 
 	/*
 	 * Before the state is set to SENDING, any CS de-assertion would
@@ -430,13 +458,13 @@ static void spi_send_response_packet(struct host_packet *pkt)
  * Handle an event on the NSS pin
  *
  * A falling edge of NSS indicates that the master is starting a new
- * transaction. A rising edge indicates that we have finsihed
+ * transaction. A rising edge indicates that we have finished.
  *
  * @param signal	GPIO signal for the NSS pin
  */
 void spi_event(enum gpio_signal signal)
 {
-	stm32_dma_chan_t *rxdma;
+	dma_chan_t *rxdma;
 	uint16_t i;
 
 	/* If not enabled, ignore glitches on NSS */
@@ -495,7 +523,7 @@ void spi_event(enum gpio_signal signal)
 		/*
 		 * Check how big the packet should be.  We can't just wait to
 		 * see how much data the host sends, because it will keep
-		 * sending dummy data until we respond.
+		 * sending extra data until we respond.
 		 */
 		pkt_size = host_request_expected_size(r);
 		if (pkt_size == 0 || pkt_size > sizeof(in_msg))
@@ -540,7 +568,7 @@ void spi_event(enum gpio_signal signal)
 
 #ifdef CHIP_FAMILY_STM32F0
 		CPRINTS("WARNING: Protocol version 2 is not supported on the F0"
-			" line due to crbug.com/31390");
+			" line due to crosbug.com/p/31390");
 #endif
 
 		args.version = in_msg[0] - EC_CMD_VERSION0;
@@ -605,7 +633,11 @@ static void spi_chipset_startup(void)
 
 	enabled = 1;
 }
+#ifdef CONFIG_CHIPSET_RESUME_INIT_HOOK
+DECLARE_HOOK(HOOK_CHIPSET_RESUME_INIT, spi_chipset_startup, HOOK_PRIO_DEFAULT);
+#else
 DECLARE_HOOK(HOOK_CHIPSET_RESUME, spi_chipset_startup, HOOK_PRIO_DEFAULT);
+#endif
 
 static void spi_chipset_shutdown(void)
 {
@@ -621,7 +653,12 @@ static void spi_chipset_shutdown(void)
 	/* Allow deep sleep when AP off */
 	enable_sleep(SLEEP_MASK_SPI);
 }
+#ifdef CONFIG_CHIPSET_RESUME_INIT_HOOK
+DECLARE_HOOK(HOOK_CHIPSET_SUSPEND_COMPLETE, spi_chipset_shutdown,
+	     HOOK_PRIO_DEFAULT);
+#else
 DECLARE_HOOK(HOOK_CHIPSET_SUSPEND, spi_chipset_shutdown, HOOK_PRIO_DEFAULT);
+#endif
 
 static void spi_init(void)
 {
@@ -632,8 +669,8 @@ static void spi_init(void)
 	/* Fix for bug chrome-os-partner:31390 */
 	enabled = 0;
 	state = SPI_STATE_DISABLED;
-	STM32_RCC_APB2RSTR |= (1 << 12);
-	STM32_RCC_APB2RSTR &= ~(1 << 12);
+	STM32_RCC_APB2RSTR |= STM32_RCC_PB2_SPI1;
+	STM32_RCC_APB2RSTR &= ~STM32_RCC_PB2_SPI1;
 
 	/* 40 MHz pin speed */
 	STM32_GPIO_OSPEEDR(GPIO_A) |= 0xff00;
@@ -645,14 +682,37 @@ static void spi_init(void)
 	clock_wait_bus_cycles(BUS_APB, 1);
 
 	/*
+	 * Select the right DMA request for the variants using it.
+	 * This is not required for STM32F4 since the channel (aka request) is
+	 * set directly in the respective dma_option. In fact, it would be
+	 * overridden in dma-stm32f4::prepare_stream().
+	 */
+#ifdef CHIP_FAMILY_STM32L4
+	dma_select_channel(STM32_DMAC_SPI1_TX, 1);
+	dma_select_channel(STM32_DMAC_SPI1_RX, 1);
+#elif defined(CHIP_FAMILY_STM32H7)
+	dma_select_channel(STM32_DMAC_SPI1_TX, DMAMUX1_REQ_SPI1_TX);
+	dma_select_channel(STM32_DMAC_SPI1_RX, DMAMUX1_REQ_SPI1_RX);
+#endif
+	/*
 	 * Enable rx/tx DMA and get ready to receive our first transaction and
 	 * "disable" FIFO by setting event to happen after only 1 byte
 	 */
+#ifdef CHIP_FAMILY_STM32H7
+	spi->cfg2 = 0;
+	spi->cfg1 = STM32_SPI_CFG1_DATASIZE(8) | STM32_SPI_CFG1_FTHLV(4) |
+			STM32_SPI_CFG1_CRCSIZE(8) |
+			STM32_SPI_CFG1_TXDMAEN | STM32_SPI_CFG1_RXDMAEN |
+			STM32_SPI_CFG1_UDRCFG_CONST |
+			STM32_SPI_CFG1_UDRDET_BEGIN_FRM;
+	spi->cr1 = 0;
+#else /* !CHIP_FAMILY_STM32H7 */
 	spi->cr2 = STM32_SPI_CR2_RXDMAEN | STM32_SPI_CR2_TXDMAEN |
-		STM32_SPI_CR2_FRXTH;
+		STM32_SPI_CR2_FRXTH | STM32_SPI_CR2_DATASIZE(8);
 
 	/* Enable the SPI peripheral */
 	spi->cr1 |= STM32_SPI_CR1_SPE;
+#endif /* !CHIP_FAMILY_STM32H7 */
 
 	gpio_enable_interrupt(GPIO_SPI1_NSS);
 
@@ -668,23 +728,20 @@ DECLARE_HOOK(HOOK_INIT, spi_init, HOOK_PRIO_INIT_SPI);
 /**
  * Get protocol information
  */
-static int spi_get_protocol_info(struct host_cmd_handler_args *args)
+enum ec_status spi_get_protocol_info(struct host_cmd_handler_args *args)
 {
 	struct ec_response_get_protocol_info *r = args->response;
 
 	memset(r, 0, sizeof(*r));
 #ifdef CONFIG_SPI_PROTOCOL_V2
-	r->protocol_versions |= (1 << 2);
+	r->protocol_versions |= BIT(2);
 #endif
-	r->protocol_versions |= (1 << 3);
+	r->protocol_versions |= BIT(3);
 	r->max_request_packet_size = SPI_MAX_REQUEST_SIZE;
 	r->max_response_packet_size = SPI_MAX_RESPONSE_SIZE;
 	r->flags = EC_PROTOCOL_INFO_IN_PROGRESS_SUPPORTED;
 
 	args->response_size = sizeof(*r);
 
-	return EC_SUCCESS;
+	return EC_RES_SUCCESS;
 }
-DECLARE_HOST_COMMAND(EC_CMD_GET_PROTOCOL_INFO,
-		     spi_get_protocol_info,
-		     EC_VER_MASK(0));

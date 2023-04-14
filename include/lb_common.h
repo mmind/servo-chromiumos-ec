@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+ * Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -22,7 +22,7 @@ int lb_get_rgb(unsigned int led, uint8_t *red, uint8_t *green, uint8_t *blue);
 void lb_set_brightness(unsigned int newval);
 /* Get the overall brighness level. */
 uint8_t lb_get_brightness(void);
-/* Initialize the IC controller registers to sane values. */
+/* Initialize the IC controller registers to reasonable values. */
 void lb_init(int use_lock);
 /* Disable the LED current off (the IC stays on). */
 void lb_off(void);

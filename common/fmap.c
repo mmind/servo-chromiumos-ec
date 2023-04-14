@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+ * Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -7,10 +7,14 @@
 #include <stddef.h>
 
 #include "common.h"
+#include "rwsig.h"
 #include "util.h"
 #include "version.h"
 
-/* FMAP structs. See http://code.google.com/p/flashmap/wiki/FmapSpec */
+/*
+ * FMAP structs.
+ * See https://chromium.googlesource.com/chromiumos/third_party/flashmap/+/master/lib/fmap.h
+ */
 #define FMAP_NAMELEN 32
 #define FMAP_SIGNATURE "__FMAP__"
 #define FMAP_SIGNATURE_SIZE 8
@@ -50,9 +54,9 @@ struct fmap_header {
 	uint16_t    fmap_nareas;
 } __packed;
 
-#define FMAP_AREA_STATIC      (1 << 0)	/* can be checksummed */
-#define FMAP_AREA_COMPRESSED  (1 << 1)  /* may be compressed */
-#define FMAP_AREA_RO          (1 << 2)  /* writes may fail */
+#define FMAP_AREA_STATIC      BIT(0)	/* can be checksummed */
+#define FMAP_AREA_COMPRESSED  BIT(1)  /* may be compressed */
+#define FMAP_AREA_RO          BIT(2)  /* writes may fail */
 
 struct fmap_area_header {
 	uint32_t area_offset;
@@ -61,7 +65,31 @@ struct fmap_area_header {
 	uint16_t area_flags;
 } __packed;
 
-#define NUM_EC_FMAP_AREAS 7
+#ifdef CONFIG_RWSIG_TYPE_RWSIG
+#define NUM_EC_FMAP_AREAS_RWSIG 2
+#else
+#define NUM_EC_FMAP_AREAS_RWSIG 0
+#endif
+
+#ifdef CONFIG_ROLLBACK
+#define NUM_EC_FMAP_AREAS_ROLLBACK 1
+#else
+#define NUM_EC_FMAP_AREAS_ROLLBACK 0
+#endif
+#ifdef CONFIG_RW_B
+#  ifdef CONFIG_RWSIG_TYPE_RWSIG
+#    define NUM_EC_FMAP_AREAS_RW_B     2
+#  else
+#    define NUM_EC_FMAP_AREAS_RW_B     1
+#  endif
+#else
+#define NUM_EC_FMAP_AREAS_RW_B     0
+#endif
+
+#define NUM_EC_FMAP_AREAS (7 + \
+			NUM_EC_FMAP_AREAS_RWSIG + \
+			NUM_EC_FMAP_AREAS_ROLLBACK + \
+			NUM_EC_FMAP_AREAS_RW_B)
 
 const struct _ec_fmap {
 	struct fmap_header header;
@@ -83,14 +111,17 @@ const struct _ec_fmap {
 	/* RO Firmware */
 		{
 			/*
-			 * Range of RO firmware to be updated. Verified in
-			 * factory finalization by hash. Should not have
+			 * Range of RO firmware to be updated. EC_RO
+			 * section includes the bootloader section
+			 * because it may need to be updated/paired
+			 * with a different RO.  Verified in factory
+			 * finalization by hash. Should not have
 			 * volatile data (ex, calibration results).
 			 */
 			.area_name = "EC_RO",
 			.area_offset = CONFIG_EC_PROTECTED_STORAGE_OFF -
-				FMAP_REGION_START + CONFIG_RO_STORAGE_OFF,
-			.area_size = CONFIG_RO_SIZE,
+				FMAP_REGION_START,
+			.area_size = CONFIG_RO_SIZE + CONFIG_RO_STORAGE_OFF,
 			.area_flags = FMAP_AREA_STATIC | FMAP_AREA_RO,
 		},
 		{
@@ -109,9 +140,9 @@ const struct _ec_fmap {
 			.area_name = "RO_FRID",
 			.area_offset = CONFIG_EC_PROTECTED_STORAGE_OFF -
 				FMAP_REGION_START + CONFIG_RO_STORAGE_OFF +
-				RELATIVE_RO((uint32_t)__version_struct_offset) +
-				offsetof(struct version_struct,  version),
-			.area_size = sizeof(version_data.version),
+				RELATIVE_RO((uint32_t)__image_data_offset) +
+				offsetof(struct image_data,  version),
+			.area_size = sizeof(current_image_data.version),
 			.area_flags = FMAP_AREA_STATIC | FMAP_AREA_RO,
 		},
 
@@ -136,6 +167,17 @@ const struct _ec_fmap {
 			.area_size = CONFIG_WP_STORAGE_SIZE,
 			.area_flags = FMAP_AREA_STATIC | FMAP_AREA_RO,
 		},
+#ifdef CONFIG_RWSIG_TYPE_RWSIG
+		{
+			/* RO public key address, for RW verification */
+			.area_name = "KEY_RO",
+			.area_offset = CONFIG_EC_PROTECTED_STORAGE_OFF -
+				FMAP_REGION_START + CONFIG_RO_PUBKEY_ADDR -
+				CONFIG_PROGRAM_MEMORY_BASE,
+			.area_size = CONFIG_RO_PUBKEY_SIZE,
+			.area_flags = FMAP_AREA_STATIC | FMAP_AREA_RO,
+		},
+#endif
 
 		/* RW Firmware */
 		{
@@ -151,16 +193,68 @@ const struct _ec_fmap {
 			 * RW firmware version ID. Must be NULL terminated
 			 * ASCII, and padded with \0.
 			 * TODO: Get the relative offset of
-			 * __version_struct_offset within our RW image to
+			 * __image_data_offset within our RW image to
 			 * accommodate image asymmetry.
 			 */
 			.area_name = "RW_FWID",
 			.area_offset = CONFIG_EC_WRITABLE_STORAGE_OFF -
 				FMAP_REGION_START + CONFIG_RW_STORAGE_OFF +
-				RELATIVE_RO((uint32_t)__version_struct_offset) +
-				offsetof(struct version_struct,  version),
-			.area_size = sizeof(version_data.version),
+				RELATIVE_RO((uint32_t)__image_data_offset) +
+				offsetof(struct image_data,  version),
+			.area_size = sizeof(current_image_data.version),
 			.area_flags = FMAP_AREA_STATIC,
 		},
+#ifdef CONFIG_ROLLBACK
+		{
+			/*
+			 * RW rollback version, 32-bit unsigned integer.
+			 * TODO: Get the relative offset of
+			 * __image_data_offset within our RW image to
+			 * accommodate image asymmetry.
+			 */
+			.area_name = "RW_RBVER",
+			.area_offset = CONFIG_EC_WRITABLE_STORAGE_OFF -
+				FMAP_REGION_START + CONFIG_RW_STORAGE_OFF +
+				RELATIVE_RO((uint32_t)__image_data_offset) +
+				offsetof(struct image_data, rollback_version),
+			.area_size = sizeof(
+				current_image_data.rollback_version),
+			.area_flags = FMAP_AREA_STATIC,
+		},
+#endif
+#ifdef CONFIG_RWSIG_TYPE_RWSIG
+		{
+			 /* RW image signature */
+			.area_name = "SIG_RW",
+			.area_offset = CONFIG_EC_PROTECTED_STORAGE_OFF -
+				FMAP_REGION_START + CONFIG_RW_SIG_ADDR -
+				CONFIG_PROGRAM_MEMORY_BASE,
+			.area_size = CONFIG_RW_SIG_SIZE,
+			.area_flags = FMAP_AREA_STATIC | FMAP_AREA_RO,
+		},
+#endif
+#ifdef CONFIG_RW_B
+		/* RW Firmware */
+		{
+			 /* The range of RW firmware to be auto-updated. */
+			.area_name = "EC_RW_B",
+			.area_offset = CONFIG_EC_WRITABLE_STORAGE_OFF -
+				FMAP_REGION_START + CONFIG_RW_STORAGE_OFF +
+				CONFIG_RW_SIZE,
+			.area_size = CONFIG_RW_SIZE,
+			.area_flags = FMAP_AREA_STATIC | FMAP_AREA_RO,
+		},
+#ifdef CONFIG_RWSIG_TYPE_RWSIG
+		{
+			 /* RW_B image signature */
+			.area_name = "SIG_RW_B",
+			.area_offset = CONFIG_EC_PROTECTED_STORAGE_OFF -
+				FMAP_REGION_START + CONFIG_RW_B_SIG_ADDR -
+				CONFIG_PROGRAM_MEMORY_BASE,
+			.area_size = CONFIG_RW_SIG_SIZE,
+			.area_flags = FMAP_AREA_STATIC | FMAP_AREA_RO,
+		},
+#endif
+#endif
 	}
 };

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -11,7 +11,7 @@
 /* Optional features */
 #define CONFIG_SYSTEM_UNLOCKED  /* Allow dangerous commands */
 #define CONFIG_I2C
-#define CONFIG_I2C_MASTER
+#define CONFIG_I2C_CONTROLLER
 
 /* LM4 modules we don't use on link but still want to keep compiling */
 #define CONFIG_EEPROM
@@ -19,7 +19,7 @@
 
 /* Modules we want to exclude */
 #undef CONFIG_LID_SWITCH
-#undef CONFIG_LPC
+#undef CONFIG_HOSTCMD_LPC
 #undef CONFIG_PECI
 #undef CONFIG_SWITCH
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -80,7 +80,7 @@ __switchto:
 .global __task_start
 .thumb_func
 __task_start:
-  ldr r2,=scratchpad     @ area used as dummy thread stack for the first switch
+  ldr r2,=scratchpad     @ area used as thread stack for the first switch
   mov r3, #2             @ use : priv. mode / thread stack / no floating point
                          @ setting FP to unused here means first context switch
                          @ will not store FP regs

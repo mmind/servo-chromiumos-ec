@@ -12,7 +12,7 @@
 #include "hooks.h"
 #include "link_defs.h"
 #include "registers.h"
-#include "usb_dwc_hw.h"
+#include "usb_hw.h"
 #include "system.h"
 #include "task.h"
 #include "timer.h"
@@ -38,8 +38,8 @@
 /* Standard USB stuff */
 
 #ifdef CONFIG_USB_BOS
-/* v2.01 (vs 2.00) BOS Descriptor provided */
-#define USB_DEV_BCDUSB 0x0201
+/* v2.10 (vs 2.00) BOS Descriptor provided */
+#define USB_DEV_BCDUSB 0x0210
 #else
 #define USB_DEV_BCDUSB 0x0200
 #endif
@@ -50,14 +50,6 @@
 
 #ifndef CONFIG_USB_BCD_DEV
 #define CONFIG_USB_BCD_DEV 0x0100		/* 1.00 */
-#endif
-
-#ifndef USB_BMATTRIBUTES
-#ifdef CONFIG_USB_SELF_POWERED
-#define USB_BMATTRIBUTES 0xc0  /* Self powered. */
-#else
-#define USB_BMATTRIBUTES 0x80  /* Bus powered. */
-#endif
 #endif
 
 #ifndef CONFIG_USB_SERIALNO
@@ -93,21 +85,15 @@ const struct usb_config_descriptor USB_CONF_DESC(conf) = {
 	.bNumInterfaces = USB_IFACE_COUNT,
 	.bConfigurationValue = 1,		/* Caution: hard-coded value */
 	.iConfiguration = USB_STR_VERSION,
-	.bmAttributes = USB_BMATTRIBUTES, /* bus or self powered */
+	.bmAttributes = 0x80 /* Reserved bit */
+#ifdef CONFIG_USB_SELF_POWERED  /* bus or self powered */
+		      | 0x40
+#endif
+#ifdef CONFIG_USB_REMOTE_WAKEUP
+		      | 0x20
+#endif
+	,
 	.bMaxPower = (CONFIG_USB_MAXPOWER_MA / 2),
-};
-
-/* Qualifier Descriptor */
-static const struct usb_qualifier_descriptor qualifier_desc = {
-	.bLength = USB_DT_QUALIFIER_SIZE,
-	.bDescriptorType = USB_DT_DEVICE_QUALIFIER,
-	.bcdUSB = USB_DEV_BCDUSB,
-	.bDeviceClass  = USB_DEV_CLASS,
-	.bDeviceSubClass = 0x00,
-	.bDeviceProtocol = 0x00,
-	.bMaxPacketSize0 = USB_MAX_PACKET_SIZE,
-	.bNumConfigurations = 1,
-	.bReserved = 0,
 };
 
 const uint8_t usb_string_desc[] = {
@@ -160,14 +146,14 @@ static enum table_case decode_table_10_7(uint32_t doepint)
 
 /* For STATUS/OUT: Use two DMA descriptors, each with one-packet buffers */
 #define NUM_OUT_BUFFERS 2
-static uint8_t ep0_setup_buf[USB_MAX_PACKET_SIZE];
+static uint8_t __aligned(4) ep0_setup_buf[USB_MAX_PACKET_SIZE];
 
 /* For IN: Several DMA descriptors, all pointing into one large buffer, so that
  * we can return the configuration descriptor as one big blob.
  */
 #define NUM_IN_PACKETS_AT_ONCE 4
 #define IN_BUF_SIZE (NUM_IN_PACKETS_AT_ONCE * USB_MAX_PACKET_SIZE)
-static uint8_t ep0_in_buf[IN_BUF_SIZE];
+static uint8_t __aligned(4) ep0_in_buf[IN_BUF_SIZE];
 
 struct dwc_usb_ep ep0_ctl = {
 	.max_packet = USB_MAX_PACKET_SIZE,
@@ -246,7 +232,8 @@ int usb_write_ep(uint32_t ep_num, int len, void *data)
 	struct dwc_usb_ep *ep = usb_ctl.ep[ep_num];
 
 	if (GR_USB_DIEPCTL(ep_num) & DXEPCTL_EPENA) {
-		CPRINTS("usb_write_ep ep%d: FAIL: tx already in progress!");
+		CPRINTS("usb_write_ep ep%d: FAIL: tx already in progress!",
+			ep_num);
 		return 0;
 	}
 
@@ -981,7 +968,7 @@ static void usb_init_endpoints(void)
 
 	/* Reset the other endpoints */
 	for (ep = 1; ep < USB_EP_COUNT; ep++)
-		usb_ep_reset[ep]();
+		usb_ep_event[ep](USB_EVENT_RESET);
 }
 
 static void usb_reset(void)
@@ -1360,7 +1347,7 @@ static int usb_set_serial(const char *serialno)
 		return EC_ERROR_INVAL;
 
 	/* Convert into unicode usb string desc. */
-	for (i = 0; i < USB_STRING_LEN; i++) {
+	for (i = 0; i < CONFIG_SERIALNO_LEN; i++) {
 		sd->_data[i] = serialno[i];
 		if (serialno[i] == 0)
 			break;
@@ -1378,14 +1365,13 @@ static int usb_load_serial(void)
 	const char *serialno;
 	int rv;
 
-	serialno = flash_read_serial();
+	serialno = board_read_serial();
 	if (!serialno)
 		return EC_ERROR_ACCESS_DENIED;
 
 	rv = usb_set_serial(serialno);
 	return rv;
 }
-
 
 /* Save serial number into pstate region. */
 static int usb_save_serial(const char *serialno)
@@ -1396,7 +1382,7 @@ static int usb_save_serial(const char *serialno)
 		return EC_ERROR_INVAL;
 
 	/* Save this new serial number to flash. */
-	rv = flash_write_serial(serialno);
+	rv = board_write_serial(serialno);
 	if (rv)
 		return rv;
 
@@ -1408,7 +1394,7 @@ static int usb_save_serial(const char *serialno)
 static int command_serialno(int argc, char **argv)
 {
 	struct usb_string_desc *sd = usb_serialno_desc;
-	char buf[USB_STRING_LEN];
+	char buf[CONFIG_SERIALNO_LEN];
 	int rv = EC_SUCCESS;
 	int i;
 
@@ -1425,7 +1411,7 @@ static int command_serialno(int argc, char **argv)
 			return EC_ERROR_INVAL;
 	}
 
-	for (i = 0; i < USB_STRING_LEN; i++)
+	for (i = 0; i < CONFIG_SERIALNO_LEN; i++)
 		buf[i] = sd->_data[i];
 	ccprintf("Serial number: %s\n", buf);
 	return rv;
@@ -1434,5 +1420,4 @@ static int command_serialno(int argc, char **argv)
 DECLARE_CONSOLE_COMMAND(serialno, command_serialno,
 	"load/set [value]",
 	"Read and write USB serial number");
-#endif
-
+#endif  /* CONFIG_USB_SERIALNO */

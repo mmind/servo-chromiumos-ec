@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +43,12 @@ static const char * const meanings[] = {
 	"INVALID_HEADER",
 	"REQUEST_TRUNCATED",
 	"RESPONSE_TOO_BIG",
-	"BUS_ERROR"
+	"BUS_ERROR",
+	"BUSY",
+	"INVALID_HEADER_VERSION",
+	"INVALID_HEADER_CRC",
+	"INVALID_DATA_CRC",
+	"DUP_UNAVAILABLE",
 };
 
 static const char *strresult(int i)
@@ -219,6 +225,24 @@ static int ec_dev_is_v2(void)
 	return 0;
 }
 
+static int ec_pollevent_dev(unsigned long mask, void *buffer, size_t buf_size,
+			    int timeout)
+{
+	int rv;
+	struct pollfd pf = { .fd = fd, .events = POLLIN };
+
+	ioctl(fd, CROS_EC_DEV_IOCEVENTMASK_V2, mask);
+
+	rv = poll(&pf, 1, timeout);
+	if (rv != 1)
+		return rv;
+
+	if (pf.revents != POLLIN)
+		return -pf.revents;
+
+	return read(fd, buffer, buf_size);
+}
+
 int comm_init_dev(const char *device_name)
 {
 	int (*ec_cmd_readmem)(int offset, int bytes, void *dest);
@@ -257,6 +281,7 @@ int comm_init_dev(const char *device_name)
 	if (ec_cmd_readmem(EC_MEMMAP_ID, 2, version) == 2 &&
 	    version[0] == 'E' && version[1] == 'C')
 		ec_readmem = ec_cmd_readmem;
+	ec_pollevent = ec_pollevent_dev;
 
 	/*
 	 * Set temporary size, will be updated later.

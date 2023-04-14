@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -15,9 +15,13 @@
 #include "gpio.h"
 #include "hooks.h"
 #include "registers.h"
+#include "system.h"
 #include "task.h"
 #include "timer.h"
 #include "util.h"
+
+#define CPRINTS(format, args...) cprints(CC_SYSTEM, format, ## args)
+#define CPRINTF(format, args...) cprintf(CC_SYSTEM, format, ## args)
 
 /* Maximum time we allow for an ADC conversion */
 #define ADC_TIMEOUT_US            SECOND
@@ -35,6 +39,8 @@ enum npcx_adc_conversion_mode {
 
 /* Global variables */
 static volatile task_id_t task_waiting;
+
+struct mutex adc_lock;
 
 /**
  * Preset ADC operation clock.
@@ -74,6 +80,9 @@ static int start_single_and_wait(enum npcx_adc_input_channel input_ch
 
 	task_waiting = task_get_current();
 
+	/* Stop ADC conversion first */
+	SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_STOP);
+
 	/* Set ADC conversion code to SW conversion mode */
 	SET_FIELD(NPCX_ADCCNF, NPCX_ADCCNF_ADCMD_FIELD,
 			ADC_CHN_CONVERSION_MODE);
@@ -102,8 +111,70 @@ static int start_single_and_wait(enum npcx_adc_input_channel input_ch
 
 }
 
+static uint16_t repetitive_enabled;
+void npcx_set_adc_repetitive(enum npcx_adc_input_channel input_ch, int enable)
+{
+	mutex_lock(&adc_lock);
+
+	/* Stop ADC conversion */
+	SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_STOP);
+
+	if (enable) {
+		/* Forbid EC enter deep sleep during conversion. */
+		disable_sleep(SLEEP_MASK_ADC);
+		/* Turn on ADC */
+		SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_ADCEN);
+		/* Set ADC conversion code to SW conversion mode */
+		SET_FIELD(NPCX_ADCCNF, NPCX_ADCCNF_ADCMD_FIELD,
+			  ADC_SCAN_CONVERSION_MODE);
+		/* Update number of channel to be converted */
+		SET_BIT(NPCX_ADCCS, input_ch);
+		/* Set conversion type to repetitive (runs continuously) */
+		SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_ADCRPTC);
+		repetitive_enabled |= BIT(input_ch);
+
+		/* Start conversion */
+		SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_START);
+	} else {
+		CLEAR_BIT(NPCX_ADCCS, input_ch);
+		repetitive_enabled &= ~BIT(input_ch);
+
+		if (!repetitive_enabled) {
+			/* Turn off ADC */
+			CLEAR_BIT(NPCX_ADCCNF, NPCX_ADCCNF_ADCEN);
+			/* Set ADC to one-shot mode */
+			CLEAR_BIT(NPCX_ADCCNF, NPCX_ADCCNF_ADCRPTC);
+			/* Allow ec enter deep sleep */
+			enable_sleep(SLEEP_MASK_ADC);
+		} else {
+			/* Start conversion again */
+			SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_START);
+		}
+	}
+
+	mutex_unlock(&adc_lock);
+}
+
 /**
- * ADC read specific channel.
+ * Return the ADC value from CHNDAT register directly.
+ *
+ * @param   input_ch    channel number
+ * @return  ADC data
+ */
+int adc_read_data(enum npcx_adc_input_channel input_ch)
+{
+	const struct adc_t *adc = adc_channels + input_ch;
+	int value;
+	uint16_t chn_data;
+
+	chn_data = NPCX_CHNDAT(adc->input_ch);
+	value = GET_FIELD(chn_data, NPCX_CHNDAT_CHDAT_FIELD) *
+		 adc->factor_mul / adc->factor_div + adc->shift;
+	return value;
+}
+
+/**
+ * Start a single conversion and return the result
  *
  * @param   ch    operation channel
  * @return  ADC converted voltage or error message
@@ -111,11 +182,16 @@ static int start_single_and_wait(enum npcx_adc_input_channel input_ch
 int adc_read_channel(enum adc_channel ch)
 {
 	const struct adc_t *adc = adc_channels + ch;
-	static struct mutex adc_lock;
 	int value;
 	uint16_t chn_data;
 
 	mutex_lock(&adc_lock);
+
+	/* Forbid ec enter deep sleep during ADC conversion is proceeding. */
+	disable_sleep(SLEEP_MASK_ADC);
+
+	/* Turn on ADC */
+	SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_ADCEN);
 
 	if (start_single_and_wait(adc->input_ch, ADC_TIMEOUT_US)) {
 		chn_data = NPCX_CHNDAT(adc->input_ch);
@@ -132,9 +208,108 @@ int adc_read_channel(enum adc_channel ch)
 		value = ADC_READ_ERROR;
 	}
 
+	if (!repetitive_enabled) {
+		/* Turn off ADC */
+		CLEAR_BIT(NPCX_ADCCNF, NPCX_ADCCNF_ADCEN);
+		/* Allow ec enter deep sleep */
+		enable_sleep(SLEEP_MASK_ADC);
+	} else {
+		/* Set ADC conversion code to SW conversion mode */
+		SET_FIELD(NPCX_ADCCNF, NPCX_ADCCNF_ADCMD_FIELD,
+		  ADC_SCAN_CONVERSION_MODE);
+		/* Set conversion type to repetitive (runs continuously) */
+		SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_ADCRPTC);
+		/* Start conversion */
+		SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_START);
+	}
+
 	mutex_unlock(&adc_lock);
 
 	return value;
+}
+
+/* Board should register these callbacks with npcx_adc_cfg_thresh_int(). */
+static void (*adc_thresh_irqs[NPCX_ADC_THRESH_CNT])(void);
+
+void npcx_adc_thresh_int_enable(int threshold_idx, int enable)
+{
+	uint16_t thrcts;
+
+	enable = !!enable;
+
+	if ((threshold_idx < 1) || (threshold_idx > NPCX_ADC_THRESH_CNT)) {
+		CPRINTS("Invalid ADC thresh index! (%d)",
+			threshold_idx);
+		return;
+	}
+	threshold_idx--; /* convert to 0-based */
+
+	/* avoid clearing other threshold status */
+	thrcts = NPCX_THRCTS & ~GENMASK(NPCX_ADC_THRESH_CNT - 1, 0);
+
+	if (enable) {
+		/* clear threshold status */
+		SET_BIT(thrcts, threshold_idx);
+		/* set enable threshold status */
+		SET_BIT(thrcts, NPCX_THRCTS_THR1_IEN + threshold_idx);
+	} else {
+		CLEAR_BIT(thrcts, NPCX_THRCTS_THR1_IEN + threshold_idx);
+	}
+	NPCX_THRCTS = thrcts;
+}
+
+void npcx_adc_register_thresh_irq(int threshold_idx,
+				  const struct npcx_adc_thresh_t *thresh_cfg)
+{
+	int npcx_adc_ch;
+	int raw_val;
+	int mul;
+	int div;
+	int shift;
+
+	if ((threshold_idx < 1) || (threshold_idx > NPCX_ADC_THRESH_CNT)) {
+		CPRINTS("Invalid ADC thresh index! (%d)",
+			threshold_idx);
+		return;
+	}
+	npcx_adc_ch = adc_channels[thresh_cfg->adc_ch].input_ch;
+
+	if (!thresh_cfg->adc_thresh_cb) {
+		CPRINTS("No callback for ADC Threshold %d!",
+			threshold_idx);
+		return;
+	}
+
+	/* Fill in the table */
+	adc_thresh_irqs[threshold_idx-1] = thresh_cfg->adc_thresh_cb;
+
+	/* Select the channel */
+	SET_FIELD(NPCX_THRCTL(threshold_idx), NPCX_THRCTL_CHNSEL,
+		  npcx_adc_ch);
+
+	if (thresh_cfg->lower_or_higher)
+		SET_BIT(NPCX_THRCTL(threshold_idx), NPCX_THRCTL_L_H);
+	else
+		CLEAR_BIT(NPCX_THRCTL(threshold_idx), NPCX_THRCTL_L_H);
+
+	/* Set the threshold value. */
+	mul = adc_channels[thresh_cfg->adc_ch].factor_mul;
+	div = adc_channels[thresh_cfg->adc_ch].factor_div;
+	shift = adc_channels[thresh_cfg->adc_ch].shift;
+
+	raw_val = (thresh_cfg->thresh_assert - shift) * div / mul;
+	CPRINTS("ADC THR%d: Setting THRVAL = %d, L_H: %d", threshold_idx,
+		raw_val, thresh_cfg->lower_or_higher);
+	SET_FIELD(NPCX_THRCTL(threshold_idx), NPCX_THRCTL_THRVAL,
+		  raw_val);
+
+#if NPCX_FAMILY_VERSION <= NPCX_FAMILY_NPCX7
+	/* Disable deassertion threshold function */
+	CLEAR_BIT(NPCX_THR_DCTL(threshold_idx), NPCX_THR_DCTL_THRD_EN);
+#endif
+
+	/* Enable threshold detection */
+	SET_BIT(NPCX_THRCTL(threshold_idx), NPCX_THRCTL_THEN);
 }
 
 /**
@@ -146,22 +321,41 @@ int adc_read_channel(enum adc_channel ch)
  */
 void adc_interrupt(void)
 {
-	if (IS_BIT_SET(NPCX_ADCSTS, NPCX_ADCSTS_EOCEV)) {
+	int i;
+	uint16_t thrcts;
+
+	if (IS_BIT_SET(NPCX_ADCCNF, NPCX_ADCCNF_INTECEN) &&
+	    IS_BIT_SET(NPCX_ADCSTS, NPCX_ADCSTS_EOCEV)) {
 		/* Disable End-of-Conversion Interrupt */
 		CLEAR_BIT(NPCX_ADCCNF, NPCX_ADCCNF_INTECEN);
 
-		/* Stop conversion */
-		SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_STOP);
+		/* Stop conversion for single-shot mode */
+		if (!repetitive_enabled)
+			SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_STOP);
 
 		/* Clear End-of-Conversion Event status */
 		SET_BIT(NPCX_ADCSTS, NPCX_ADCSTS_EOCEV);
 
 		/* Wake up the task which was waiting for the interrupt */
 		if (task_waiting != TASK_ID_INVALID)
-			task_set_event(task_waiting, TASK_EVENT_ADC_DONE, 0);
+			task_set_event(task_waiting, TASK_EVENT_ADC_DONE);
+	}
+
+	for (i = NPCX_THRCTS_THR1_STS; i < NPCX_ADC_THRESH_CNT; i++) {
+		if (IS_BIT_SET(NPCX_THRCTS, NPCX_THRCTS_THR1_IEN + i) &&
+		    IS_BIT_SET(NPCX_THRCTS, i)) {
+			/* avoid clearing other threshold status */
+			thrcts = NPCX_THRCTS &
+					~GENMASK(NPCX_ADC_THRESH_CNT - 1, 0);
+			/* Clear threshold status */
+			SET_BIT(thrcts, i);
+			NPCX_THRCTS = thrcts;
+			if (adc_thresh_irqs[i])
+				adc_thresh_irqs[i]();
+		}
 	}
 }
-DECLARE_IRQ(NPCX_IRQ_ADC, adc_interrupt, 3);
+DECLARE_IRQ(NPCX_IRQ_ADC, adc_interrupt, 4);
 
 /**
  * ADC initial.
@@ -177,9 +371,6 @@ static void adc_init(void)
 	/* Enable ADC clock (bit4 mask = 0x10) */
 	clock_enable_peripheral(CGC_OFFSET_ADC, CGC_ADC_MASK,
 			CGC_MODE_RUN | CGC_MODE_SLEEP);
-
-	/* Enable ADC */
-	SET_BIT(NPCX_ADCCNF, NPCX_ADCCNF_ADCEN);
 
 	/* Set Core Clock Division Factor in order to obtain the ADC clock */
 	adc_freq_changed();

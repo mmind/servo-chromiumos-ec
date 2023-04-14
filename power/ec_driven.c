@@ -1,10 +1,10 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
 
 /*
- * Dummy power module for Sensor HUB.
+ * Mock power module for Sensor HUB.
  *
  * This implements the following features:
  * when AP_IN_SUSPEND is low, in S0, otherwise S3.

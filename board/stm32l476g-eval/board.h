@@ -8,6 +8,12 @@
 #ifndef __CROS_EC_BOARD_H
 #define __CROS_EC_BOARD_H
 
+#ifdef CTS_MODULE
+/* CTS tests are small. We can use smaller size to expedite flash time. */
+#undef  CONFIG_FLASH_SIZE
+#define CONFIG_FLASH_SIZE 0x00040000	/* 256k */
+#endif
+
 /* Optional features */
 #undef CONFIG_WATCHDOG_HELP
 #undef CONFIG_LID_SWITCH
@@ -31,7 +37,7 @@
 
 #ifdef CTS_MODULE_I2C
 #define CONFIG_I2C
-#define CONFIG_I2C_SLAVE
+#define CONFIG_I2C_PERIPHERAL
 #define CONFIG_HOSTCMD_I2C_SLAVE_ADDR 0x3c
 #define I2C_PORT_EC STM32_I2C2_PORT
 #endif

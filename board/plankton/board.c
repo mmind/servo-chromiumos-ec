@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -12,7 +12,7 @@
 #include "hooks.h"
 #include "i2c.h"
 #include "ina2xx.h"
-#include "ioexpander_pca9534.h"
+#include "pca9534.h"
 #include "registers.h"
 #include "system.h"
 #include "task.h"
@@ -203,14 +203,14 @@ static void detect_cc_cable(void)
 					     TYPEC_CABLE_SINGLE_CC;
 		/* Flip back to original polarity and enable PD comms */
 		set_active_cc(!active_cc);
-		pd_comm_enable(1);
+		pd_comm_enable(0, 1);
 		break;
 	case TYPEC_CABLE_SINGLE_CC:
 	case TYPEC_CABLE_DOUBLE_CC:
 		/* Check for disconnection and disable PD comms */
 		if (!pd_is_connected(0)) {
 			cable = TYPEC_CABLE_NONE;
-			pd_comm_enable(0);
+			pd_comm_enable(0, 0);
 		}
 		break;
 	}
@@ -269,7 +269,7 @@ static void update_usbc_dual_role(int dual_role)
 		/* Need to make sure both CC lines are set for SNK or SRC. */
 		set_active_cc(host_mode);
 		/* Ensure that PD communication is enabled. */
-		pd_comm_enable(1);
+		pd_comm_enable(0, 1);
 	} else {
 		drp_enable = 0;
 		/*
@@ -279,7 +279,7 @@ static void update_usbc_dual_role(int dual_role)
 		hook_call_deferred(&detect_cc_cable_data, 0);
 	}
 	/* Update dual role setting used in USB PD protocol state machine */
-	pd_set_dual_role(dual_role);
+	pd_set_dual_role(0, dual_role);
 	cprintf(CC_USBPD, "DRP = %d, host_mode = %d\n", drp_enable, host_mode);
 }
 
@@ -467,7 +467,7 @@ const struct i2c_port_t i2c_ports[] = {
 const unsigned int i2c_ports_used = ARRAY_SIZE(i2c_ports);
 
 /* 8-bit address */
-#define SN75DP130_I2C_ADDR 0x5c
+#define SN75DP130_I2C_ADDR_FLAGS 0x2e
 /*
  * Pin number for active-high reset from PCA9534 to CMOS pull-down to
  * SN75DP130's RSTN (active-low)
@@ -476,7 +476,8 @@ const unsigned int i2c_ports_used = ARRAY_SIZE(i2c_ports);
 
 static int sn75dp130_i2c_write(uint8_t index, uint8_t value)
 {
-	return i2c_write8(I2C_PORT_MASTER, SN75DP130_I2C_ADDR, index, value);
+	return i2c_write8(I2C_PORT_MASTER, SN75DP130_I2C_ADDR_FLAGS,
+			  index, value);
 }
 
 /**
@@ -489,15 +490,17 @@ static int sn75dp130_reset(void)
 {
 	int rv;
 
-	rv = pca9534_config_pin(I2C_PORT_MASTER, 0x40, REDRIVER_RST_PIN,
-				PCA9534_OUTPUT);
+	rv = pca9534_config_pin(I2C_PORT_MASTER, 0x20,
+				REDRIVER_RST_PIN, PCA9534_OUTPUT);
 	/* Assert (its active high) */
-	rv |= pca9534_set_level(I2C_PORT_MASTER, 0x40, REDRIVER_RST_PIN, 1);
+	rv |= pca9534_set_level(I2C_PORT_MASTER, 0x20,
+				REDRIVER_RST_PIN, 1);
 	/* datasheet recommends > 100usec */
 	usleep(200);
 
 	/* De-assert */
-	rv |= pca9534_set_level(I2C_PORT_MASTER, 0x40, REDRIVER_RST_PIN, 0);
+	rv |= pca9534_set_level(I2C_PORT_MASTER, 0x20,
+				REDRIVER_RST_PIN, 0);
 	/* datasheet recommends > 400msec */
 	usleep(450 * MSEC);
 	return rv;
@@ -593,10 +596,12 @@ int board_in_hub_mode(void)
 	int ret;
 	int level;
 
-	ret = pca9534_config_pin(I2C_PORT_MASTER, 0x40, 6, PCA9534_INPUT);
+	ret = pca9534_config_pin(I2C_PORT_MASTER, 0x20,
+				 6, PCA9534_INPUT);
 	if (ret)
 		return -1;
-	ret = pca9534_get_level(I2C_PORT_MASTER, 0x40, 6, &level);
+	ret = pca9534_get_level(I2C_PORT_MASTER, 0x20,
+				6, &level);
 	if (ret)
 		return -1;
 	return level;
@@ -606,14 +611,17 @@ static int board_usb_hub_reset(void)
 {
 	int ret;
 
-	ret = pca9534_config_pin(I2C_PORT_MASTER, 0x40, 7, PCA9534_OUTPUT);
+	ret = pca9534_config_pin(I2C_PORT_MASTER, 0x20,
+				 7, PCA9534_OUTPUT);
 	if (ret)
 		return ret;
-	ret = pca9534_set_level(I2C_PORT_MASTER, 0x40, 7, 0);
+	ret = pca9534_set_level(I2C_PORT_MASTER, 0x20,
+				7, 0);
 	if (ret)
 		return ret;
 	usleep(100 * MSEC);
-	return pca9534_set_level(I2C_PORT_MASTER, 0x40, 7, 1);
+	return pca9534_set_level(I2C_PORT_MASTER, 0x20,
+				 7, 1);
 }
 
 void board_maybe_reset_usb_hub(void)
@@ -733,7 +741,7 @@ static void board_init(void)
 	sn75dp130_redriver_init();
 
 	/* Initialize USB hub */
-	if (system_get_reset_flags() & RESET_FLAG_POWER_ON)
+	if (system_get_reset_flags() & EC_RESET_FLAG_POWER_ON)
 		hook_call_deferred(&board_usb_hub_reset_no_return_data,
 				   500 * MSEC);
 

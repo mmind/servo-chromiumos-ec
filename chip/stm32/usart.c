@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -17,6 +17,7 @@
 void usart_init(struct usart_config const *config)
 {
 	intptr_t base = config->hw->base;
+	uint32_t cr2, cr3;
 
 	/*
 	 * Enable clock to USART, this must be done first, before attempting
@@ -40,9 +41,22 @@ void usart_init(struct usart_config const *config)
 	 * 8N1, 16 samples per bit. error interrupts, and special modes
 	 * disabled.
 	 */
+
+	cr2 = 0x0000;
+	cr3 = 0x0000;
+#if defined(CHIP_FAMILY_STM32F0) || defined(CHIP_FAMILY_STM32F3) || \
+    defined(CHIP_FAMILY_STM32L4)
+	if (config->flags & USART_CONFIG_FLAG_RX_INV)
+		cr2 |= BIT(16);
+	if (config->flags & USART_CONFIG_FLAG_TX_INV)
+		cr2 |= BIT(17);
+#endif
+	if (config->flags & USART_CONFIG_FLAG_HDSEL)
+		cr3 |= BIT(3);
+
 	STM32_USART_CR1(base) = 0x0000;
-	STM32_USART_CR2(base) = 0x0000;
-	STM32_USART_CR3(base) = 0x0000;
+	STM32_USART_CR2(base) = cr2;
+	STM32_USART_CR3(base) = cr3;
 
 	/*
 	 * Enable the RX, TX, and variant specific HW.
@@ -72,9 +86,10 @@ void usart_shutdown(struct usart_config const *config)
 	config->hw->ops->disable(config);
 }
 
-void usart_set_baud_f0_l(struct usart_config const *config, int frequency_hz)
+void usart_set_baud_f0_l(struct usart_config const *config, int baud,
+			int frequency_hz)
 {
-	int      div  = DIV_ROUND_NEAREST(frequency_hz, config->baud);
+	int      div  = DIV_ROUND_NEAREST(frequency_hz, baud);
 	intptr_t base = config->hw->base;
 
 	if (div / 16 > 0) {
@@ -94,12 +109,60 @@ void usart_set_baud_f0_l(struct usart_config const *config, int frequency_hz)
 	}
 }
 
-void usart_set_baud_f(struct usart_config const *config, int frequency_hz)
+void usart_set_baud_f(struct usart_config const *config, int baud,
+		int frequency_hz)
 {
-	int div = DIV_ROUND_NEAREST(frequency_hz, config->baud);
+	int div = DIV_ROUND_NEAREST(frequency_hz, baud);
 
 	/* STM32F only supports x16 oversampling */
 	STM32_USART_BRR(config->hw->base) = div;
+}
+
+int usart_get_parity(struct usart_config const *config)
+{
+	intptr_t base = config->hw->base;
+
+	if (!(STM32_USART_CR1(base) & STM32_USART_CR1_PCE))
+		return 0;
+	if (STM32_USART_CR1(base) & STM32_USART_CR1_PS)
+		return 1;
+	return 2;
+}
+
+/*
+ * We only allow 8 bit word. CR1_PCE modifies parity enable,
+ * CR1_PS modifies even/odd, CR1_M modifies total word length
+ * to make room for parity.
+ */
+void usart_set_parity(struct usart_config const *config, int parity)
+{
+	uint32_t ue;
+	intptr_t base = config->hw->base;
+
+	if ((parity < 0) || (parity > 2))
+		return;
+
+	/* Record active state and disable the UART. */
+	ue = STM32_USART_CR1(base) & STM32_USART_CR1_UE;
+	STM32_USART_CR1(base) &= ~STM32_USART_CR1_UE;
+
+	if (parity) {
+		/* Set parity control enable. */
+		STM32_USART_CR1(base) |=
+			(STM32_USART_CR1_PCE | STM32_USART_CR1_M);
+		/* Set parity select even/odd bit. */
+		if (parity == 2)
+			STM32_USART_CR1(base) &= ~STM32_USART_CR1_PS;
+		else
+			STM32_USART_CR1(base) |= STM32_USART_CR1_PS;
+	} else {
+		STM32_USART_CR1(base) &=
+			~(STM32_USART_CR1_PCE | STM32_USART_CR1_PS |
+			  STM32_USART_CR1_M);
+	}
+
+	/* Restore active state. */
+	STM32_USART_CR1(base) |= ue;
 }
 
 void usart_interrupt(struct usart_config const *config)

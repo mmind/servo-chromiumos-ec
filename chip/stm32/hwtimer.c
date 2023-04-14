@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -6,6 +6,7 @@
 /* Hardware timers driver */
 
 #include "clock.h"
+#include "clock-f.h"
 #include "common.h"
 #include "hooks.h"
 #include "hwtimer.h"
@@ -243,7 +244,7 @@ void __hw_timer_enable_clock(int n, int enable)
 		reg = &STM32_RCC_APB2ENR;
 		mask = STM32_RCC_PB2_TIM1;
 	}
-#elif defined(CHIP_FAMILY_STM32L)
+#elif defined(CHIP_FAMILY_STM32L) || defined(CHIP_FAMILY_STM32F4)
 	if (n >= 9 && n <= 11) {
 		reg = &STM32_RCC_APB2ENR;
 		mask = STM32_RCC_PB2_TIM9 << (n - 9);
@@ -304,7 +305,7 @@ static void update_prescaler(void)
 	 * prescaler counter ticks down, or if forced via EGR).
 	 */
 	STM32_TIM_PSC(TIM_CLOCK_MSB) = 0;
-	STM32_TIM_PSC(TIM_CLOCK_LSB) = (clock_get_freq() / SECOND) - 1;
+	STM32_TIM_PSC(TIM_CLOCK_LSB) = (clock_get_timer_freq() / SECOND) - 1;
 }
 DECLARE_HOOK(HOOK_FREQ_CHANGE, update_prescaler, HOOK_PRIO_DEFAULT);
 
@@ -394,7 +395,7 @@ void IRQ_HANDLER(IRQ_WD)(void)
 		     "bl watchdog_check\n"
 		     "pop {r0,pc}\n");
 }
-const struct irq_priority IRQ_PRIORITY(IRQ_WD)
+const struct irq_priority __keep IRQ_PRIORITY(IRQ_WD)
 	__attribute__((section(".rodata.irqprio")))
 		= {IRQ_WD, 0}; /* put the watchdog at the highest
 					    priority */
@@ -413,7 +414,7 @@ void hwtimer_setup_watchdog(void)
 	 * Timer configuration : Down counter, counter disabled, update
 	 * event only on overflow.
 	 */
-	timer->cr1 = 0x0014 | (1 << 7);
+	timer->cr1 = 0x0014 | BIT(7);
 
 	/* TIM (slave mode) uses TIM_CLOCK_LSB as internal trigger */
 	timer->smcr = 0x0007 | (TSMAP(TIM_WATCHDOG, TIM_CLOCK_LSB) << 4);
@@ -425,7 +426,7 @@ void hwtimer_setup_watchdog(void)
 	 * to obtain the number of times TIM_CLOCK_LSB can overflow before we
 	 * generate an interrupt.
 	 */
-	timer->arr = timer->cnt = CONFIG_AUX_TIMER_PERIOD_MS * MSEC / (1 << 16);
+	timer->arr = timer->cnt = CONFIG_AUX_TIMER_PERIOD_MS * MSEC / BIT(16);
 
 	/* count on every TIM_CLOCK_LSB overflow */
 	timer->psc = 0;
@@ -450,4 +451,4 @@ void hwtimer_reset_watchdog(void)
 	timer->cnt = timer->arr;
 }
 
-#endif  /* defined(CONFIG_WATCHDOG) */
+#endif  /* defined(CONFIG_WATCHDOG_HELP) */

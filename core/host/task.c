@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -54,7 +54,8 @@ static int generator_sleeping;
 static timestamp_t generator_sleep_deadline;
 static int has_interrupt_generator = 1;
 
-static __thread task_id_t my_task_id; /* thread local task id */
+/* thread local task id */
+static __thread task_id_t my_task_id = TASK_ID_INVALID;
 
 static void task_enable_all_tasks_callback(void);
 
@@ -63,6 +64,23 @@ CONFIG_TASK_LIST
 CONFIG_TEST_TASK_LIST
 CONFIG_CTS_TASK_LIST
 #undef TASK
+
+/* usleep that uses OS functions, instead of emulated timer. */
+void _usleep(int usec)
+{
+	struct timespec req;
+
+	req.tv_sec = usec / 1000000;
+	req.tv_nsec = (usec % 1000000) * 1000;
+
+	nanosleep(&req, NULL);
+}
+
+/* msleep that uses OS functions, instead of emulated timer. */
+void _msleep(int msec)
+{
+	_usleep(1000 * msec);
+}
 
 /* Idle task */
 void __idle(void *d)
@@ -73,11 +91,11 @@ void __idle(void *d)
 
 void _run_test(void *d)
 {
-	run_test();
+	run_test(0, NULL);
 }
 
 #define TASK(n, r, d, s) {r, d},
-struct task_args task_info[TASK_ID_COUNT] = {
+const struct task_args task_info[TASK_ID_COUNT] = {
 	{__idle, NULL},
 	CONFIG_TASK_LIST
 	CONFIG_TEST_TASK_LIST
@@ -106,14 +124,14 @@ int in_interrupt_context(void)
 	return !!in_interrupt;
 }
 
-void interrupt_disable(void)
+test_mockable void interrupt_disable(void)
 {
 	pthread_mutex_lock(&interrupt_lock);
 	interrupt_disabled = 1;
 	pthread_mutex_unlock(&interrupt_lock);
 }
 
-void interrupt_enable(void)
+test_mockable void interrupt_enable(void)
 {
 	pthread_mutex_lock(&interrupt_lock);
 	interrupt_disabled = 0;
@@ -155,7 +173,7 @@ void task_trigger_test_interrupt(void (*isr)(void))
 	/* Wait for ISR to complete */
 	sem_wait(&interrupt_sem);
 	while (in_interrupt)
-		;
+		_usleep(10);
 	pending_isr = NULL;
 
 	pthread_mutex_unlock(&interrupt_lock);
@@ -180,12 +198,15 @@ pthread_t task_get_thread(task_id_t tskid)
 	return tasks[tskid].thread;
 }
 
-uint32_t task_set_event(task_id_t tskid, uint32_t event, int wait)
+uint32_t task_set_event(task_id_t tskid, uint32_t event)
 {
-	tasks[tskid].event = event;
-	if (wait)
-		return task_wait_event(-1);
+	atomic_or(&tasks[tskid].event, event);
 	return 0;
+}
+
+uint32_t *task_get_event_bitmap(task_id_t tskid)
+{
+	return &tasks[tskid].event;
 }
 
 uint32_t task_wait_event(int timeout_us)
@@ -201,8 +222,7 @@ uint32_t task_wait_event(int timeout_us)
 	pthread_cond_wait(&tasks[tid].resume, &run_lock);
 
 	/* Resume */
-	ret = tasks[tid].event;
-	tasks[tid].event = 0;
+	ret = atomic_clear(&tasks[tid].event);
 	pthread_mutex_unlock(&interrupt_lock);
 	return ret;
 }
@@ -230,7 +250,8 @@ uint32_t task_wait_event_mask(uint32_t event_mask, int timeout_us)
 
 	/* Re-post any other events collected */
 	if (events & ~event_mask)
-		tasks[task_get_current()].event |= events & ~event_mask;
+		atomic_or(&tasks[task_get_current()].event,
+			  events & ~event_mask);
 
 	return events & event_mask;
 }
@@ -263,7 +284,7 @@ void mutex_unlock(struct mutex *mtx)
 	for (v = 31; v >= 0; --v)
 		if ((1ul << v) & mtx->waiters) {
 			mtx->waiters &= ~(1ul << v);
-			task_set_event(v, TASK_EVENT_MUTEX, 0);
+			task_set_event(v, TASK_EVENT_MUTEX);
 			break;
 		}
 }
@@ -278,21 +299,57 @@ task_id_t task_get_running(void)
 	return running_task_id;
 }
 
-void wait_for_task_started(void)
+void task_print_list(void)
+{
+	int i;
+
+	ccputs("Name         Events\n");
+
+	for (i = 0; i < TASK_ID_COUNT; i++) {
+		ccprintf("%4d %-16s %08x\n", i, task_names[i], tasks[i].event);
+		cflush();
+	}
+}
+
+int command_task_info(int argc, char **argv)
+{
+	task_print_list();
+
+	return EC_SUCCESS;
+}
+DECLARE_SAFE_CONSOLE_COMMAND(taskinfo, command_task_info,
+			     NULL,
+			     "Print task info");
+
+static void _wait_for_task_started(int can_sleep)
 {
 	int i, ok;
 
 	while (1) {
 		ok = 1;
-		for (i = 0; i < TASK_ID_COUNT - 1; ++i)
+		for (i = 0; i < TASK_ID_COUNT - 1; ++i) {
 			if (!tasks[i].started) {
-				msleep(10);
+				if (can_sleep)
+					msleep(10);
+				else
+					_msleep(10);
 				ok = 0;
 				break;
 			}
+		}
 		if (ok)
 			return;
 	}
+}
+
+void wait_for_task_started(void)
+{
+	_wait_for_task_started(1);
+}
+
+void wait_for_task_started_nosleep(void)
+{
+	_wait_for_task_started(0);
 }
 
 static task_id_t task_get_next_wake(void)
@@ -379,6 +436,9 @@ void task_scheduler(void)
 		if (i < 0)
 			i = fast_forward();
 
+		now = get_time();
+		if (now.val >= tasks[i].wake_time.val)
+			tasks[i].event |= TASK_EVENT_TIMER;
 		tasks[i].wake_time.val = ~0ull;
 		running_task_id = i;
 		tasks[i].started = 1;
@@ -390,7 +450,7 @@ void task_scheduler(void)
 void *_task_start_impl(void *a)
 {
 	long tid = (long)a;
-	struct task_args *arg = task_info + tid;
+	const struct task_args *arg = task_info + tid;
 	my_task_id = tid;
 	pthread_mutex_lock(&run_lock);
 

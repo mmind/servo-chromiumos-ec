@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -103,11 +103,11 @@
 #define CONFIG_MPU
 #endif
 #define CONFIG_DMA
-#define CONFIG_LPC
+#define CONFIG_HOSTCMD_LPC
 #define CONFIG_SPI
 #define CONFIG_SWITCH
 
 #define GPIO_PIN(index) (index / 10), (1 << (index % 10))
-#define GPIO_PIN_MASK(pin, mask) (pin), (mask)
+#define GPIO_PIN_MASK(p, m) .port = (p), .mask = (m)
 
 #endif  /* __CROS_EC_CONFIG_CHIP_H */

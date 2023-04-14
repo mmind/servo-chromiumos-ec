@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -7,20 +7,25 @@
 #define __CROS_EC_ACCELGYRO_H
 
 #include "motion_sense.h"
+#include "math_util.h"
 
 /* Header file for accelerometer / gyro drivers. */
 
-/* Number of counts from accelerometer that represents 1G acceleration. */
-#define ACCEL_G  1024
+/*
+ * EC reports sensor data on 16 bits. For accel/gyro/mag.. the MSB is the sign.
+ * For instance, for gravity,
+ * real_value[in g] = measured_value * range >> 15
+ */
+#define MOTION_SCALING_FACTOR (1 << 15)
+#define MOTION_ONE_G (9.80665f)
 
 struct accelgyro_drv {
 	/**
 	 * Initialize accelerometers.
-	 * @s Pointer to sensor data pointer. Sensor data will be
-	 * allocated on success.
+	 * @s Pointer to sensor data pointer.
 	 * @return EC_SUCCESS if successful, non-zero if error.
 	 */
-	int (*init)(const struct motion_sensor_t *s);
+	int (*init)(struct motion_sensor_t *s);
 
 	/**
 	 * Read all three accelerations of an accelerometer. Note that all
@@ -30,22 +35,34 @@ struct accelgyro_drv {
 	 * @v Vector to store acceleration (in units of counts).
 	 * @return EC_SUCCESS if successful, non-zero if error.
 	 */
-	int (*read)(const struct motion_sensor_t *s, vector_3_t v);
+	int (*read)(const struct motion_sensor_t *s, intv3_t v);
 
 	/**
-	 * Setter and getter methods for the sensor range. The sensor range
+	 * Read the sensor's current internal temperature.
+	 *
+	 * @param s Pointer to sensor data.
+	 * @param temp Pointer to store temperature in degrees Kelvin.
+	 * @return EC_SUCCESS if successful, non-zero if error.
+	 */
+	int (*read_temp)(const struct motion_sensor_t *s, int *temp);
+
+	/**
+	 * Setter method for the sensor range. The sensor range
 	 * defines the maximum value that can be returned from read(). As the
 	 * range increases, the resolution gets worse.
 	 * @s Pointer to sensor data.
 	 * @range Range (Units are +/- G's for accel, +/- deg/s for gyro)
 	 * @rnd Rounding flag. If true, it rounds up to nearest valid
 	 * value. Otherwise, it rounds down.
+	 *
+	 * sensor->current_range is updated.
+	 * It will be preserved unless EC reboots or AP is shutdown (S5).
+	 *
 	 * @return EC_SUCCESS if successful, non-zero if error.
 	 */
-	int (*set_range)(const struct motion_sensor_t *s,
+	int (*set_range)(struct motion_sensor_t *s,
 			int range,
 			int rnd);
-	int (*get_range)(const struct motion_sensor_t *s);
 
 	/**
 	 * Setter and getter methods for the sensor resolution.
@@ -88,8 +105,26 @@ struct accelgyro_drv {
 	int (*get_offset)(const struct motion_sensor_t *s,
 				int16_t    *offset,
 				int16_t    *temp);
-	int (*perform_calib)(const struct motion_sensor_t *s);
-#ifdef CONFIG_ACCEL_INTERRUPTS
+	/**
+	 * Setter and getter methods for the sensor scale.
+	 * @s Pointer to sensor data.
+	 * @scale: scale to apply to raw data.
+	 * @temp: temperature when calibration was done.
+	 * @return EC_SUCCESS if successful, non-zero if error.
+	 */
+	int (*set_scale)(const struct motion_sensor_t *s,
+				const uint16_t    *scale,
+				int16_t    temp);
+	int (*get_scale)(const struct motion_sensor_t *s,
+				uint16_t   *scale,
+				int16_t    *temp);
+	/**
+	 * Request performing/entering calibration.
+	 * Either a one shot mode (enable is not used),
+	 * or enter/exit a calibration state.
+	 */
+	int (*perform_calib)(struct motion_sensor_t *s,
+				int        enable);
 	/**
 	 * handler for interrupts triggered by the sensor: it runs in task and
 	 * process the events that triggered an interrupt.
@@ -100,18 +135,6 @@ struct accelgyro_drv {
 	 * when no events have been processed.
 	 */
 	int (*irq_handler)(struct motion_sensor_t *s, uint32_t *event);
-#endif
-#ifdef CONFIG_ACCEL_FIFO
-	/**
-	 * Retrieve hardware FIFO from sensor,
-	 * - put data in Sensor Hub fifo.
-	 * - update sensor raw_xyz vector with the last information.
-	 * We put raw data in hub fifo and process data from there.
-	 * @s Pointer to sensor data.
-	 */
-	int (*load_fifo)(struct motion_sensor_t *s);
-#endif
-#ifdef CONFIG_GESTURE_HOST_DETECTION
 	/**
 	 * handler for setting/getting activity information.
 	 * Manage the high level activity detection of the chip.
@@ -134,13 +157,92 @@ struct accelgyro_drv {
 			       uint32_t *enabled,
 			       uint32_t *disabled);
 
-#endif
+	/**
+	 * Get the root mean square of current noise (ug/mdps) in the sensor.
+	 */
+	int (*get_rms_noise)(const struct motion_sensor_t *s);
+};
+
+/* Index values for rgb_calibration_t.coeff array */
+enum xyz_coeff_index {
+	TCS_CLEAR_COEFF_IDX = 0,
+	TCS_RED_COEFF_IDX,
+	TCS_GREEN_COEFF_IDX,
+	TCS_BLUE_COEFF_IDX,
+	COEFF_CHANNEL_COUNT,
+};
+
+/* Index values for rgb_scale array */
+enum rgb_index {
+	RED_RGB_IDX = 0,
+	GREEN_RGB_IDX,
+	BLUE_RGB_IDX,
+	RGB_CHANNEL_COUNT
 };
 
 /* Used to save sensor information */
 struct accelgyro_saved_data_t {
 	int odr;
-	int range;
+	uint16_t scale[3];
 };
+
+/* individual channel cover scaling and k factors */
+struct als_channel_scale_t {
+	uint16_t k_channel_scale;
+
+	/* Cover compensation scale factor */
+	uint16_t cover_scale;
+};
+
+/* Calibration data */
+struct als_calibration_t {
+	/*
+	 * Scale, uscale, and offset are used to correct the raw 16 bit ALS
+	 * data and then to convert it to 32 bit using the following equations:
+	 * raw_value += offset;
+	 * adjusted_value = raw_value * scale + raw_value * uscale / 10000;
+	 */
+	uint16_t scale;
+	uint16_t uscale;
+	int16_t offset;
+	struct als_channel_scale_t channel_scale;
+};
+
+/* RGB ALS Calibration Data */
+struct rgb_channel_calibration_t {
+	/*
+	 * Each channel has scaling factor for normalization & cover
+	 */
+	struct als_channel_scale_t scale;
+
+	/* Any offset to add to raw channel data */
+	int16_t offset;
+
+	/* Clear, R, G, and B coefficients for this channel */
+	fp_t coeff[COEFF_CHANNEL_COUNT];
+};
+
+struct rgb_calibration_t {
+	struct rgb_channel_calibration_t rgb_cal[RGB_CHANNEL_COUNT];
+
+	/* incandecent scaling factor */
+	fp_t irt;
+};
+
+/* als driver data */
+struct als_drv_data_t {
+	int rate;          /* holds current sensor rate */
+	int last_value;    /* holds last als clear channel value */
+	struct als_calibration_t als_cal;    /* calibration data */
+};
+
+#define SENSOR_APPLY_DIV_SCALE(_input, _scale) \
+	(((_input) * (uint64_t)MOTION_SENSE_DEFAULT_SCALE) / (_scale))
+
+#define SENSOR_APPLY_SCALE(_input, _scale) \
+	(((_input) * (uint64_t)(_scale)) / MOTION_SENSE_DEFAULT_SCALE)
+
+/* Individual channel scale value between 0 and 2 represented in 16 bits */
+#define ALS_CHANNEL_SCALE(_x) ((_x) * MOTION_SENSE_DEFAULT_SCALE)
 
 #endif /* __CROS_EC_ACCELGYRO_H */

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -53,7 +53,9 @@ static void lid_switch_open(void)
 	CPRINTS("lid open");
 	debounced_lid_open = 1;
 	hook_notify(HOOK_LID_CHANGE);
+#ifdef CONFIG_HOSTCMD_EVENTS
 	host_set_single_event(EC_HOST_EVENT_LID_OPEN);
+#endif
 }
 
 /**
@@ -69,7 +71,9 @@ static void lid_switch_close(void)
 	CPRINTS("lid close");
 	debounced_lid_open = 0;
 	hook_notify(HOOK_LID_CHANGE);
+#ifdef CONFIG_HOSTCMD_EVENTS
 	host_set_single_event(EC_HOST_EVENT_LID_CLOSED);
+#endif
 }
 
 test_mockable int lid_is_open(void)
@@ -147,7 +151,7 @@ DECLARE_CONSOLE_COMMAND(lidstate, command_lidstate,
 /**
  * Host command to enable/disable lid opened.
  */
-static int hc_force_lid_open(struct host_cmd_handler_args *args)
+static enum ec_status hc_force_lid_open(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_force_lid_open *p = args->params;
 

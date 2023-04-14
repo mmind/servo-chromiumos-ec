@@ -16,11 +16,13 @@
 #include "task.h"
 #include "update_fw.h"
 #include "usb_descriptor.h"
-#include "util.h"
-#include "usb_dwc_hw.h"
 #include "usb_dwc_console.h"
-#include "usb_power.h"
+#include "usb_dwc_i2c.h"
+#include "usb_dwc_stream.h"
 #include "usb_dwc_update.h"
+#include "usb_hw.h"
+#include "usb_power.h"
+#include "util.h"
 
 /******************************************************************************
  * Define the strings used in our USB descriptors.
@@ -31,6 +33,7 @@ const void *const usb_strings[] = {
 	[USB_STR_PRODUCT]	= USB_STRING_DESC("Sweetberry"),
 	[USB_STR_SERIALNO]	= USB_STRING_DESC("1234-a"),
 	[USB_STR_VERSION]	= USB_STRING_DESC(CROS_EC_VERSION32),
+	[USB_STR_I2C_NAME]	= USB_STRING_DESC("I2C"),
 	[USB_STR_CONSOLE_NAME]	= USB_STRING_DESC("Sweetberry EC Shell"),
 	[USB_STR_UPDATE_NAME]	= USB_STRING_DESC("Firmware update"),
 };
@@ -40,13 +43,13 @@ BUILD_ASSERT(ARRAY_SIZE(usb_strings) == USB_STR_COUNT);
 /* USB power interface. */
 USB_POWER_CONFIG(sweetberry_power, USB_IFACE_POWER, USB_EP_POWER);
 
-
 struct dwc_usb usb_ctl = {
 	.ep = {
 		&ep0_ctl,
 		&ep_console_ctl,
 		&usb_update_ep_ctl,
 		&sweetberry_power_ep_ctl,
+		&i2c_usb__ep_ctl,
 	},
 	.speed = USB_SPEED_FS,
 	.phy_type = USB_PHY_ULPI,
@@ -56,35 +59,18 @@ struct dwc_usb usb_ctl = {
 
 /* I2C ports */
 const struct i2c_port_t i2c_ports[] = {
-	{"i2c1", I2C_PORT_0, 800,
+	{"i2c1", I2C_PORT_0, 400,
 		GPIO_I2C1_SCL, GPIO_I2C1_SDA},
-	{"i2c2", I2C_PORT_1, 800,
+	{"i2c2", I2C_PORT_1, 400,
 		GPIO_I2C2_SCL, GPIO_I2C2_SDA},
-	{"i2c3", I2C_PORT_2, 800,
+	{"i2c3", I2C_PORT_2, 400,
 		GPIO_I2C3_SCL, GPIO_I2C3_SDA},
-	{"fmpi2c4", FMPI2C_PORT_3, 800,
+	{"fmpi2c4", FMPI2C_PORT_3, 900,
 		GPIO_FMPI2C_SCL, GPIO_FMPI2C_SDA},
 };
 const unsigned int i2c_ports_used = ARRAY_SIZE(i2c_ports);
 
-/******************************************************************************
- * Support firmware upgrade over USB. We can update whichever section is not
- * the current section.
- */
-
-/*
- * This array defines possible sections available for the firmware update.
- * The section which does not map the current executing code is picked as the
- * valid update area. The values are offsets into the flash space.
- */
-const struct section_descriptor board_rw_sections[] = {
-	{CONFIG_RO_MEM_OFF,
-	 CONFIG_RO_MEM_OFF + CONFIG_RO_SIZE},
-	{CONFIG_RW_MEM_OFF,
-	 CONFIG_RW_MEM_OFF + CONFIG_RW_SIZE},
-};
-const struct section_descriptor * const rw_sections = board_rw_sections;
-const int num_rw_sections = ARRAY_SIZE(board_rw_sections);
+int usb_i2c_board_is_enabled(void) { return 1; }
 
 #define GPIO_SET_HS(bank, number)	\
 	(STM32_GPIO_OSPEEDR(GPIO_##bank) |= (0x3 << ((number) * 2)))
@@ -135,6 +121,6 @@ static void board_init(void)
 	uint8_t tmp;
 
 	/* i2c 0 has a tendancy to get wedged. TODO(nsanders): why? */
-	i2c_xfer(0, 0, NULL, 0, &tmp, 1, I2C_XFER_SINGLE);
+	i2c_xfer(0, 0, NULL, 0, &tmp, 1);
 }
 DECLARE_HOOK(HOOK_INIT, board_init, HOOK_PRIO_DEFAULT);

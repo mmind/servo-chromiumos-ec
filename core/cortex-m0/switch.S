@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -6,6 +6,8 @@
  */
 
 #include "config.h"
+
+#define CPU_SCB_ICSR		0xe000ed04
 
 .text
 
@@ -62,12 +64,12 @@ __switchto:
 .global __task_start
 .thumb_func
 __task_start:
-  ldr  r2,=scratchpad     @ area used as dummy thread stack for the first switch
+  ldr  r2,=scratchpad     @ area used as thread stack for the first switch
   movs r3, #2             @ use : priv. mode / thread stack / no floating point
   adds r2, #17*4          @ put the pointer at the top of the stack
   movs r1, #0             @ __Schedule parameter : re-schedule nothing
   msr  psp, r2            @ setup a thread stack up to the first context switch
-  movs r2, #1
+  movs r2, #1             @ r2 = TASK_SCHEDULER_INIT
   isb                     @ ensure the write is done
   msr control, r3
   movs r3, r0
@@ -79,3 +81,36 @@ __task_start:
   movs r0, #1             @ set to EC_ERROR_UNKNOWN
   bx lr
 
+/**
+ * SVC exception handler
+ */
+.global svc_handler
+.thumb_func
+svc_handler:
+  push {r3, lr}              @ save link register and keep stack aligned
+  bl __svc_handler           @ call svc handler helper
+  ldr r3,=current_task       @ load the current task's address
+  ldr r1, [r3]               @ load the current task
+  cmp r0, r1                 @ compare with previous task returned by helper
+  beq svc_handler_return     @ return if they are the same
+  bl __switchto              @ context switch to the next task
+svc_handler_return:
+  pop {r3, pc}               @ return from exception or return to caller
+
+/**
+ * PendSVC exception handler
+ */
+.global pendsv_handler
+.thumb_func
+pendsv_handler:
+  push {r3, lr}              @ save link register and keep stack aligned
+  ldr r0, =#CPU_SCB_ICSR     @ load CPU_SCB_ICSR's address
+  movs r1, #1                @ prepare left shift (1 << 27)
+  lsls r1, #27               @ shift the bit
+  str r1, [r0]               @ clear pending flag
+  cpsid i                    @ ensure we have priority 0 during re-scheduling
+  movs r1, #0                @ desched nothing
+  movs r0, #0                @ resched nothing
+  bl svc_handler             @ re-schedule the highest priority task
+  cpsie i                    @ leave priority 0
+  pop {r3, pc}               @ return from exception

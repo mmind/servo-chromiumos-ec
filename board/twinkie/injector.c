@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -380,7 +380,7 @@ static int cmd_send(int argc, char **argv)
 {
 	int pol, cnt, i;
 	uint16_t header;
-	uint32_t data[VDO_MAX_SIZE-1];
+	uint32_t data[VDO_MAX_SIZE];
 	char *e;
 	int bit_len;
 
@@ -526,8 +526,9 @@ static int cmd_bufrd(int argc, char **argv)
 
 	if (argc >= 2)
 		cnt = strtoi(argv[1], &e, 10);
-		if (*e || idx + cnt > INJ_CMD_COUNT)
-			return EC_ERROR_PARAM3;
+
+	if (*e || idx + cnt > INJ_CMD_COUNT)
+		return EC_ERROR_PARAM3;
 
 	for (i = idx; i < idx + cnt; i++)
 		ccprintf("%08x ", inj_cmds[i]);
@@ -542,7 +543,7 @@ static int cmd_sink(int argc, char **argv)
 	 * Jump to the RW section which should contain a firmware acting
 	 * as a USB PD sink
 	 */
-	system_run_image_copy(SYSTEM_IMAGE_RW);
+	system_run_image_copy(EC_IMAGE_RW);
 
 	return EC_SUCCESS;
 }

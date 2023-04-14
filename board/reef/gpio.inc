@@ -19,9 +19,12 @@ GPIO_INT(USB_C1_PD_INT_ODL,	PIN(B, 1), GPIO_INT_FALLING | GPIO_PULL_UP, tcpc_ale
 
 GPIO_INT(USB_C0_CABLE_DET,	PIN(C, 5), GPIO_INT_RISING, anx74xx_cable_det_interrupt)	/* CABLE_DET from ANX3429 */
 
+#ifdef CONFIG_POWER_S0IX
+GPIO_INT(PCH_SLP_S0_L,		PIN(7, 5), GPIO_INT_BOTH, power_signal_interrupt) /* SLP_S0_L */
+#endif
 GPIO_INT(PCH_SLP_S4_L,		PIN(8, 6), GPIO_INT_BOTH, power_signal_interrupt)		/* SLP_S4_L */
 GPIO_INT(PCH_SLP_S3_L,		PIN(7, 3), GPIO_INT_BOTH, power_signal_interrupt)		/* SLP_S3_L */
-GPIO_INT(SUSPWRNACK,		PIN(7, 2), GPIO_INT_BOTH, power_signal_interrupt)
+GPIO_INT(SUSPWRDNACK,		PIN(7, 2), GPIO_INT_BOTH, power_signal_interrupt)
 GPIO_INT(RSMRST_L_PGOOD,	PIN(6, 0), GPIO_INT_BOTH, power_signal_interrupt)		/* PMIC_EC_RSMRST_ODL */
 GPIO_INT(ALL_SYS_PGOOD,		PIN(5, 0), GPIO_INT_BOTH, power_signal_interrupt)		/* PMIC_EC_PWROK_OD */
 
@@ -69,7 +72,9 @@ GPIO(EC_I2C_POWER_SCL,		PIN(D, 1), GPIO_INPUT)
 
 GPIO(PCH_SMI_L,			PIN(A, 6), GPIO_ODR_HIGH | GPIO_SEL_1P8V)	/* EC_SMI_ODL */
 GPIO(PCH_SCI_L,			PIN(A, 7), GPIO_ODR_HIGH | GPIO_SEL_1P8V)	/* EC_SCI_ODL */
+#ifndef CONFIG_POWER_S0IX
 GPIO(PCH_SLP_S0_L,              PIN(7, 5), GPIO_INPUT)				/* SLP_S0_L */
+#endif
 
 /*
  * BRD_ID1 is a an ADC pin which will be used to measure multiple values.
@@ -89,7 +94,10 @@ GPIO(EN_PP3300,			PIN(C, 2), GPIO_OUT_LOW)
 GPIO(PP3300_PG,			PIN(6, 2), GPIO_INPUT)
 GPIO(EN_PP5000,			PIN(C, 6), GPIO_OUT_LOW)
 GPIO(PP5000_PG,			PIN(7, 1), GPIO_INPUT)
-GPIO(EN_P3300_TRACKPAD_ODL,	PIN(3, 2), GPIO_ODR_HIGH)
+GPIO(EN_P3300_TRACKPAD_ODL,	PIN(3, 2), GPIO_ODR_LOW)
+/* Control the gate for trackpad IRQ. High closes the gate.
+ * This is always set low so that the OS can manage the trackpad. */
+GPIO(TRACKPAD_INT_GATE,		PIN(A, 1), GPIO_OUT_LOW)
 GPIO(PCH_SYS_PWROK,		PIN(E, 7), GPIO_OUT_LOW)		/* EC_PCH_PWROK */
 GPIO(ENABLE_BACKLIGHT,		PIN(9, 7), GPIO_ODR_HIGH | GPIO_SEL_1P8V)	/* EC_BL_EN_OD */
 
@@ -107,14 +115,13 @@ GPIO(PCH_WAKE_L,		PIN(8, 1), GPIO_ODR_HIGH)		/* EC_PCH_WAKE_ODL */
 GPIO(USB_C0_HPD_1P8_ODL,	PIN(9, 4), GPIO_INPUT | GPIO_SEL_1P8V)
 GPIO(USB_C1_HPD_1P8_ODL,	PIN(A, 5), GPIO_INPUT | GPIO_SEL_1P8V)
 
-GPIO(USB2_OTG_ID,		PIN(A, 1), GPIO_OUTPUT) /* FIXME: what should this init to? */
 GPIO(USB2_OTG_VBUSSENSE,	PIN(9, 5), GPIO_OUTPUT)
 
 /* EC_PCH_RTCRST is a sledgehammer for resetting SoC state and should rarely
  * be used. Set as input for now, we'll set it as an output when we want to use
  * it. Has external pull-down resistor. */
 GPIO(EC_PCH_RTCRST,		PIN(B, 7), GPIO_INPUT)
-GPIO(PCH_RCIN_L,		PIN(6, 1), GPIO_ODR_HIGH)		/* SYS_RST_ODL */
+GPIO(SYS_RESET_L,		PIN(6, 1), GPIO_ODR_HIGH)		/* SYS_RST_ODL */
 
 /* FIXME: What, if anything, to do about EC_RST_ODL on VCC1_RST#? */
 

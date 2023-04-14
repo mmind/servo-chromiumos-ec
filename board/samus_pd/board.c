@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -29,9 +29,6 @@
 #include "util.h"
 
 #define CPRINTS(format, args...) cprints(CC_USBCHARGE, format, ## args)
-
-/* Amount to offset the input current limit when sending to EC */
-#define INPUT_CURRENT_LIMIT_OFFSET_MA 192
 
 /*
  * When battery is high, system may not be pulling full current. Also, when
@@ -82,7 +79,7 @@ struct pi3usb9281_config pi3usb9281_chips[] = {
 	},
 };
 BUILD_ASSERT(ARRAY_SIZE(pi3usb9281_chips) ==
-	     CONFIG_USB_SWITCH_PI3USB9281_CHIP_COUNT);
+	     CONFIG_BC12_DETECT_PI3USB9281_CHIP_COUNT);
 
 static void pericom_port0_reenable_interrupts(void)
 {
@@ -112,12 +109,12 @@ void vbus1_evt(enum gpio_signal signal)
 
 void usb0_evt(enum gpio_signal signal)
 {
-	task_set_event(TASK_ID_USB_CHG_P0, USB_CHG_EVENT_BC12, 0);
+	task_set_event(TASK_ID_USB_CHG_P0, USB_CHG_EVENT_BC12);
 }
 
 void usb1_evt(enum gpio_signal signal)
 {
-	task_set_event(TASK_ID_USB_CHG_P1, USB_CHG_EVENT_BC12, 0);
+	task_set_event(TASK_ID_USB_CHG_P1, USB_CHG_EVENT_BC12);
 }
 
 static void chipset_s5_to_s3(void)
@@ -138,6 +135,7 @@ static void chipset_s3_to_s5(void)
 {
 	ps = POWER_S5;
 	hook_notify(HOOK_CHIPSET_SHUTDOWN);
+	hook_notify(HOOK_CHIPSET_SHUTDOWN_COMPLETE);
 }
 
 static void chipset_s0_to_s3(void)
@@ -184,7 +182,7 @@ void pch_evt(enum gpio_signal signal)
 void board_config_pre_init(void)
 {
 	/* enable SYSCFG clock */
-	STM32_RCC_APB2ENR |= 1 << 0;
+	STM32_RCC_APB2ENR |= BIT(0);
 	/*
 	 * the DMA mapping is :
 	 *  Chan 2 : TIM1_CH1  (C0 RX)
@@ -199,7 +197,7 @@ void board_config_pre_init(void)
 	 * Remap USART1 RX/TX DMA to match uart driver. Remap SPI2 RX/TX and
 	 * TIM3_CH1 for unique DMA channels.
 	 */
-	STM32_SYSCFG_CFGR1 |= (1 << 9) | (1 << 10) | (1 << 24) | (1 << 30);
+	STM32_SYSCFG_CFGR1 |= BIT(9) | BIT(10) | BIT(24) | BIT(30);
 }
 
 #include "gpio_list.h"
@@ -237,6 +235,7 @@ static void board_init(void)
 	} else {
 		enable_sleep(SLEEP_MASK_AP_RUN);
 		hook_notify(HOOK_CHIPSET_SHUTDOWN);
+		hook_notify(HOOK_CHIPSET_SHUTDOWN_COMPLETE);
 		ps = POWER_S5;
 	}
 
@@ -250,7 +249,7 @@ static void board_init(void)
 	/* Set PD MCU system status bits */
 	if (system_jumped_to_this_image())
 		pd_status_flags |= PD_STATUS_JUMPED_TO_IMAGE;
-	if (system_get_image_copy() == SYSTEM_IMAGE_RW)
+	if (system_is_in_rw())
 		pd_status_flags |= PD_STATUS_IN_RW;
 
 #ifdef CONFIG_PWM
@@ -321,7 +320,7 @@ int board_set_active_charge_port(int charge_port)
 {
 	/* charge port is a realy physical port */
 	int is_real_port = (charge_port >= 0 &&
-			    charge_port < CONFIG_USB_PD_PORT_COUNT);
+			    charge_port < CONFIG_USB_PD_PORT_MAX_COUNT);
 	/* check if we are source vbus on that port */
 	if (is_real_port && usb_charger_port_is_sourcing_vbus(charge_port)) {
 		CPRINTS("Skip enable p%d", charge_port);
@@ -341,7 +340,7 @@ int board_set_active_charge_port(int charge_port)
 		gpio_set_level(GPIO_USB_C1_CHARGE_EN_L, 1);
 		charge_state = PD_CHARGE_NONE;
 		pd_status.active_charge_port = charge_port;
-		CPRINTS("Chg: None\n");
+		CPRINTS("Chg: None");
 		return EC_SUCCESS;
 	}
 
@@ -364,43 +363,9 @@ int pd_is_max_request_allowed(void)
 }
 
 /**
- * Return whether ramping is allowed for given supplier
- */
-int board_is_ramp_allowed(int supplier)
-{
-	/* Don't allow ramping in RO when write protected */
-	if (system_get_image_copy() != SYSTEM_IMAGE_RW
-	    && system_is_locked())
-		return 0;
-	else
-		return supplier == CHARGE_SUPPLIER_BC12_DCP ||
-		       supplier == CHARGE_SUPPLIER_BC12_SDP ||
-		       supplier == CHARGE_SUPPLIER_BC12_CDP ||
-		       supplier == CHARGE_SUPPLIER_PROPRIETARY;
-}
-
-/**
- * Return the maximum allowed input current
- */
-int board_get_ramp_current_limit(int supplier, int sup_curr)
-{
-	switch (supplier) {
-	case CHARGE_SUPPLIER_BC12_DCP:
-		return 2000;
-	case CHARGE_SUPPLIER_BC12_SDP:
-		return 1000;
-	case CHARGE_SUPPLIER_BC12_CDP:
-	case CHARGE_SUPPLIER_PROPRIETARY:
-		return sup_curr;
-	default:
-		return 500;
-	}
-}
-
-/**
  * Return if board is consuming full amount of input current
  */
-int board_is_consuming_full_charge(void)
+int charge_is_consuming_full_input_current(void)
 {
 	return batt_soc >= 1 && batt_soc < HIGH_BATT_THRESHOLD;
 }
@@ -417,7 +382,7 @@ int board_is_consuming_full_charge(void)
 /**
  * Return if VBUS is sagging too low
  */
-int board_is_vbus_too_low(enum chg_ramp_vbus_state ramp_state)
+int board_is_vbus_too_low(int port, enum chg_ramp_vbus_state ramp_state)
 {
 	static int vbus[VBUS_STABLE_SAMPLE_COUNT];
 	static int vbus_idx, vbus_samples_full;
@@ -485,8 +450,8 @@ static int board_update_charge_limit(int charge_ma)
 	pwm_set_duty(PWM_CH_ILIM, pwm_duty);
 #endif
 
-	pd_status.curr_lim_ma = MAX(0, charge_ma -
-					INPUT_CURRENT_LIMIT_OFFSET_MA);
+	pd_status.curr_lim_ma = charge_ma >= 500 ?
+				(charge_ma - 500) * 92 / 100 + 256 : 0;
 
 	CPRINTS("New ilim %d", charge_ma);
 	return 1;
@@ -498,11 +463,13 @@ static int board_update_charge_limit(int charge_ma)
  * @param port          Port number.
  * @param supplier      Charge supplier type.
  * @param charge_ma     Desired charge limit (mA).
+ * @param charge_mv     Negotiated charge voltage (mV).
  */
-void board_set_charge_limit(int port, int supplier, int charge_ma, int max_ma)
+void board_set_charge_limit(int port, int supplier, int charge_ma,
+			    int max_ma, int charge_mv)
 {
 	/* Update current limit and notify EC if it changed */
-	if (board_update_charge_limit(charge_ma))
+	if (board_update_charge_limit(charge_ma), charge_mv)
 		pd_send_ec_int();
 }
 
@@ -510,6 +477,8 @@ static void board_update_battery_soc(int soc)
 {
 	if (batt_soc != soc) {
 		batt_soc = soc;
+		if (batt_soc >= CONFIG_CHARGE_MANAGER_BAT_PCT_SAFE_MODE_EXIT)
+			charge_manager_leave_safe_mode();
 		board_update_charge_limit(desired_charge_rate_ma);
 		hook_notify(HOOK_BATTERY_SOC_CHANGE);
 	}
@@ -525,6 +494,11 @@ void pd_send_host_event(int mask)
 	atomic_or(&(host_event_status_flags), mask);
 	atomic_or(&(pd_status_flags), PD_STATUS_HOST_EVENT);
 	pd_send_ec_int();
+}
+
+int battery_is_cut_off(void)
+{
+	return 0;  /* Always return NOT cut off */
 }
 
 /****************************************************************************/
@@ -561,7 +535,7 @@ DECLARE_CONSOLE_COMMAND(pdevent, command_pd_host_event,
 
 /****************************************************************************/
 /* Host commands */
-static int ec_status_host_cmd(struct host_cmd_handler_args *args)
+static enum ec_status ec_status_host_cmd(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_pd_status *p = args->params;
 	struct ec_response_pd_status *r = args->response;
@@ -619,7 +593,7 @@ static int ec_status_host_cmd(struct host_cmd_handler_args *args)
 	r->status = pd_status_flags;
 
 	/* Clear host event */
-	atomic_clear(&(pd_status_flags), PD_STATUS_HOST_EVENT);
+	atomic_clear_bits(&(pd_status_flags), PD_STATUS_HOST_EVENT);
 
 	args->response_size = sizeof(*r);
 
@@ -628,15 +602,16 @@ static int ec_status_host_cmd(struct host_cmd_handler_args *args)
 DECLARE_HOST_COMMAND(EC_CMD_PD_EXCHANGE_STATUS, ec_status_host_cmd,
 		     EC_VER_MASK(EC_VER_PD_EXCHANGE_STATUS));
 
-static int host_event_status_host_cmd(struct host_cmd_handler_args *args)
+static enum ec_status
+host_event_status_host_cmd(struct host_cmd_handler_args *args)
 {
 	struct ec_response_host_event_status *r = args->response;
 
 	/* Clear host event bit to avoid sending more unnecessary events */
-	atomic_clear(&(pd_status_flags), PD_STATUS_HOST_EVENT);
+	atomic_clear_bits(&(pd_status_flags), PD_STATUS_HOST_EVENT);
 
 	/* Read and clear the host event status to return to AP */
-	r->status = atomic_read_clear(&(host_event_status_flags));
+	r->status = atomic_clear(&(host_event_status_flags));
 
 	args->response_size = sizeof(*r);
 	return EC_RES_SUCCESS;

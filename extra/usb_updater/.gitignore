@@ -1,1 +1,6 @@
-usb_updater
+generated_version.h
+gsctool
+usb_updater2
+*.d
+*.o
+dp

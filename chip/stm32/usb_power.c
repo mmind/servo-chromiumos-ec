@@ -16,22 +16,9 @@
 
 #define CPRINTS(format, args...) cprints(CC_I2C, format, ## args)
 
-
-
 static int usb_power_init_inas(struct usb_power_config const *config);
 static int usb_power_read(struct usb_power_config const *config);
 static int usb_power_write_line(struct usb_power_config const *config);
-
-
-static int8_t usb_power_map_error(int error)
-{
-	switch (error) {
-	case EC_SUCCESS:       return USB_POWER_SUCCESS;
-	case EC_ERROR_TIMEOUT: return USB_POWER_ERROR_TIMEOUT;
-	case EC_ERROR_BUSY:    return USB_POWER_ERROR_BUSY;
-	default:	       return USB_POWER_ERROR_UNKNOWN | (error & 0x7f);
-	}
-}
 
 void usb_power_deferred_rx(struct usb_power_config const *config)
 {
@@ -63,8 +50,12 @@ void usb_power_deferred_tx(struct usb_power_config const *config)
 }
 
 /* Reset stream */
-void usb_power_reset(struct usb_power_config const *config)
+void usb_power_event(struct usb_power_config const *config,
+		enum usb_ep_event evt)
 {
+	if (evt != USB_EVENT_RESET)
+		return;
+
 	config->ep->out_databuffer = config->state->rx_buf;
 	config->ep->out_databuffer_max = sizeof(config->state->rx_buf);
 	config->ep->in_databuffer = config->state->tx_buf;
@@ -109,9 +100,6 @@ static int usb_power_write_line(struct usb_power_config const *config)
 		return bytes;
 	}
 
-	CPRINTS("usb_power_write_line: no data rs: %d, rc: %d",
-		USB_POWER_RECORD_SIZE(state->ina_count),
-		USB_POWER_MAX_CACHED(state->ina_count));
 	return 0;
 }
 
@@ -140,12 +128,12 @@ static int usb_power_state_stop(struct usb_power_config const *config)
 		return USB_POWER_ERROR_NOT_CAPTURING;
 	}
 
-	state->state = USB_POWER_STATE_SETUP;
+	state->state = USB_POWER_STATE_OFF;
 	state->reports_head = 0;
 	state->reports_tail = 0;
 	state->reports_xmit_active = 0;
 	state->stride_bytes = 0;
-	CPRINTS("[STOP] STATE: CAPTURING -> SETUP");
+	CPRINTS("[STOP] STATE: CAPTURING -> OFF");
 	return USB_POWER_SUCCESS;
 }
 
@@ -156,14 +144,16 @@ static int usb_power_state_start(struct usb_power_config const *config,
 {
 	struct usb_power_state *state = config->state;
 	int integration_us = cmd->start.integration_us;
+	int ret;
 
 	if (state->state != USB_POWER_STATE_SETUP) {
 		CPRINTS("[START] Error not setup.");
 		return USB_POWER_ERROR_NOT_SETUP;
 	}
 
-	if (count != 6) {
-		CPRINTS("[START] Error count %d is not 6", (int)count);
+	if (count != sizeof(struct usb_power_command_start)) {
+		CPRINTS("[START] Error count %d is not %d", (int)count,
+			sizeof(struct usb_power_command_start));
 		return USB_POWER_ERROR_READ_SIZE;
 	}
 
@@ -177,7 +167,10 @@ static int usb_power_state_start(struct usb_power_config const *config,
 	state->max_cached = USB_POWER_MAX_CACHED(state->ina_count);
 
 	state->integration_us = integration_us;
-	usb_power_init_inas(config);
+	ret = usb_power_init_inas(config);
+
+	if (ret)
+		return USB_POWER_ERROR_INVAL;
 
 	state->state = USB_POWER_STATE_CAPTURING;
 	CPRINTS("[START] STATE: SETUP -> CAPTURING %dus", integration_us);
@@ -205,7 +198,7 @@ static int usb_power_state_settime(struct usb_power_config const *config,
 	else
 		config->state->wall_offset = 0;
 
-	return EC_SUCCESS;
+	return USB_POWER_SUCCESS;
 }
 
 
@@ -214,6 +207,7 @@ static int usb_power_state_addina(struct usb_power_config const *config,
 {
 	struct usb_power_state *state = config->state;
 	struct usb_power_ina_cfg *ina;
+	int i;
 
 	/* Only valid from OFF or SETUP */
 	if ((state->state != USB_POWER_STATE_OFF) &&
@@ -239,12 +233,48 @@ static int usb_power_state_addina(struct usb_power_config const *config,
 		state->ina_count = 0;
 	}
 
+	if ((cmd->addina.type < USBP_INA231_POWER) ||
+	    (cmd->addina.type > USBP_INA231_SHUNTV)) {
+		CPRINTS("[ADDINA] Error INA type 0x%x invalid",
+			(int)(cmd->addina.type));
+		return USB_POWER_ERROR_INVAL;
+	}
+
+	if (cmd->addina.rs == 0) {
+		CPRINTS("[ADDINA] Error INA resistance cannot be zero!");
+		return USB_POWER_ERROR_INVAL;
+	}
+
 	/* Select INA to configure */
 	ina = state->ina_cfg + state->ina_count;
 
 	ina->port = cmd->addina.port;
-	ina->addr = (cmd->addina.addr) << 1;  /* 7 to 8 bit addr. */
+	ina->addr_flags = cmd->addina.addr_flags;
 	ina->rs = cmd->addina.rs;
+	ina->type = cmd->addina.type;
+
+	/*
+	 * INAs can be shared, in that they will have various values
+	 * (and therefore registers) read from them each cycle, including
+	 * power, voltage, current. If only a single value is read,
+	 * we an use i2c_readagain for faster transactions as we don't
+	 * have to respecify the address.
+	 */
+	ina->shared = 0;
+#ifdef USB_POWER_VERBOSE
+	ina->shared = 1;
+#endif
+
+	/* Check if shared with previously configured INAs. */
+	for (i = 0; i < state->ina_count; i++) {
+		struct usb_power_ina_cfg *tmp = state->ina_cfg + i;
+
+		if ((tmp->port == ina->port) &&
+		    (tmp->addr_flags == ina->addr_flags)) {
+			ina->shared = 1;
+			tmp->shared = 1;
+		}
+	}
 
 	state->ina_count += 1;
 	return USB_POWER_SUCCESS;
@@ -312,7 +342,6 @@ static int usb_power_read(struct usb_power_config const *config)
 			if (ret)
 				return EC_SUCCESS;
 
-			CPRINTS("[CAP] busy");
 			result = USB_POWER_ERROR_BUSY;
 		} else {
 			CPRINTS("[STOP] Error not capturing.");
@@ -327,7 +356,6 @@ static int usb_power_read(struct usb_power_config const *config)
 	}
 
 	/* Return result code if applicable. */
-	usb_power_map_error(0);
 	ep->in_databuffer[0] = result;
 
 	usb_write_ep(config->endpoint, in_msgsize, ep->in_databuffer);
@@ -361,44 +389,63 @@ static int usb_power_read(struct usb_power_config const *config)
 #define INA231_MODE_BUS			0x6
 #define INA231_MODE_BOTH		0x7
 
+int reg_type_mapping(enum usb_power_ina_type ina_type)
+{
+	switch (ina_type) {
+	case USBP_INA231_POWER:
+		return INA231_REG_PWR;
+	case USBP_INA231_BUSV:
+		return INA231_REG_BUSV;
+	case USBP_INA231_CURRENT:
+		return INA231_REG_CURR;
+	case USBP_INA231_SHUNTV:
+		return INA231_REG_RSHV;
 
+	default:
+		return INA231_REG_CONF;
+	}
+}
 
-uint16_t ina2xx_readagain(uint8_t port, uint8_t addr)
+uint16_t ina2xx_readagain(uint8_t port, uint16_t slave_addr_flags)
 {
 	int res;
 	uint16_t val;
 
-	res = i2c_xfer(port, addr, NULL, 0, (uint8_t *)&val, sizeof(uint16_t),
-		      I2C_XFER_SINGLE);
+	res = i2c_xfer(port, slave_addr_flags,
+		       NULL, 0, (uint8_t *)&val, sizeof(uint16_t));
+
 	if (res) {
 		CPRINTS("INA2XX I2C readagain failed p:%d a:%02x",
-			(int)port, (int)addr);
+			(int)port, (int)I2C_STRIP_FLAGS(slave_addr_flags));
 		return 0x0bad;
 	}
 	return (val >> 8) | ((val & 0xff) << 8);
 }
 
 
-uint16_t ina2xx_read(uint8_t port, uint8_t addr, uint8_t reg)
+uint16_t ina2xx_read(uint8_t port, uint16_t slave_addr_flags,
+		     uint8_t reg)
 {
 	int res;
 	int val;
 
-	res = i2c_read16(port, addr, reg, &val);
+	res = i2c_read16(port, slave_addr_flags, reg, &val);
 	if (res) {
 		CPRINTS("INA2XX I2C read failed p:%d a:%02x, r:%02x",
-			(int)port, (int)addr, (int)reg);
+			(int)port, (int)I2C_STRIP_FLAGS(slave_addr_flags),
+			(int)reg);
 		return 0x0bad;
 	}
 	return (val >> 8) | ((val & 0xff) << 8);
 }
 
-int ina2xx_write(uint8_t port, uint8_t addr, uint8_t reg, uint16_t val)
+int ina2xx_write(uint8_t port, uint16_t slave_addr_flags,
+		 uint8_t reg, uint16_t val)
 {
 	int res;
 	uint16_t be_val = (val >> 8) | ((val & 0xff) << 8);
 
-	res = i2c_write16(port, addr, reg, be_val);
+	res = i2c_write16(port, slave_addr_flags, reg, be_val);
 	if (res)
 		CPRINTS("INA2XX I2C write failed");
 	return res;
@@ -415,6 +462,7 @@ int ina2xx_write(uint8_t port, uint8_t addr, uint8_t reg, uint16_t val)
  */
 
 /* INA231 integration and averaging time presets, indexed by register value */
+#define NELEMS(x)  (sizeof(x) / sizeof((x)[0]))
 static const int average_settings[] = {
 	1, 4, 16, 64, 128, 256, 512, 1024};
 static const int conversion_time_us[] =	{
@@ -434,14 +482,14 @@ static int usb_power_init_inas(struct usb_power_config const *config)
 	}
 
 	/* Find an INA preset integration time less than specified */
-	while (shunt_time < 7) {
+	while (shunt_time < (NELEMS(conversion_time_us) - 1)) {
 		if (conversion_time_us[shunt_time + 1] > target_us)
 			break;
 		shunt_time++;
 	}
 
 	/* Find an averaging setting from the INA presets that fits. */
-	while (avg < 7) {
+	while (avg < (NELEMS(average_settings) - 1)) {
 		if ((conversion_time_us[shunt_time] *
 		     average_settings[avg + 1])
 		    > target_us)
@@ -461,25 +509,35 @@ static int usb_power_init_inas(struct usb_power_config const *config)
 		{
 		int conf, cal;
 
-		conf = ina2xx_read(ina->port, ina->addr, INA231_REG_CONF);
-		cal = ina2xx_read(ina->port, ina->addr, INA231_REG_CAL);
+		conf = ina2xx_read(ina->port, ina->addr_flags,
+				   INA231_REG_CONF);
+		cal = ina2xx_read(ina->port, ina->addr_flags,
+				  INA231_REG_CAL);
 		CPRINTS("[CAP] %d (%d,0x%02x): conf:%x, cal:%x",
-			i, ina->port, ina->addr, conf, cal);
+			i, ina->port, I2C_STRIP_FLAGS(ina->addr_flags),
+			conf, cal);
 		}
 #endif
 		/*
 		 * Calculate INA231 Calibration register
 		 * CurrentLSB = uA per div = 80mV / (Rsh * 2^15)
-		 * CurrentLSB uA = 80000000nV / (Rsh mOhm * 0x8000)
+		 * CurrentLSB 100x uA = 100x 80000000nV / (Rsh mOhm * 0x8000)
 		 */
-		ina->scale = 80000000 / (ina->rs * 0x8000);
+		/* TODO: allow voltage readings if no sense resistor. */
+		if (ina->rs == 0)
+			return -1;
+
+		ina->scale = (100 * (80000000 / 0x8000)) / ina->rs;
 
 		/*
 		 * CAL = .00512 / (CurrentLSB * Rsh)
 		 * CAL = 5120000 / (uA * mOhm)
 		 */
-		value = 5120000 / (ina->scale * ina->rs);
-		ret = ina2xx_write(ina->port, ina->addr, INA231_REG_CAL, value);
+		if (ina->scale == 0)
+			return -1;
+		value = (5120000 * 100) / (ina->scale * ina->rs);
+		ret = ina2xx_write(ina->port, ina->addr_flags,
+				   INA231_REG_CAL, value);
 		if (ret != EC_SUCCESS) {
 			CPRINTS("[CAP] usb_power_init_inas CAL FAIL: %d", ret);
 			return ret;
@@ -488,9 +546,10 @@ static int usb_power_init_inas(struct usb_power_config const *config)
 		{
 		int actual;
 
-		actual = ina2xx_read(ina->port, ina->addr, INA231_REG_CAL);
+		actual = ina2xx_read(ina->port, ina->addr_flags,
+				     INA231_REG_CAL);
 		CPRINTS("[CAP] scale: %d uA/div, %d uW/div, cal:%x act:%x",
-			ina->scale, ina->scale*25, value, actual);
+			ina->scale / 100, ina->scale*25/100, value, actual);
 		}
 #endif
 		/* Conversion time, shunt + bus, set average. */
@@ -498,8 +557,8 @@ static int usb_power_init_inas(struct usb_power_config const *config)
 			INA231_CONF_SHUNT_TIME(shunt_time) |
 			INA231_CONF_BUS_TIME(shunt_time) |
 			INA231_CONF_AVG(avg);
-		ret = ina2xx_write(
-			ina->port, ina->addr, INA231_REG_CONF, value);
+		ret = ina2xx_write(ina->port, ina->addr_flags,
+				   INA231_REG_CONF, value);
 		if (ret != EC_SUCCESS) {
 			CPRINTS("[CAP] usb_power_init_inas CONF FAIL: %d", ret);
 			return ret;
@@ -508,26 +567,34 @@ static int usb_power_init_inas(struct usb_power_config const *config)
 		{
 		int actual;
 
-		actual = ina2xx_read(ina->port, ina->addr, INA231_REG_CONF);
+		actual = ina2xx_read(ina->port, ina->addr_flags,
+				     INA231_REG_CONF);
 		CPRINTS("[CAP] %d (%d,0x%02x): conf:%x, act:%x",
-			i, ina->port, ina->addr, value, actual);
+			i, ina->port, I2C_STRIP_FLAGS(ina->addr_flags),
+			value, actual);
 		}
 #endif
 #ifdef USB_POWER_VERBOSE
 		{
 		int busv_mv =
-			(ina2xx_read(ina->port, ina->addr, INA231_REG_BUSV)
+			(ina2xx_read(ina->port, ina->addr_flags,
+				     INA231_REG_BUSV)
 			 * 125) / 100;
 
 		CPRINTS("[CAP] %d (%d,0x%02x): busv:%dmv",
-			i, ina->port, ina->addr, busv_mv);
+			i, ina->port, I2C_STRIP_FLAGS(ina->addr_flags),
+			busv_mv);
 		}
 #endif
 		/* Initialize read from power register. This register address
 		 * will be cached and all ina2xx_readagain() calls will read
 		 * from the same address.
 		 */
-		ina2xx_read(ina->port, ina->addr, INA231_REG_PWR);
+		ina2xx_read(ina->port, ina->addr_flags,
+			    reg_type_mapping(ina->type));
+#ifdef USB_POWER_VERBOSE
+		CPRINTS("[CAP] %d (%d,0x%02x): type:%d", (int)(ina->type));
+#endif
 	}
 
 	return EC_SUCCESS;
@@ -573,7 +640,7 @@ static int usb_power_get_samples(struct usb_power_config const *config)
 	r->timestamp = time;
 
 	for (i = 0; i < state->ina_count; i++) {
-		int power;
+		int regval;
 		struct usb_power_ina_cfg *ina = inas + i;
 
 		/* Read INA231.
@@ -581,31 +648,42 @@ static int usb_power_get_samples(struct usb_power_config const *config)
 		 * Readagain cached this address so we'll save an I2C
 		 * transaction.
 		 */
-		power = ina2xx_readagain(ina->port, ina->addr);
-		r->power[i] = power;
+		if (ina->shared)
+			regval = ina2xx_read(ina->port, ina->addr_flags,
+					reg_type_mapping(ina->type));
+		else
+			regval = ina2xx_readagain(ina->port,
+						  ina->addr_flags);
+		r->power[i] = regval;
 #ifdef USB_POWER_VERBOSE
 		{
 		int current;
+		int power;
 		int voltage;
 		int bvoltage;
 
-		voltage = ina2xx_read(ina->port, ina->addr, INA231_REG_RSHV);
-		bvoltage = ina2xx_read(ina->port, ina->addr, INA231_REG_BUSV);
-		current = ina2xx_read(ina->port, ina->addr, INA231_REG_CURR);
-		power = ina2xx_read(ina->port, ina->addr, INA231_REG_PWR);
-		}
+		voltage = ina2xx_read(ina->port, ina->addr_flags,
+				      INA231_REG_RSHV);
+		bvoltage = ina2xx_read(ina->port, ina->addr_flags,
+				       INA231_REG_BUSV);
+		current = ina2xx_read(ina->port, ina->addr_flags,
+				      INA231_REG_CURR);
+		power = ina2xx_read(ina->port, ina->addr_flags,
+				    INA231_REG_PWR);
 		{
 		int uV = ((int)voltage * 25) / 10;
 		int mV = ((int)bvoltage * 125) / 100;
 		int uA = (uV * 1000) / ina->rs;
-		int CuA = ((int)current * ina->scale);
-		int uW = ((int)power * ina->scale*25);
+		int CuA = (((int)current * ina->scale) / 100);
+		int uW = (((int)power * ina->scale*25)/100);
 
 		CPRINTS("[CAP] %d (%d,0x%02x): %dmV / %dmO = %dmA",
-			i, ina->port, ina->addr, uV/1000, ina->rs, uA/1000);
+			i, ina->port, I2C_STRIP_FLAGS(ina->addr_flags),
+			uV/1000, ina->rs, uA/1000);
 		CPRINTS("[CAP] %duV %dmV %duA %dCuA "
 			"%duW v:%04x, b:%04x, p:%04x",
 			uV, mV, uA, CuA, uW, voltage, bvoltage, power);
+		}
 		}
 #endif
 	}

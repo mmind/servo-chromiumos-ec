@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -18,22 +18,23 @@
 /* Optional features */
 #define CONFIG_STM_HWTIMER32
 #define CONFIG_USB_POWER_DELIVERY
+#define CONFIG_USB_PD_TCPMV1
 #define CONFIG_USB_PD_ALT_MODE
-#undef  CONFIG_USB_PD_COMM_ENABLED
-#define CONFIG_USB_PD_CUSTOM_VDM
+#define CONFIG_USB_PD_COMM_DISABLED
+#define CONFIG_USB_PD_CUSTOM_PDO
 #define CONFIG_USB_PD_DUAL_ROLE
 #define CONFIG_USB_PD_DYNAMIC_SRC_CAP
 #define CONFIG_USB_PD_IDENTITY_HW_VERS 1
 #define CONFIG_USB_PD_IDENTITY_SW_VERS 1
 #define CONFIG_USB_PD_INTERNAL_COMP
-#define CONFIG_USB_PD_PORT_COUNT 1
+#define CONFIG_USB_PD_PORT_MAX_COUNT 1
 #define CONFIG_USB_PD_TCPC
 #define CONFIG_USB_PD_TCPM_STUB
 #define CONFIG_USB_PD_VBUS_DETECT_GPIO
 #define CONFIG_ADC
 #define CONFIG_HW_CRC
 #define CONFIG_I2C
-#define CONFIG_I2C_MASTER
+#define CONFIG_I2C_CONTROLLER
 #define CONFIG_INA219
 #define CONFIG_IO_EXPANDER_PCA9534
 #undef CONFIG_WATCHDOG_HELP
@@ -78,9 +79,6 @@ enum board_src_cap {
 /* 3.0A Rp */
 #define PD_SRC_VNC            PD_SRC_3_0_VNC_MV
 #define PD_SNK_RD_THRESHOLD   PD_SRC_3_0_RD_THRESH_MV
-
-/* we are acting only as a sink */
-#define PD_DEFAULT_STATE PD_STATE_SNK_DISCONNECTED
 
 /* delay necessary for the voltage transition on the power supply */
 #define PD_POWER_SUPPLY_TURN_ON_DELAY  50000 /* us */

@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/env python
 # Copyright 2015 The Chromium OS Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
@@ -10,24 +10,31 @@ handles the presentation of the EC console including editing methods as well as
 session-persistent command history.
 """
 
+# Note: This is a py2/3 compatible file.
+
 from __future__ import print_function
 
 import argparse
 import binascii
+import ctypes
+from datetime import datetime
 # pylint: disable=cros-logging-import
 import logging
-import multiprocessing
 import os
 import pty
 import re
 import select
 import stat
 import sys
+import traceback
+
+import six
 
 import interpreter
+import threadproc_shim
 
 
-PROMPT = '> '
+PROMPT = b'> '
 CONSOLE_INPUT_LINE_SIZE = 80  # Taken from the CONFIG_* with the same name.
 CONSOLE_MAX_READ = 100  # Max bytes to read at a time from the user.
 LOOK_BUFFER_SIZE = 256  # Size of search window when looking for the enhanced EC
@@ -37,9 +44,9 @@ LOOK_BUFFER_SIZE = 256  # Size of search window when looking for the enhanced EC
 # enabled.  Enhanced images will print a slightly different string.  These
 # regular expressions are used to determine at reboot whether the EC image is
 # enhanced or not.
-ENHANCED_IMAGE_RE = re.compile(r'Enhanced Console is enabled '
-                               r'\(v([0-9]+\.[0-9]+\.[0-9]+)\)')
-NON_ENHANCED_IMAGE_RE = re.compile(r'Console is enabled; ')
+ENHANCED_IMAGE_RE = re.compile(br'Enhanced Console is enabled '
+                               br'\(v([0-9]+\.[0-9]+\.[0-9]+)\)')
+NON_ENHANCED_IMAGE_RE = re.compile(br'Console is enabled; ')
 
 # The timeouts are really only useful for enhanced EC images, but otherwise just
 # serve as a delay for non-enhanced EC images.  Therefore, we can keep this
@@ -54,9 +61,10 @@ NON_ENHANCED_EC_INTERROGATION_TIMEOUT = 0.3  # Maximum number of seconds to wait
 ENHANCED_EC_INTERROGATION_TIMEOUT = 1.0  # Maximum number of seconds to wait for
                                          # a response to an interrogation of an
                                          # enhanced EC image.
-INTERROGATION_MODES = ['never', 'always', 'auto']  # List of modes which control
-                                                   # when interrogations are
-                                                   # performed with the EC.
+# List of modes which control when interrogations are performed with the EC.
+INTERROGATION_MODES = [b'never', b'always', b'auto']
+# Format for printing host timestamp
+HOST_STRFTIME="%y-%m-%d %H:%M:%S.%f"
 
 
 class EscState(object):
@@ -94,14 +102,15 @@ class Console(object):
     master_pty: File descriptor to the master side of the PTY.  Used for driving
       output to the user and receiving user input.
     user_pty: A string representing the PTY name of the served console.
-    cmd_pipe: A multiprocessing.Connection object which represents the console
-      side of the command pipe.  This must be a bidirectional pipe.  Console
-      commands and responses utilize this pipe.
-    dbg_pipe: A multiprocessing.Connection object which represents the console's
-      read-only side of the debug pipe.  This must be a unidirectional pipe
-      attached to the intepreter.  EC debug messages use this pipe.
-    oobm_queue: A multiprocessing.Queue which is used for out of band management
-      for the interactive console.
+    cmd_pipe: A socket.socket or multiprocessing.Connection object which
+      represents the console side of the command pipe.  This must be a
+      bidirectional pipe.  Console commands and responses utilize this pipe.
+    dbg_pipe: A socket.socket or multiprocessing.Connection object which
+      represents the console's read-only side of the debug pipe.  This must be a
+      unidirectional pipe attached to the intepreter.  EC debug messages use
+      this pipe.
+    oobm_queue: A queue.Queue or multiprocessing.Queue which is used for out of
+      band management for the interactive console.
     input_buffer: A string representing the current input command.
     input_buffer_pos: An integer representing the current position in the buffer
       to insert a char.
@@ -126,32 +135,43 @@ class Console(object):
     pending_oobm_cmd: A string containing the pending OOBM command.
     interrogation_mode: A string containing the current mode of whether
       interrogations are performed with the EC or not and how often.
+    raw_debug: Flag to indicate whether per interrupt data should be logged to
+      debug
+    output_line_log_buffer: buffer for lines coming from the EC to log to debug
   """
 
-  def __init__(self, master_pty, user_pty, cmd_pipe, dbg_pipe):
+  def __init__(self, master_pty, user_pty, interface_pty, cmd_pipe, dbg_pipe,
+               name=None):
     """Initalises a Console object with the provided arguments.
 
     Args:
     master_pty: File descriptor to the master side of the PTY.  Used for driving
       output to the user and receiving user input.
     user_pty: A string representing the PTY name of the served console.
-    cmd_pipe: A multiprocessing.Connection object which represents the console
-      side of the command pipe.  This must be a bidirectional pipe.  Console
-      commands and responses utilize this pipe.
-    dbg_pipe: A multiprocessing.Connection object which represents the console's
-      read-only side of the debug pipe.  This must be a unidirectional pipe
-      attached to the intepreter.  EC debug messages use this pipe.
+    interface_pty: A string representing the PTY name of the served command
+      interface.
+    cmd_pipe: A socket.socket or multiprocessing.Connection object which
+      represents the console side of the command pipe.  This must be a
+      bidirectional pipe.  Console commands and responses utilize this pipe.
+    dbg_pipe: A socket.socket or multiprocessing.Connection object which
+      represents the console's read-only side of the debug pipe.  This must be a
+      unidirectional pipe attached to the intepreter.  EC debug messages use
+      this pipe.
+    name: the console source name
     """
-    logger = logging.getLogger('EC3PO.Console')
+    # Create a unique logger based on the console name
+    console_prefix = ('%s - ' % name) if name else ''
+    logger = logging.getLogger('%sEC3PO.Console' % console_prefix)
     self.logger = interpreter.LoggerAdapter(logger, {'pty': user_pty})
     self.master_pty = master_pty
     self.user_pty = user_pty
+    self.interface_pty = interface_pty
     self.cmd_pipe = cmd_pipe
     self.dbg_pipe = dbg_pipe
-    self.oobm_queue = multiprocessing.Queue()
-    self.input_buffer = ''
+    self.oobm_queue = threadproc_shim.Queue()
+    self.input_buffer = b''
     self.input_buffer_pos = 0
-    self.partial_cmd = ''
+    self.partial_cmd = b''
     self.esc_state = 0
     self.line_limit = CONSOLE_INPUT_LINE_SIZE
     self.history = []
@@ -160,15 +180,19 @@ class Console(object):
     self.enhanced_ec = False
     self.interrogation_timeout = NON_ENHANCED_EC_INTERROGATION_TIMEOUT
     self.receiving_oobm_cmd = False
-    self.pending_oobm_cmd = ''
-    self.interrogation_mode = 'auto'
-    self.look_buffer = ''
+    self.pending_oobm_cmd = b''
+    self.interrogation_mode = b'auto'
+    self.timestamp_enabled = True
+    self.look_buffer = b''
+    self.raw_debug = False
+    self.output_line_log_buffer = []
 
   def __str__(self):
     """Show internal state of Console object as a string."""
     string = []
     string.append('master_pty: %s' % self.master_pty)
     string.append('user_pty: %s' % self.user_pty)
+    string.append('interface_pty: %s' % self.interface_pty)
     string.append('cmd_pipe: %s' % self.cmd_pipe)
     string.append('dbg_pipe: %s' % self.dbg_pipe)
     string.append('oobm_queue: %s' % self.oobm_queue)
@@ -176,7 +200,7 @@ class Console(object):
     string.append('input_buffer_pos: %d' % self.input_buffer_pos)
     string.append('esc_state: %d' % self.esc_state)
     string.append('line_limit: %d' % self.line_limit)
-    string.append('history: [\'' + '\', \''.join(self.history) + '\']')
+    string.append('history: [\'' + '%s' % repr(self.history) + '\']')
     string.append('history_pos: %d' % self.history_pos)
     string.append('prompt: \'%s\'' % self.prompt)
     string.append('partial_cmd: \'%s\''% self.partial_cmd)
@@ -184,13 +208,55 @@ class Console(object):
     string.append('look_buffer: \'%s\'' % self.look_buffer)
     return '\n'.join(string)
 
+  def LogConsoleOutput(self, data):
+    """Log to debug user MCU output to master_pty when line is filled.
+
+    The logging also suppresses the Cr50 spinner lines by removing characters
+    when it sees backspaces.
+
+    Args:
+      data: binary string received from MCU
+    """
+    data = list(data)
+
+    # This is a list of already filtered characters (or placeholders).
+    line = self.output_line_log_buffer
+
+    symbols = {
+            b'\n': u'\\n',
+            b'\r': u'\\r',
+            b'\t': u'\\t'
+    }
+    # self.logger.debug(u'%s + %r', u''.join(line), ''.join(data))
+    while data:
+      byte = data.pop(0)
+      if byte == '\n':
+        line.append(symbols[byte])
+        if line:
+          self.logger.debug(u'%s', ''.join(line))
+        line = []
+      elif byte == b'\b':
+        # Backspace: trim the last character off the buffer
+        if line:
+          line.pop(-1)
+      elif byte in symbols:
+        line.append(symbols[byte])
+      elif byte < b' ' or byte > b'~':
+        # Turn any character that isn't printable ASCII into escaped hex.
+        # ' ' is chr(20), and 0-19 are unprintable control characters.
+        # '~' is chr(126), and 127 is DELETE.  128-255 are control and Latin-1.
+        line.append(u'\\x%02x' % ord(byte))
+      else:
+        line.append(u'%s' % byte)
+    self.output_line_log_buffer = line
+
   def PrintHistory(self):
     """Print the history of entered commands."""
     fd = self.master_pty
     # Make it pretty by figuring out how wide to pad the numbers.
-    wide = (len(self.history) / 10) + 1
+    wide = (len(self.history) // 10) + 1
     for i in range(len(self.history)):
-      line = ' %*d %s\r\n' % (wide, i, self.history[i])
+      line = b' %*d %s\r\n' % (wide, i, self.history[i])
       os.write(fd, line)
 
   def ShowPreviousCommand(self):
@@ -254,7 +320,7 @@ class Console(object):
       self.input_buffer = self.partial_cmd
       self.input_buffer_pos = len(self.input_buffer)
       # Now that we've printed it, clear the partial cmd storage.
-      self.partial_cmd = ''
+      self.partial_cmd = b''
       # Reset history position.
       self.history_pos = len(self.history)
       return
@@ -289,7 +355,7 @@ class Console(object):
     # Write the rest of the line
     moved_col = os.write(fd, self.input_buffer[self.input_buffer_pos:])
     # Write a space to clear out the last char
-    moved_col += os.write(fd, ' ')
+    moved_col += os.write(fd, b' ')
     # Update the input buffer position.
     self.input_buffer_pos += moved_col
     # Reset the cursor
@@ -413,7 +479,7 @@ class Console(object):
       self.history.append(self.input_buffer)
 
     # Split the command up by spaces.
-    line = self.input_buffer.split(' ')
+    line = self.input_buffer.split(b' ')
     self.logger.debug('cmd: %s', self.input_buffer)
     cmd = line[0].lower()
 
@@ -435,6 +501,9 @@ class Console(object):
     Returns:
       is_enhanced: A boolean indicating whether the EC responded to the
         interrogation correctly.
+
+    Raises:
+      EOFError: Allowed to propagate through from self.dbg_pipe.recv().
     """
     # Send interrogation byte and wait for the response.
     self.logger.debug('Performing interrogation.')
@@ -468,6 +537,10 @@ class Console(object):
 
     Args:
       byte: An integer representing the character received from the user.
+
+    Raises:
+      EOFError: Allowed to propagate through from self.CheckForEnhancedECImage()
+          i.e. from self.dbg_pipe.recv().
     """
     fd = self.master_pty
 
@@ -476,14 +549,15 @@ class Console(object):
       self.logger.debug('Begin OOBM command.')
       self.receiving_oobm_cmd = True
       # Print a "prompt".
-      os.write(self.master_pty, '\r\n% ')
+      os.write(self.master_pty, b'\r\n% ')
       return
 
     # Add chars to the pending OOBM command if we're currently receiving one.
     if self.receiving_oobm_cmd and byte != ControlKey.CARRIAGE_RETURN:
-      self.pending_oobm_cmd += chr(byte)
-      self.logger.debug('%s', chr(byte))
-      os.write(self.master_pty, chr(byte))
+      tmp_bytes = six.int2byte(byte)
+      self.pending_oobm_cmd += tmp_bytes
+      self.logger.debug('%s', tmp_bytes)
+      os.write(self.master_pty, tmp_bytes)
       return
 
     if byte == ControlKey.CARRIAGE_RETURN:
@@ -496,28 +570,28 @@ class Console(object):
                             self.pending_oobm_cmd)
 
         # Reset the state.
-        os.write(self.master_pty, '\r\n' + self.prompt)
-        self.input_buffer = ''
+        os.write(self.master_pty, b'\r\n' + self.prompt)
+        self.input_buffer = b''
         self.input_buffer_pos = 0
         self.receiving_oobm_cmd = False
-        self.pending_oobm_cmd = ''
+        self.pending_oobm_cmd = b''
         return
 
-      if self.interrogation_mode == 'never':
+      if self.interrogation_mode == b'never':
         self.logger.debug('Skipping interrogation because interrogation mode'
                           ' is set to never.')
-      elif self.interrogation_mode == 'always':
+      elif self.interrogation_mode == b'always':
         # Only interrogate the EC if the interrogation mode is set to 'always'.
         self.enhanced_ec = self.CheckForEnhancedECImage()
         self.logger.debug('Enhanced EC image? %r', self.enhanced_ec)
 
     if not self.enhanced_ec:
       # Send everything straight to the EC to handle.
-      self.cmd_pipe.send(chr(byte))
+      self.cmd_pipe.send(six.int2byte(byte))
       # Reset the input buffer.
-      self.input_buffer = ''
+      self.input_buffer = b''
       self.input_buffer_pos = 0
-      self.logger.debug('Reset input buffer.')
+      self.logger.log(1, 'Reset input buffer.')
       return
 
     # Keep handling the ESC sequence if we're in the middle of it.
@@ -542,7 +616,7 @@ class Console(object):
     if byte == ControlKey.CARRIAGE_RETURN:
       self.logger.debug('Enter key pressed.')
       # Put a carriage return/newline and the print the prompt.
-      os.write(fd, '\r\n')
+      os.write(fd, b'\r\n')
 
       # TODO(aaboagye): When we control the printing of all output, print the
       # prompt AFTER printing all the output.  We can't do it yet because we
@@ -553,12 +627,12 @@ class Console(object):
       # Process the input.
       self.ProcessInput()
       # Now, clear the buffer.
-      self.input_buffer = ''
+      self.input_buffer = b''
       self.input_buffer_pos = 0
       # Reset history buffer pos.
       self.history_pos = len(self.history)
       # Clear partial command.
-      self.partial_cmd = ''
+      self.partial_cmd = b''
 
     # Backspace
     elif byte == ControlKey.BACKSPACE:
@@ -626,14 +700,14 @@ class Console(object):
         self.logger.debug('Dropped char: %c(%d)', byte, byte)
         return
       # Print the character.
-      os.write(fd, chr(byte))
+      os.write(fd, six.int2byte(byte))
       # Print the rest of the line (if any).
       extra_bytes_written = os.write(fd,
                                      self.input_buffer[self.input_buffer_pos:])
 
       # Recreate the input buffer.
       self.input_buffer = (self.input_buffer[0:self.input_buffer_pos] +
-                           ('%c' % byte) +
+                           six.int2byte(byte) +
                            self.input_buffer[self.input_buffer_pos:])
       # Update the input buffer position.
       self.input_buffer_pos += 1 + extra_bytes_written
@@ -660,12 +734,12 @@ class Console(object):
     if not count:
       return
     fd = self.master_pty
-    seq = '\033[' + str(count)
+    seq = b'\033[' + str(count).encode('ascii')
     if direction == 'left':
       # Bind the movement.
       if count > self.input_buffer_pos:
         count = self.input_buffer_pos
-      seq += 'D'
+      seq += b'D'
       self.logger.debug('move cursor left %d', count)
       self.input_buffer_pos -= count
 
@@ -673,7 +747,7 @@ class Console(object):
       # Bind the movement.
       if (count + self.input_buffer_pos) > len(self.input_buffer):
         count = 0
-      seq += 'C'
+      seq += b'C'
       self.logger.debug('move cursor right %d', count)
       self.input_buffer_pos += count
 
@@ -707,15 +781,15 @@ class Console(object):
 
   def SendBackspace(self):
     """Backspace a character on the console."""
-    os.write(self.master_pty, '\033[1D \033[1D')
+    os.write(self.master_pty, b'\033[1D \033[1D')
 
   def ProcessOOBMQueue(self):
     """Retrieve an item from the OOBM queue and process it."""
     item = self.oobm_queue.get()
     self.logger.debug('OOBM cmd: %s', item)
-    cmd = item.split(' ')
+    cmd = item.split(b' ')
 
-    if cmd[0] == 'loglevel':
+    if cmd[0] == b'loglevel':
       # An integer is required in order to set the log level.
       if len(cmd) < 2:
         self.logger.debug('Insufficient args')
@@ -733,10 +807,22 @@ class Console(object):
         # Ignoring the request if an integer was not provided.
         self.PrintOOBMHelp()
 
-    elif cmd[0] == 'interrogate' and len(cmd) >= 2:
+    elif cmd[0] == b'timestamp':
+      mode = cmd[1].lower()
+      self.timestamp_enabled = mode == 'on'
+      self.logger.info('%sabling uart timestamps.',
+                       'En' if self.timestamp_enabled else 'Dis')
+
+    elif cmd[0] == b'rawdebug':
+      mode = cmd[1].lower()
+      self.raw_debug = mode == 'on'
+      self.logger.info('%sabling per interrupt debug logs.',
+                       'En' if self.raw_debug else 'Dis')
+
+    elif cmd[0] == b'interrogate' and len(cmd) >= 2:
       enhanced = False
       mode = cmd[1]
-      if len(cmd) >= 3 and cmd[2] == 'enhanced':
+      if len(cmd) >= 3 and cmd[2] == b'enhanced':
         enhanced = True
 
       # Set the mode if correct.
@@ -749,7 +835,7 @@ class Console(object):
         self.logger.debug('Enhanced EC image is now %r', self.enhanced_ec)
 
         # Send command to interpreter as well.
-        self.cmd_pipe.send('enhanced ' + str(self.enhanced_ec))
+        self.cmd_pipe.send(b'enhanced ' + str(self.enhanced_ec).encode('ascii'))
       else:
         self.PrintOOBMHelp()
 
@@ -759,10 +845,10 @@ class Console(object):
   def PrintOOBMHelp(self):
     """Prints out the OOBM help."""
     # Print help syntax.
-    os.write(self.master_pty, '\r\n' + 'Known OOBM commands:\r\n')
-    os.write(self.master_pty, '  interrogate <never | always | auto> '
-             '[enhanced]\r\n')
-    os.write(self.master_pty, '  loglevel <int>\r\n')
+    os.write(self.master_pty, b'\r\n' + b'Known OOBM commands:\r\n')
+    os.write(self.master_pty, b'  interrogate <never | always | auto> '
+             b'[enhanced]\r\n')
+    os.write(self.master_pty, b'  loglevel <int>\r\n')
 
   def CheckBufferForEnhancedImage(self, data):
     """Adds data to a look buffer and checks to see for enhanced EC image.
@@ -790,14 +876,26 @@ class Console(object):
         self.enhanced_ec = False
 
       # Inform the interpreter of the result.
-      self.cmd_pipe.send('enhanced ' + str(self.enhanced_ec))
+      self.cmd_pipe.send(b'enhanced ' + str(self.enhanced_ec).encode('ascii'))
       self.logger.debug('Enhanced EC image? %r', self.enhanced_ec)
 
       # Clear look buffer since a match was found.
-      self.look_buffer = ''
+      self.look_buffer = b''
 
     # Move the sliding window.
     self.look_buffer = self.look_buffer[-LOOK_BUFFER_SIZE:]
+
+
+def CanonicalizeTimeString(timestr):
+  """Canonicalize the timestamp string.
+
+  Args:
+    timestr: A timestamp string ended with 6 digits msec.
+
+  Returns:
+    A string with 3 digits msec and an extra space.
+  """
+  return timestr[:-3].encode('ascii') + b' '
 
 
 def IsPrintable(byte):
@@ -812,57 +910,178 @@ def IsPrintable(byte):
   return byte >= ord(' ') and byte <= ord('~')
 
 
-def StartLoop(console):
+def StartLoop(console, command_active, shutdown_pipe=None):
   """Starts the infinite loop of console processing.
 
   Args:
     console: A Console object that has been properly initialzed.
+    command_active: ctypes data object or multiprocessing.Value indicating if
+      servod owns the console, or user owns the console. This prevents input
+      collisions.
+    shutdown_pipe: A file object for a pipe or equivalent that becomes readable
+      (not blocked) to indicate that the loop should exit.  Can be None to never
+      exit the loop.
   """
-  console.logger.info('EC Console is being served on %s.', console.user_pty)
-  console.logger.debug(console)
   try:
-    while True:
+    console.logger.debug('Console is being served on %s.', console.user_pty)
+    console.logger.debug('Console master is on %s.', console.master_pty)
+    console.logger.debug('Command interface is being served on %s.',
+        console.interface_pty)
+    console.logger.debug(console)
+
+    # This checks for HUP to indicate if the user has connected to the pty.
+    ep = select.epoll()
+    ep.register(console.master_pty, select.EPOLLHUP)
+
+    # This is used instead of "break" to avoid exiting the loop in the middle of
+    # an iteration.
+    continue_looping = True
+
+    # Used for determining when to print host timestamps
+    tm_req = True
+
+    while continue_looping:
+      # Check to see if pts is connected to anything
+      events = ep.poll(0)
+      master_connected = not events
+
       # Check to see if pipes or the console are ready for reading.
-      read_list = [console.master_pty, console.cmd_pipe, console.dbg_pipe]
-      ready_for_reading = select.select(read_list, [], [])[0]
+      read_list = [console.interface_pty,
+                   console.cmd_pipe, console.dbg_pipe]
+      if master_connected:
+        read_list.append(console.master_pty)
+      if shutdown_pipe is not None:
+        read_list.append(shutdown_pipe)
+
+      # Check if any input is ready, or wait for .1 sec and re-poll if
+      # a user has connected to the pts.
+      select_output = select.select(read_list, [], [], .1)
+      if not select_output:
+        continue
+      ready_for_reading = select_output[0]
 
       for obj in ready_for_reading:
         if obj is console.master_pty:
-          console.logger.debug('Input from user')
-          # Convert to bytes so we can look for non-printable chars such as
-          # Ctrl+A, Ctrl+E, etc.
-          line = bytearray(os.read(console.master_pty, CONSOLE_MAX_READ))
-          for i in line:
-            # Handle each character as it arrives.
-            console.HandleChar(i)
+          if not command_active.value:
+            # Convert to bytes so we can look for non-printable chars such as
+            # Ctrl+A, Ctrl+E, etc.
+            try:
+              line = bytearray(os.read(console.master_pty, CONSOLE_MAX_READ))
+              console.logger.debug('Input from user: %s, locked:%s',
+                  str(line).strip(), command_active.value)
+              for i in line:
+                try:
+                  # Handle each character as it arrives.
+                  console.HandleChar(i)
+                except EOFError:
+                  console.logger.debug(
+                      'ec3po console received EOF from dbg_pipe in HandleChar()'
+                      ' while reading console.master_pty')
+                  continue_looping = False
+                  break
+            except OSError:
+              console.logger.debug('Ptm read failed, probably user disconnect.')
+
+        elif obj is console.interface_pty:
+          if command_active.value:
+            # Convert to bytes so we can look for non-printable chars such as
+            # Ctrl+A, Ctrl+E, etc.
+            line = bytearray(os.read(console.interface_pty, CONSOLE_MAX_READ))
+            console.logger.debug('Input from interface: %s, locked:%s',
+                str(line).strip(), command_active.value)
+            for i in line:
+              try:
+                # Handle each character as it arrives.
+                console.HandleChar(i)
+              except EOFError:
+                console.logger.debug(
+                    'ec3po console received EOF from dbg_pipe in HandleChar()'
+                    ' while reading console.interface_pty')
+                continue_looping = False
+                break
 
         elif obj is console.cmd_pipe:
-          data = console.cmd_pipe.recv()
-          # Write it to the user console.
-          console.logger.debug('|CMD|->\'%s\'', data)
-          os.write(console.master_pty, data)
+          try:
+            data = console.cmd_pipe.recv()
+          except EOFError:
+            console.logger.debug('ec3po console received EOF from cmd_pipe')
+            continue_looping = False
+          else:
+            # Write it to the user console.
+            if console.raw_debug:
+              console.logger.debug('|CMD|-%s->\'%s\'',
+                                   ('u' if master_connected else '') +
+                                   ('i' if command_active.value else ''),
+                                   data.strip())
+            if master_connected:
+              os.write(console.master_pty, data)
+            if command_active.value:
+              os.write(console.interface_pty, data)
 
         elif obj is console.dbg_pipe:
-          data = console.dbg_pipe.recv()
-          if console.interrogation_mode == 'auto':
-            # Search look buffer for enhanced EC image string.
-            console.CheckBufferForEnhancedImage(data)
-          # Write it to the user console.
-          console.logger.debug('|DBG|->\'%s\'', data)
-          os.write(console.master_pty, data)
+          try:
+            data = console.dbg_pipe.recv()
+          except EOFError:
+            console.logger.debug('ec3po console received EOF from dbg_pipe')
+            continue_looping = False
+          else:
+            if console.interrogation_mode == b'auto':
+              # Search look buffer for enhanced EC image string.
+              console.CheckBufferForEnhancedImage(data)
+            # Write it to the user console.
+            if len(data) > 1 and console.raw_debug:
+              console.logger.debug('|DBG|-%s->\'%s\'',
+                                   ('u' if master_connected else '') +
+                                   ('i' if command_active.value else ''),
+                                   data.strip())
+            console.LogConsoleOutput(data)
+            if master_connected:
+              end = len(data) - 1
+              if console.timestamp_enabled:
+                # A timestamp is required at the beginning of this line
+                if tm_req is True:
+                  now = datetime.now()
+                  tm = CanonicalizeTimeString(now.strftime(HOST_STRFTIME))
+                  os.write(console.master_pty, tm)
+                  tm_req = False
+
+                # Insert timestamps into the middle where appropriate
+                # except if the last character is a newline
+                nls_found = data.count(b'\n', 0, end)
+                now = datetime.now()
+                tm = CanonicalizeTimeString(now.strftime('\n' + HOST_STRFTIME))
+                data_tm = data.replace(b'\n', tm, nls_found)
+              else:
+                data_tm = data
+
+              # timestamp required on next input
+              if data[end] == b'\n':
+                tm_req = True
+              os.write(console.master_pty, data_tm)
+            if command_active.value:
+              os.write(console.interface_pty, data)
+
+        elif obj is shutdown_pipe:
+          console.logger.debug(
+              'ec3po console received shutdown pipe unblocked notification')
+          continue_looping = False
 
       while not console.oobm_queue.empty():
         console.logger.debug('OOBM queue ready for reading.')
         console.ProcessOOBMQueue()
 
+  except KeyboardInterrupt:
+    pass
+
   finally:
-    # Close pipes.
+    ep.unregister(console.master_pty)
     console.dbg_pipe.close()
     console.cmd_pipe.close()
-    # Close file descriptor.
     os.close(console.master_pty)
-    # Exit.
-    sys.exit(0)
+    os.close(console.interface_pty)
+    if shutdown_pipe is not None:
+      shutdown_pipe.close()
+    console.logger.debug('Exit ec3po console loop for %s', console.user_pty)
 
 
 def main(argv):
@@ -910,17 +1129,17 @@ def main(argv):
 
   # Create some pipes to communicate between the interpreter and the console.
   # The command pipe is bidirectional.
-  cmd_pipe_interactive, cmd_pipe_interp = multiprocessing.Pipe()
+  cmd_pipe_interactive, cmd_pipe_interp = threadproc_shim.Pipe()
   # The debug pipe is unidirectional from interpreter to console only.
-  dbg_pipe_interactive, dbg_pipe_interp = multiprocessing.Pipe(duplex=False)
+  dbg_pipe_interactive, dbg_pipe_interp = threadproc_shim.Pipe(duplex=False)
 
   # Create an interpreter instance.
   itpr = interpreter.Interpreter(opts.ec_uart_pty, cmd_pipe_interp,
                                  dbg_pipe_interp, log_level)
 
   # Spawn an interpreter process.
-  itpr_process = multiprocessing.Process(target=interpreter.StartLoop,
-                                         args=(itpr,))
+  itpr_process = threadproc_shim.ThreadOrProcess(
+      target=interpreter.StartLoop, args=(itpr,))
   # Make sure to kill the interpreter when we terminate.
   itpr_process.daemon = True
   # Start the interpreter.
@@ -935,7 +1154,8 @@ def main(argv):
   console = Console(master_pty, os.ttyname(user_pty), cmd_pipe_interactive,
                     dbg_pipe_interactive)
   # Start serving the console.
-  StartLoop(console)
+  v = threadproc_shim.Value(ctypes.c_bool, False)
+  StartLoop(console, v)
 
 
 if __name__ == '__main__':

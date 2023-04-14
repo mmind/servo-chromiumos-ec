@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -8,6 +8,7 @@
 #include "ap_hang_detect.h"
 #include "common.h"
 #include "console.h"
+#include "ec_commands.h"
 #include "host_command.h"
 #include "link_defs.h"
 #include "lpc.h"
@@ -19,19 +20,20 @@
 
 /* Console output macros */
 #define CPUTS(outstr) cputs(CC_HOSTCMD, outstr)
+#define CPRINTF(format, args...) cprintf(CC_HOSTCMD, format, ## args)
 #define CPRINTS(format, args...) cprints(CC_HOSTCMD, format, ## args)
 
-#define TASK_EVENT_CMD_PENDING TASK_EVENT_CUSTOM(1)
+#define TASK_EVENT_CMD_PENDING TASK_EVENT_CUSTOM_BIT(0)
 
 /* Maximum delay to skip printing repeated host command debug output */
 #define HCDEBUG_MAX_REPEAT_DELAY (50 * MSEC)
 
+/* Stop printing repeated host commands "+" after this count */
+#define HCDEBUG_MAX_REPEAT_COUNT 5
+
 static struct host_cmd_handler_args *pending_args;
 
-/* Verify Boot Mode */
-static int g_vboot_mode;
-
-#ifndef CONFIG_LPC
+#ifndef CONFIG_HOSTCMD_X86
 /*
  * Simulated memory map.  Must be word-aligned, because some of the elements
  * in the memory map are words.
@@ -74,18 +76,23 @@ static struct host_cmd_handler_args args0;
 /* Current host command packet from host, for protocol version 3+ */
 static struct host_packet *pkt0;
 
+/*
+ * Host command suppress
+ */
+#ifdef CONFIG_SUPPRESSED_HOST_COMMANDS
+#define SUPPRESSED_CMD_INTERVAL (60UL * 60 * SECOND)
+static timestamp_t suppressed_cmd_deadline;
+static const uint16_t hc_suppressed_cmd[] = { CONFIG_SUPPRESSED_HOST_COMMANDS };
+static uint32_t hc_suppressed_cnt[ARRAY_SIZE(hc_suppressed_cmd)];
+#endif
+
 uint8_t *host_get_memmap(int offset)
 {
-#ifdef CONFIG_LPC
+#ifdef CONFIG_HOSTCMD_X86
 	return lpc_get_memmap_range() + offset;
 #else
 	return host_memmap + offset;
 #endif
-}
-
-int host_get_vboot_mode(void)
-{
-	return g_vboot_mode;
 }
 
 test_mockable void host_send_response(struct host_cmd_handler_args *args)
@@ -172,13 +179,13 @@ void host_command_received(struct host_cmd_handler_args *args)
 		pending_args = args;
 
 		/* Wake up the task to handle the command */
-		task_set_event(TASK_ID_HOSTCMD, TASK_EVENT_CMD_PENDING, 0);
+		task_set_event(TASK_ID_HOSTCMD, TASK_EVENT_CMD_PENDING);
 		return;
 	}
 
 	/*
 	 * TODO (crosbug.com/p/29315): This is typically running in interrupt
-	 * context, so it woud be better not to send the response here, and to
+	 * context, so it would be better not to send the response here, and to
 	 * let the host command task send the response.
 	 */
 	/* Send the response now */
@@ -348,7 +355,7 @@ void host_packet_receive(struct host_packet *pkt)
 host_packet_bad:
 	/*
 	 * TODO (crosbug.com/p/29315): This is typically running in interrupt
-	 * context, so it woud be better not to send the response here, and to
+	 * context, so it would be better not to send the response here, and to
 	 * let the host command task send the response.
 	 */
 	/* Improperly formed packet from host, so send an error response */
@@ -363,14 +370,41 @@ host_packet_bad:
  */
 static const struct host_command *find_host_command(int command)
 {
-	const struct host_command *cmd;
+	if (IS_ENABLED(CONFIG_ZEPHYR)) {
+		/* TODO(b/172678200): shim host commands for Zephyr */
+		return NULL;
+	} else if (IS_ENABLED(CONFIG_HOSTCMD_SECTION_SORTED)) {
+		const struct host_command *l, *r, *m;
+		uint32_t num;
 
-	for (cmd = __hcmds; cmd < __hcmds_end; cmd++) {
-		if (command == cmd->command)
-			return cmd;
+		/* Use binary search to locate host command handler */
+		l = __hcmds;
+		r = __hcmds_end - 1;
+
+		while (1) {
+			if (l > r)
+				return NULL;
+
+			num = r - l;
+			m = l + (num / 2);
+
+			if (m->command < command)
+				l = m + 1;
+			else if (m->command > command)
+				r = m - 1;
+			else
+				return m;
+		}
+	} else {
+		const struct host_command *cmd;
+
+		for (cmd = __hcmds; cmd < __hcmds_end; cmd++) {
+			if (command == cmd->command)
+				return cmd;
+		}
+
+		return NULL;
 	}
-
-	return NULL;
 }
 
 static void host_command_init(void)
@@ -383,11 +417,15 @@ static void host_command_init(void)
 
 #ifdef CONFIG_HOSTCMD_EVENTS
 	host_set_single_event(EC_HOST_EVENT_INTERFACE_READY);
-	CPRINTS("hostcmd init 0x%x", host_get_events());
+	HOST_EVENT_CPRINTS("hostcmd init", host_get_events());
+#endif
+
+#ifdef CONFIG_SUPPRESSED_HOST_COMMANDS
+	suppressed_cmd_deadline.val = get_time().val + SUPPRESSED_CMD_INTERVAL;
 #endif
 }
 
-void host_command_task(void)
+void host_command_task(void *u)
 {
 	timestamp_t t0, t1, t_recess;
 	t_recess.val = 0;
@@ -426,7 +464,8 @@ void host_command_task(void)
 /* Host commands */
 
 /* TODO(crosbug.com/p/11223): Remove this once the kernel no longer cares */
-static int host_command_proto_version(struct host_cmd_handler_args *args)
+static enum ec_status
+host_command_proto_version(struct host_cmd_handler_args *args)
 {
 	struct ec_response_proto_version *r = args->response;
 
@@ -439,7 +478,7 @@ DECLARE_HOST_COMMAND(EC_CMD_PROTO_VERSION,
 		     host_command_proto_version,
 		     EC_VER_MASK(0));
 
-static int host_command_hello(struct host_cmd_handler_args *args)
+static enum ec_status host_command_hello(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_hello *p = args->params;
 	struct ec_response_hello *r = args->response;
@@ -454,7 +493,7 @@ DECLARE_HOST_COMMAND(EC_CMD_HELLO,
 		     host_command_hello,
 		     EC_VER_MASK(0));
 
-static int host_command_read_test(struct host_cmd_handler_args *args)
+static enum ec_status host_command_read_test(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_read_test *p = args->params;
 	struct ec_response_read_test *r = args->response;
@@ -463,13 +502,13 @@ static int host_command_read_test(struct host_cmd_handler_args *args)
 	int size = p->size / sizeof(uint32_t);
 	int i;
 
-	if (size > ARRAY_SIZE(r->data))
+	if (size > ARRAY_SIZE(r->data) || p->size > args->response_size)
 		return EC_RES_ERROR;
 
 	for (i = 0; i < size; i++)
 		r->data[i] = offset + i;
 
-	args->response_size = sizeof(*r);
+	args->response_size = size * sizeof(uint32_t);
 
 	return EC_RES_SUCCESS;
 }
@@ -477,12 +516,13 @@ DECLARE_HOST_COMMAND(EC_CMD_READ_TEST,
 		     host_command_read_test,
 		     EC_VER_MASK(0));
 
-#ifndef CONFIG_LPC
+#ifndef CONFIG_HOSTCMD_X86
 /*
  * Host command to read memory map is not needed on LPC, because LPC can
  * directly map the data to the host's memory space.
  */
-static int host_command_read_memmap(struct host_cmd_handler_args *args)
+static enum ec_status
+host_command_read_memmap(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_read_memmap *p = args->params;
 
@@ -491,8 +531,13 @@ static int host_command_read_memmap(struct host_cmd_handler_args *args)
 	uint8_t size = p->size;
 
 	if (size > EC_MEMMAP_SIZE || offset > EC_MEMMAP_SIZE ||
-	    offset + size > EC_MEMMAP_SIZE)
+	    offset + size > EC_MEMMAP_SIZE || size > args->response_max)
 		return EC_RES_INVALID_PARAM;
+
+	/* Make sure switch data is initialized */
+	if (offset == EC_MEMMAP_SWITCHES &&
+	    *host_get_memmap(EC_MEMMAP_SWITCHES_VERSION) == 0)
+		return EC_RES_UNAVAILABLE;
 
 	memcpy(args->response, host_get_memmap(offset), size);
 	args->response_size = size;
@@ -504,7 +549,8 @@ DECLARE_HOST_COMMAND(EC_CMD_READ_MEMMAP,
 		     EC_VER_MASK(0));
 #endif
 
-static int host_command_get_cmd_versions(struct host_cmd_handler_args *args)
+static enum ec_status
+host_command_get_cmd_versions(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_get_cmd_versions *p = args->params;
 	const struct ec_params_get_cmd_versions_v1 *p_v1 = args->params;
@@ -527,6 +573,56 @@ DECLARE_HOST_COMMAND(EC_CMD_GET_CMD_VERSIONS,
 		     host_command_get_cmd_versions,
 		     EC_VER_MASK(0) | EC_VER_MASK(1));
 
+static int host_command_is_suppressed(uint16_t cmd)
+{
+#ifdef CONFIG_SUPPRESSED_HOST_COMMANDS
+	int i;
+	for (i = 0; i < ARRAY_SIZE(hc_suppressed_cmd); i++) {
+		if (hc_suppressed_cmd[i] == cmd) {
+			hc_suppressed_cnt[i]++;
+			return 1;
+		}
+	}
+#endif
+	return 0;
+}
+
+/*
+ * Print & reset suppressed command counters. It should be called periodically
+ * and on important events (e.g. shutdown, sysjump, etc.).
+ */
+static void dump_host_command_suppressed(int force)
+{
+#ifdef CONFIG_SUPPRESSED_HOST_COMMANDS
+	int i;
+
+	if (!force && !timestamp_expired(suppressed_cmd_deadline, NULL))
+		return;
+
+	CPRINTF("[%pT HC Suppressed:", PRINTF_TIMESTAMP_NOW);
+	for (i = 0; i < ARRAY_SIZE(hc_suppressed_cmd); i++) {
+		CPRINTF(" 0x%x=%d", hc_suppressed_cmd[i], hc_suppressed_cnt[i]);
+		hc_suppressed_cnt[i] = 0;
+	}
+	CPRINTF("]\n");
+	cflush();
+
+	/* Reset the timer */
+	suppressed_cmd_deadline.val = get_time().val + SUPPRESSED_CMD_INTERVAL;
+}
+
+static void dump_host_command_suppressed_(void)
+{
+	dump_host_command_suppressed(1);
+}
+DECLARE_HOOK(HOOK_CHIPSET_SHUTDOWN,
+	     dump_host_command_suppressed_, HOOK_PRIO_DEFAULT);
+DECLARE_HOOK(HOOK_SYSJUMP,
+	     dump_host_command_suppressed_, HOOK_PRIO_DEFAULT);
+#else
+}
+#endif /* CONFIG_SUPPRESSED_HOST_COMMANDS */
+
 /**
  * Print debug output for the host command request, before it's processed.
  *
@@ -535,6 +631,7 @@ DECLARE_HOST_COMMAND(EC_CMD_GET_CMD_VERSIONS,
 static void host_command_debug_request(struct host_cmd_handler_args *args)
 {
 	static int hc_prev_cmd;
+	static int hc_prev_count;
 	static uint64_t hc_prev_time;
 
 	/*
@@ -544,30 +641,54 @@ static void host_command_debug_request(struct host_cmd_handler_args *args)
 	 */
 	if (hcdebug == HCDEBUG_NORMAL) {
 		uint64_t t = get_time().val;
-		if (args->command == hc_prev_cmd &&
-		    t - hc_prev_time < HCDEBUG_MAX_REPEAT_DELAY) {
-			hc_prev_time = t;
-			CPUTS("+");
+		if (host_command_is_suppressed(args->command)) {
+			dump_host_command_suppressed(0);
 			return;
 		}
+		if (args->command == hc_prev_cmd &&
+		    t - hc_prev_time < HCDEBUG_MAX_REPEAT_DELAY) {
+			hc_prev_count++;
+			hc_prev_time = t;
+			if (hc_prev_count < HCDEBUG_MAX_REPEAT_COUNT)
+				CPUTS("+");
+			else if (hc_prev_count == HCDEBUG_MAX_REPEAT_COUNT)
+				CPUTS("(++)");
+			return;
+		}
+		hc_prev_count = 1;
 		hc_prev_time = t;
 		hc_prev_cmd = args->command;
 	}
 
 	if (hcdebug >= HCDEBUG_PARAMS && args->params_size)
-		CPRINTS("HC 0x%02x.%d:%.*h", args->command,
-			args->version, args->params_size, args->params);
+		CPRINTS("HC 0x%02x.%d:%ph", args->command,
+			args->version,
+			HEX_BUF(args->params, args->params_size));
 	else
 		CPRINTS("HC 0x%02x", args->command);
 }
 
-enum ec_status host_command_process(struct host_cmd_handler_args *args)
+uint16_t host_command_process(struct host_cmd_handler_args *args)
 {
 	const struct host_command *cmd;
 	int rv;
 
 	if (hcdebug)
 		host_command_debug_request(args);
+
+	/*
+	 * Pre-emptively clear the entire response buffer so we do not
+	 * have any left over contents from previous host commands.
+	 * For example, this prevents the last portion of a char array buffer
+	 * from containing data from the last host command if the string does
+	 * not take the entire width of the char array buffer.
+	 *
+	 * Note that if request and response buffers pointed to the same memory
+	 * location, then the chip implementation already needed to provide a
+	 * request_temp buffer in which the request data was already copied
+	 * by this point (see host_packet_receive function).
+	 */
+	memset(args->response, 0, args->response_max);
 
 #ifdef CONFIG_HOSTCMD_PD
 	if (args->command >= EC_CMD_PASSTHRU_OFFSET(1) &&
@@ -600,22 +721,23 @@ enum ec_status host_command_process(struct host_cmd_handler_args *args)
 		CPRINTS("HC 0x%02x err %d", args->command, rv);
 
 	if (hcdebug >= HCDEBUG_PARAMS && args->response_size)
-		CPRINTS("HC resp:%.*h", args->response_size,
-			args->response);
+		CPRINTS("HC resp:%ph",
+			HEX_BUF(args->response, args->response_size));
 
 	return rv;
 }
 
 #ifdef CONFIG_HOST_COMMAND_STATUS
 /* Returns current command status (busy or not) */
-static int host_command_get_comms_status(struct host_cmd_handler_args *args)
+static enum ec_status
+host_command_get_comms_status(struct host_cmd_handler_args *args)
 {
 	struct ec_response_get_comms_status *r = args->response;
 
 	r->flags = command_pending ? EC_COMMS_STATUS_PROCESSING : 0;
 	args->response_size = sizeof(*r);
 
-	return EC_SUCCESS;
+	return EC_RES_SUCCESS;
 }
 
 DECLARE_HOST_COMMAND(EC_CMD_GET_COMMS_STATUS,
@@ -623,7 +745,8 @@ DECLARE_HOST_COMMAND(EC_CMD_GET_COMMS_STATUS,
 		     EC_VER_MASK(0));
 
 /* Resend the last saved response */
-static int host_command_resend_response(struct host_cmd_handler_args *args)
+static enum ec_status
+host_command_resend_response(struct host_cmd_handler_args *args)
 {
 	/* Handle resending response */
 	args->result = saved_result;
@@ -631,7 +754,7 @@ static int host_command_resend_response(struct host_cmd_handler_args *args)
 
 	saved_result = EC_RES_UNAVAILABLE;
 
-	return EC_SUCCESS;
+	return EC_RES_SUCCESS;
 }
 
 DECLARE_HOST_COMMAND(EC_CMD_RESEND_RESPONSE,
@@ -639,20 +762,9 @@ DECLARE_HOST_COMMAND(EC_CMD_RESEND_RESPONSE,
 		     EC_VER_MASK(0));
 #endif /* CONFIG_HOST_COMMAND_STATUS */
 
-
-static int host_command_entering_mode(struct host_cmd_handler_args *args)
-{
-	struct ec_params_entering_mode *param =
-		(struct ec_params_entering_mode *)args->params;
-	args->response_size = 0;
-	g_vboot_mode = param->vboot_mode;
-	return EC_SUCCESS;
-}
-DECLARE_HOST_COMMAND(EC_CMD_ENTERING_MODE,
-		host_command_entering_mode, EC_VER_MASK(0));
-
 /* Returns what we tell it to. */
-static int host_command_test_protocol(struct host_cmd_handler_args *args)
+static enum ec_status
+host_command_test_protocol(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_test_protocol *p = args->params;
 	struct ec_response_test_protocol *r = args->response;
@@ -660,7 +772,7 @@ static int host_command_test_protocol(struct host_cmd_handler_args *args)
 
 	memset(r->buf, 0, sizeof(r->buf));
 	memcpy(r->buf, p->buf, copy_len);
-	args->response_size = p->ret_len;
+	args->response_size = copy_len;
 
 	return p->ec_result;
 }
@@ -669,96 +781,15 @@ DECLARE_HOST_COMMAND(EC_CMD_TEST_PROTOCOL,
 		     EC_VER_MASK(0));
 
 /* Returns supported features. */
-static int host_command_get_features(struct host_cmd_handler_args *args)
+static enum ec_status
+host_command_get_features(struct host_cmd_handler_args *args)
 {
 	struct ec_response_get_features *r = args->response;
 	args->response_size = sizeof(*r);
 
 	memset(r, 0, sizeof(*r));
-	r->flags[0] = 0
-#ifdef CONFIG_FW_LIMITED_IMAGE
-		| EC_FEATURE_MASK_0(EC_FEATURE_LIMITED)
-#endif
-#ifdef CONFIG_FLASH
-		| EC_FEATURE_MASK_0(EC_FEATURE_FLASH)
-#endif
-#ifdef CONFIG_FANS
-		| EC_FEATURE_MASK_0(EC_FEATURE_PWM_FAN)
-#endif
-#ifdef CONFIG_PWM_KBLIGHT
-		| EC_FEATURE_MASK_0(EC_FEATURE_PWM_KEYB)
-#endif
-#ifdef HAS_TASK_LIGHTBAR
-		| EC_FEATURE_MASK_0(EC_FEATURE_LIGHTBAR)
-#endif
-#ifdef CONFIG_LED_COMMON
-		| EC_FEATURE_MASK_0(EC_FEATURE_LED)
-#endif
-#ifdef HAS_TASK_MOTIONSENSE
-		| EC_FEATURE_MASK_0(EC_FEATURE_MOTION_SENSE)
-#endif
-#ifdef HAS_TASK_KEYSCAN
-		| EC_FEATURE_MASK_0(EC_FEATURE_KEYB)
-#endif
-#ifdef CONFIG_PSTORE
-		| EC_FEATURE_MASK_0(EC_FEATURE_PSTORE)
-#endif
-#ifdef CONFIG_LPC
-		| EC_FEATURE_MASK_0(EC_FEATURE_PORT80)
-#endif
-#ifdef CONFIG_TEMP_SENSOR
-		| EC_FEATURE_MASK_0(EC_FEATURE_THERMAL)
-#endif
-/* Hack to uniquely identify Samus ec */
-#if (defined CONFIG_BACKLIGHT_LID) || (defined CONFIG_BATTERY_SAMUS)
-		| EC_FEATURE_MASK_0(EC_FEATURE_BKLIGHT_SWITCH)
-#endif
-#ifdef CONFIG_WIRELESS
-		| EC_FEATURE_MASK_0(EC_FEATURE_WIFI_SWITCH)
-#endif
-#ifdef CONFIG_HOSTCMD_EVENTS
-		| EC_FEATURE_MASK_0(EC_FEATURE_HOST_EVENTS)
-#endif
-#ifdef CONFIG_COMMON_GPIO
-		| EC_FEATURE_MASK_0(EC_FEATURE_GPIO)
-#endif
-#ifdef CONFIG_I2C_MASTER
-		| EC_FEATURE_MASK_0(EC_FEATURE_I2C)
-#endif
-#ifdef CONFIG_CHARGER
-		| EC_FEATURE_MASK_0(EC_FEATURE_CHARGER)
-#endif
-#if (defined CONFIG_BATTERY) || (defined CONFIG_BATTERY_SMART)
-		| EC_FEATURE_MASK_0(EC_FEATURE_BATTERY)
-#endif
-#ifdef CONFIG_BATTERY_SMART
-		| EC_FEATURE_MASK_0(EC_FEATURE_SMART_BATTERY)
-#endif
-#ifdef CONFIG_AP_HANG_DETECT
-		| EC_FEATURE_MASK_0(EC_FEATURE_HANG_DETECT)
-#endif
-#ifdef CONFIG_PMU_POWERINFO
-		| EC_FEATURE_MASK_0(EC_FEATURE_PMU)
-#endif
-#ifdef CONFIG_HOSTCMD_PD
-		| EC_FEATURE_MASK_0(EC_FEATURE_SUB_MCU)
-#endif
-#ifdef CONFIG_CHARGE_MANAGER
-		| EC_FEATURE_MASK_0(EC_FEATURE_USB_PD)
-#endif
-#ifdef CONFIG_ACCEL_FIFO
-		| EC_FEATURE_MASK_0(EC_FEATURE_MOTION_SENSE_FIFO)
-#endif
-#ifdef CONFIG_VSTORE
-		| EC_FEATURE_MASK_0(EC_FEATURE_VSTORE)
-#endif
-#ifdef CONFIG_USB_MUX_VIRTUAL
-		| EC_FEATURE_MASK_0(EC_FEATURE_USBC_SS_MUX_VIRTUAL)
-#endif
-#ifdef CONFIG_HOSTCMD_RTC
-		| EC_FEATURE_MASK_0(EC_FEATURE_RTC)
-#endif
-		;
+	r->flags[0] = get_feature_flags0();
+	r->flags[1] = get_feature_flags1();
 	return EC_RES_SUCCESS;
 }
 DECLARE_HOST_COMMAND(EC_CMD_GET_FEATURES,
@@ -807,12 +838,12 @@ static int command_host_command(int argc, char **argv)
 {
 	struct host_cmd_handler_args args;
 	char *cmd_params;
-	enum ec_status res;
+	uint16_t res;
 	char *e;
 	int rv;
 
 	/* Use shared memory for command params space */
-	if (shared_mem_acquire(EC_PROTO2_MAX_PARAM_SIZE, &cmd_params)) {
+	if (SHARED_MEM_ACQUIRE_CHECK(EC_PROTO2_MAX_PARAM_SIZE, &cmd_params)) {
 		ccputs("Can't acquire shared memory buffer.\n");
 		return EC_ERROR_UNKNOWN;
 	}
@@ -859,7 +890,8 @@ static int command_host_command(int argc, char **argv)
 	if (res != EC_RES_SUCCESS)
 		ccprintf("Command returned %d\n", res);
 	else if (args.response_size)
-		ccprintf("Response: %.*h\n", args.response_size, cmd_params);
+		ccprintf("Response: %ph\n",
+			 HEX_BUF(cmd_params, args.response_size));
 	else
 		ccprintf("Command succeeded; no response.\n");
 
@@ -889,6 +921,7 @@ static int command_hcdebug(int argc, char **argv)
 
 	ccprintf("Host command debug mode is %s\n",
 		 hcdebug_mode_names[hcdebug]);
+	dump_host_command_suppressed(1);
 
 	return EC_SUCCESS;
 }

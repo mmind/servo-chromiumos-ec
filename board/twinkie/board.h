@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -16,23 +16,20 @@
 
 /* Optional features */
 #define CONFIG_USB
+#define CONFIG_USB_BOS
 #define CONFIG_USB_CONSOLE
+#define CONFIG_WEBUSB_URL "storage.googleapis.com/webtwinkie.org/tool.html"
 
 #define CONFIG_USB_POWER_DELIVERY
+#define CONFIG_USB_PD_TCPMV1
+#define CONFIG_USB_PD_CUSTOM_PDO
 #define CONFIG_USB_PD_DUAL_ROLE
 #define CONFIG_USB_PD_INTERNAL_COMP
-#define CONFIG_USB_PD_PORT_COUNT 1
+#define CONFIG_USB_PD_PORT_MAX_COUNT 1
 #define CONFIG_USB_PD_TCPC
 #define CONFIG_USB_PD_TCPM_STUB
 #define CONFIG_USB_PD_VBUS_DETECT_GPIO
 #define CONFIG_PD_USE_DAC_AS_REF
-/*
- * use #define CONFIG_USBC_SNIFFER_HEADER_V1
- * if you do not want twinkie to send out vbus info;
- * use #define CONFIG_USBC_SNIFFER_HEADER_V2
- * if you want twinkie to send out vbus info.
- */
-#define CONFIG_USBC_SNIFFER_HEADER_V1
 #define CONFIG_HW_CRC
 
 #ifndef HAS_TASK_PD_C0 /* PD sniffer mode */
@@ -45,7 +42,7 @@
 #define CONFIG_ADC
 #define CONFIG_BOARD_PRE_INIT
 #define CONFIG_I2C
-#define CONFIG_I2C_MASTER
+#define CONFIG_I2C_CONTROLLER
 #define CONFIG_INA231
 #undef CONFIG_WATCHDOG_HELP
 #undef CONFIG_LID_SWITCH
@@ -66,6 +63,8 @@
 #define CONFIG_SYSTEM_UNLOCKED
 
 #ifndef __ASSEMBLER__
+
+#include <stdint.h>
 
 void sniffer_init(void);
 
@@ -109,9 +108,6 @@ enum usb_strings {
 /* Standard-current Rp */
 #define PD_SRC_VNC           PD_SRC_DEF_VNC_MV
 #define PD_SRC_RD_THRESHOLD  PD_SRC_DEF_RD_THRESH_MV
-
-/* start as a sink in case we have no other power supply/battery */
-#define PD_DEFAULT_STATE PD_STATE_SNK_DISCONNECTED
 
 /* delay necessary for the voltage transition on the power supply */
 #define PD_POWER_SUPPLY_TURN_ON_DELAY  50000 /* us */

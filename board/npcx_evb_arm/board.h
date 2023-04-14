@@ -16,15 +16,18 @@
 /* Optional features */
 #define CONFIG_SYSTEM_UNLOCKED /* Allow dangerous commands for testing */
 #define CONFIG_FLASH_SIZE          0x00800000 /* 8MB spi flash */
+#define CONFIG_SPI_FLASH_REGS
 #define CONFIG_SPI_FLASH_W25Q64
 #define CONFIG_I2C
-#define CONFIG_I2C_MASTER
+#define CONFIG_I2C_CONTROLLER
 #define CONFIG_KEYBOARD_BOARD_CONFIG
 #define CONFIG_KEYBOARD_PROTOCOL_MKBP /* Instead of 8042 protocol of keyboard */
+#define CONFIG_MKBP_USE_GPIO
 #define CONFIG_POWER_BUTTON
 #define CONFIG_VBOOT_HASH
 #define CONFIG_PWM_KBLIGHT
-#define CONFIG_BOARD_VERSION
+#define CONFIG_BOARD_VERSION_GPIO
+#define CONFIG_ENABLE_JTAG_SELECTION
 
 /* Optional features for test commands */
 #define CONFIG_CMD_TASKREADY
@@ -41,14 +44,13 @@
 /* Optional feature - used by nuvoton */
 #define NPCX_UART_MODULE2    0 /* 0:GPIO10/11 1:GPIO64/65 as UART */
 #define NPCX_JTAG_MODULE2    0 /* 0:GPIO21/17/16/20 1:GPIOD5/E2/D4/E5 as JTAG*/
-#define NPCX_TACH_SEL2       0 /* 0:GPIO40/A4 1:GPIO93/D3 as TACH */
+#define NPCX_TACH_SEL2       0 /* 0:GPIO40/73 1:GPIO93/A6 as TACH */
 /* Enable SHI PU on transition to S0. Disable the PU otherwise for leakage. */
 #define NPCX_SHI_CS_PU
 /* Enable bypass since shi outputs invalid data when across 256B boundary */
 #define NPCX_SHI_BYPASS_OVER_256B
 
 /* Optional for testing */
-#undef  CONFIG_PECI
 #undef  CONFIG_PSTORE
 #undef  CONFIG_LOW_POWER_IDLE           /* Deep Sleep Support */
 

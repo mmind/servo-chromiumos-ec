@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -55,6 +55,7 @@ static struct usart_config const loopback_usart =
 		     loopback_rx_dma.usart_rx,
 		     loopback_tx_dma.usart_tx,
 		     115200,
+		     0,
 		     loopback_queue,
 		     loopback_queue);
 

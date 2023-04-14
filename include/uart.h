@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -48,12 +48,31 @@ int uart_putc(int c);
 int uart_puts(const char *outstr);
 
 /**
+ * Put byte stream to the UART while translating '\n' to '\r\n'
+ *
+ * @param out		Pointer to data to send
+ * @param len		Length of transfer in bytes
+ * @return EC_SUCCESS, or non-zero if output was truncated.
+ */
+int uart_put(const char *out, int len);
+
+/**
+ * Put raw byte stream to the UART
+ *
+ * @param out		Pointer to data to send
+ * @param len		Length of transfer in bytes
+ * @return EC_SUCCESS, or non-zero if output was truncated.
+ */
+int uart_put_raw(const char *out, int len);
+
+/**
  * Print formatted output to the UART, like printf().
  *
  * See printf.h for valid formatting codes.
  *
  * @return EC_SUCCESS, or non-zero if output was truncated.
  */
+__attribute__((__format__(__printf__, 1, 2)))
 int uart_printf(const char *format, ...);
 
 /**
@@ -182,6 +201,11 @@ void uart_tx_stop(void);
 void uart_process_input(void);
 
 /**
+ * Clear input buffer
+ */
+void uart_clear_input(void);
+
+/**
  * Helper for processing UART output.
  *
  * Fills the output FIFO until the transmit buffer is empty or the FIFO full.
@@ -193,6 +217,11 @@ void uart_process_output(void);
  * Return boolean expressing whether UART buffer is empty or not.
  */
 int uart_buffer_empty(void);
+
+/**
+ * Return boolean expressing whether UART buffer is full or not.
+ */
+int uart_buffer_full(void);
 
 /**
  * Disable the EC console UART and convert the UART RX pin to a generic GPIO
@@ -215,6 +244,17 @@ void uart_deepsleep_interrupt(enum gpio_signal signal);
 #else
 static inline void uart_deepsleep_interrupt(enum gpio_signal signal) { }
 #endif /* !CONFIG_LOW_POWER_IDLE */
+
+#if defined(HAS_TASK_CONSOLE) && defined(CONFIG_FORCE_CONSOLE_RESUME)
+/**
+ * Enable/Disable the UART controller low-power mode wake-up capability.
+ *
+ * @param enable  1 to enable wake-up, 0 to disable it.
+ */
+void uart_enable_wakeup(int enable);
+#elif !defined(CHIP_FAMILY_NPCX5)
+static inline void uart_enable_wakeup(int enable) {}
+#endif
 
 #ifdef CONFIG_UART_INPUT_FILTER
 /**
@@ -245,5 +285,85 @@ int uart_comx_putc_ok(void);
  * Write a character to the COMx UART interface.
  */
 void uart_comx_putc(int c);
+
+/*
+ * Functions for pad switching UART, only defined on some chips (npcx), and
+ * if CONFIG_UART_PAD_SWITCH is enabled.
+ */
+enum uart_pad {
+	UART_DEFAULT_PAD = 0,
+	UART_ALTERNATE_PAD = 1,
+};
+
+/**
+ * Reset UART pad to default pad, so that a panic information can be printed
+ * on the EC console.
+ */
+void uart_reset_default_pad_panic(void);
+
+/**
+ * Specialized function to write then read data on UART alternate pad.
+ * The transfer may be interrupted at any time if data is received on the main
+ * pad.
+ *
+ * @param tx		Data to be sent
+ * @param tx_len	Length of data to be sent
+ * @param rx		Buffer to receive data
+ * @param rx_len	Receive buffer length
+ * @param timeout_us	Timeout in microseconds for the transaction to complete.
+ *
+ * @return The number of bytes read back (indicates a timeout if != rx_len).
+ *         - -EC_ERROR_BUSY if the alternate pad cannot be used (e.g. default
+ *           pad is currently being used), or if the transfer was interrupted.
+ *         - -EC_ERROR_TIMEOUT in case tx_len bytes cannot be written in the
+ *           time specified in timeout_us.
+ */
+int uart_alt_pad_write_read(uint8_t *tx, int tx_len, uint8_t *rx, int rx_len,
+			int timeout_us);
+
+/**
+ * Interrupt handler for default UART RX pin transition when UART is switched
+ * to alternate pad.
+ *
+ * @param signal	Signal which triggered the interrupt.
+ */
+void uart_default_pad_rx_interrupt(enum gpio_signal signal);
+
+/**
+ * Prepare for following `uart_console_read_buffer()` call.  It will create a
+ * snapshot of current uart buffer.
+ *
+ * @return result status (EC_RES_*)
+ */
+enum ec_status uart_console_read_buffer_init(void);
+
+/**
+ * Read from uart buffer.
+ *
+ * `uart_console_read_buffer_init()` must be called first.
+ *
+ * If `type` is CONSOLE_READ_NEXT, this will return data starting from the
+ * beginning of the last snapshot created by `uart_console_read_buffer_init()`.
+ *
+ * If `type` is CONSOLE_READ_RECENT, this will start from the end of the
+ * previous snapshot (so if current snapshot and previous snapshot has overlaps,
+ * only new content will be returned).
+ *
+ * @param type		an ec_console_read_subcmd value.
+ * @param dest		output buffer, it will be a null-terminated string.
+ * @param dest_size	size of output buffer.
+ * @param write_count	number of bytes written (including '\0').
+ *
+ * @return result status (EC_RES_*)
+ */
+int uart_console_read_buffer(uint8_t type,
+			     char *dest,
+			     uint16_t dest_size,
+			     uint16_t *write_count);
+
+/**
+ * Initialize tx buffer head and tail
+ */
+void uart_init_buffer(void);
 
 #endif  /* __CROS_EC_UART_H */

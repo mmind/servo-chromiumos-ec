@@ -9,12 +9,6 @@
 #define __CROS_EC_BOARD_H
 
 /*
- * Allow dangerous commands.
- * TODO: Remove this config before production.
- */
-#define CONFIG_SYSTEM_UNLOCKED
-
-/*
  * By default, enable all console messages excepted HC, ACPI and event:
  * The sensor stack is generating a lot of activity.
  */
@@ -33,7 +27,7 @@
 #define BD9995X_IOUT_GAIN_SELECT \
 		BD9995X_CMD_PMON_IOUT_CTRL_SET_IOUT_GAIN_SET_20V
 
-#define CONFIG_CMD_CHARGER_PSYS
+#define CONFIG_CHARGER_PSYS_READ
 #define BD9995X_PSYS_GAIN_SELECT \
 		BD9995X_CMD_PMON_IOUT_CTRL_SET_PMON_GAIN_SET_02UAW
 
@@ -48,23 +42,25 @@
 #define CONFIG_BATTERY_DEVICE_CHEMISTRY  "LION"
 #define CONFIG_BATTERY_CUT_OFF
 #define CONFIG_BATTERY_PRESENT_CUSTOM
-#define CONFIG_BATTERY_REVIVE_DISCONNECT
 #define CONFIG_BATTERY_SMART
 
 /* Charger */
 #define CONFIG_CHARGE_MANAGER
-#define CONFIG_CHARGE_RAMP
+#define CONFIG_CHARGE_RAMP_SW
 #define CONFIG_CHARGER
-#define CONFIG_CHARGER_V2
-#define CONFIG_CHARGER_BD99956
+#define CONFIG_CHARGER_BD9995X
 #define CONFIG_CHARGER_BD9995X_CHGEN
 #define CONFIG_CHARGER_DISCHARGE_ON_AC
 #define CONFIG_CHARGER_INPUT_CURRENT 512
 #define CONFIG_CHARGER_LIMIT_POWER_THRESH_BAT_PCT 1
-#define CONFIG_CHARGER_LIMIT_POWER_THRESH_CHG_MW 15000
+#define CONFIG_CHARGER_LIMIT_POWER_THRESH_CHG_MW 18000
+#define CONFIG_CHARGER_MAINTAIN_VBAT
 #define CONFIG_CHARGER_MIN_BAT_PCT_FOR_POWER_ON 1
 #define CONFIG_USB_CHARGER
 #define CONFIG_CHARGER_PROFILE_OVERRIDE
+#define CONFIG_CHARGER_PROFILE_OVERRIDE_COMMON
+#undef  CONFIG_CHARGER_PROFILE_VOLTAGE_RANGES
+#define CONFIG_CHARGER_PROFILE_VOLTAGE_RANGES 3
 #define CONFIG_CHARGE_MANAGER_EXTERNAL_POWER_LIMIT
 
 /* USB-A config */
@@ -73,35 +69,31 @@
 #define CONFIG_USB_PORT_POWER_SMART_SIMPLE
 #undef CONFIG_USB_PORT_POWER_SMART_PORT_COUNT
 #define CONFIG_USB_PORT_POWER_SMART_PORT_COUNT 1
-#define GPIO_USB_ILIM_SEL GPIO_USB_A_CHARGE_EN_L
+#define GPIO_USB1_ILIM_SEL GPIO_USB_A_CHARGE_EN_L
 #define GPIO_USB_CTL1 GPIO_EN_PP5000
 
 #define CONFIG_TABLET_MODE
 
 /* USB PD config */
-#define CONFIG_CASE_CLOSED_DEBUG_EXTERNAL
-#define CONFIG_CMD_PD_CONTROL
+#define CONFIG_HOSTCMD_PD_CONTROL
 #define CONFIG_USB_PD_ALT_MODE
 #define CONFIG_USB_PD_ALT_MODE_DFP
-#define CONFIG_USB_PD_CUSTOM_VDM
 #define CONFIG_USB_PD_DUAL_ROLE
 #define CONFIG_USB_PD_DUAL_ROLE_AUTO_TOGGLE
-#define CONFIG_USB_PD_DISCHARGE
 #define CONFIG_USB_PD_DISCHARGE_TCPC
 #define CONFIG_USB_PD_LOGGING
-#define CONFIG_USB_PD_LOG_SIZE 512
 #define CONFIG_USB_PD_MAX_SINGLE_SOURCE_CURRENT TYPEC_RP_3A0
-#define CONFIG_USB_PD_PORT_COUNT 2
-#define CONFIG_USB_PD_QUIRK_SLOW_CC_STATUS
+#define CONFIG_USB_PD_PORT_MAX_COUNT 2
 #define CONFIG_USB_PD_VBUS_DETECT_CHARGER
 #define CONFIG_USB_PD_TCPC_LOW_POWER
-#define CONFIG_USB_PD_TCPC_FW_VERSION
 #define CONFIG_USB_PD_TCPM_MUX  /* for both PS8751 and ANX3429 */
-#define CONFIG_USB_PD_TCPM_ANX74XX
+#define CONFIG_USB_PD_TCPM_ANX3429
 #define CONFIG_USB_PD_TCPM_PS8751
 #define CONFIG_USB_PD_TCPM_TCPCI
 #define CONFIG_USB_PD_TRY_SRC
 #define CONFIG_USB_POWER_DELIVERY
+#define CONFIG_USB_PD_TCPMV1
+#define CONFIG_USB_PD_COMM_LOCKED
 
 #define CONFIG_USBC_SS_MUX
 #define CONFIG_USBC_SS_MUX_DFP_ONLY
@@ -109,10 +101,9 @@
 #define CONFIG_USBC_VCONN_SWAP
 
 /* SoC / PCH */
-#define CONFIG_LPC
+#define CONFIG_HOSTCMD_LPC
 #define CONFIG_CHIPSET_APOLLOLAKE
 #define CONFIG_CHIPSET_RESET_HOOK
-#undef CONFIG_PECI
 #define CONFIG_POWER_BUTTON
 #define CONFIG_POWER_BUTTON_X86
 #define CONFIG_POWER_COMMON
@@ -121,16 +112,15 @@
 
 /* EC */
 #define CONFIG_ADC
-#define CONFIG_BOARD_VERSION
-#define CONFIG_BOARD_SPECIFIC_VERSION
-#define CONFIG_BUTTON_COUNT 2
+#define CONFIG_BOARD_VERSION_CUSTOM
 #define CONFIG_EXTPOWER_GPIO
 #undef   CONFIG_EXTPOWER_DEBOUNCE_MS
 #define  CONFIG_EXTPOWER_DEBOUNCE_MS 1000
 #define CONFIG_FPU
 #define CONFIG_HOSTCMD_FLASH_SPI_INFO
 #define CONFIG_I2C
-#define CONFIG_I2C_MASTER
+#define CONFIG_I2C_CONTROLLER
+#define CONFIG_KEYBOARD_BOARD_CONFIG
 #define CONFIG_KEYBOARD_PROTOCOL_8042
 #define CONFIG_KEYBOARD_COL2_INVERTED
 #define CONFIG_KEYBOARD_PWRBTN_ASSERTS_KSI2
@@ -142,17 +132,38 @@
 #define CONFIG_PWM
 #define CONFIG_TEMP_SENSOR
 #define CONFIG_THERMISTOR_NCP15WB
+#define CONFIG_STEINHART_HART_3V3_13K7_47K_4050B
+#define CONFIG_STEINHART_HART_3V3_51K1_47K_4050B
 #define CONFIG_DPTF
 #define CONFIG_SCI_GPIO GPIO_PCH_SCI_L
-#define CONFIG_UART_HOST 0
+#define CONFIG_VOLUME_BUTTONS
+#define GPIO_VOLUME_DOWN_L GPIO_EC_VOLDN_BTN_ODL
+#define GPIO_VOLUME_UP_L GPIO_EC_VOLUP_BTN_ODL
 #define CONFIG_VBOOT_HASH
 #define CONFIG_BACKLIGHT_LID
 #define CONFIG_WIRELESS
 #define CONFIG_WIRELESS_SUSPEND EC_WIRELESS_SWITCH_WLAN_POWER
 #define CONFIG_WLAN_POWER_ACTIVE_LOW
 #define  WIRELESS_GPIO_WLAN_POWER GPIO_WIRELESS_GPIO_WLAN_POWER
+#define CONFIG_PWR_STATE_DISCHARGE_FULL
+#undef CONFIG_UART_TX_BUF_SIZE
+#define CONFIG_UART_TX_BUF_SIZE 512
+
+/*
+ * During shutdown sequence TPS65094x PMIC turns off the sensor rails
+ * asynchronously to the EC. If we access the sensors when the sensor power
+ * rails are off we get I2C errors. To avoid this issue, defer switching
+ * the sensors rate if in S3. By the time deferred function is serviced if
+ * the chipset is in S5 we can back out from switching the sensor rate.
+ *
+ * Time taken by V1P8U rail to go down from S3 is 30ms to 60ms hence defer
+ * the sensor switching after 60ms.
+ */
+#undef CONFIG_MOTION_SENSE_SUSPEND_DELAY_US
+#define CONFIG_MOTION_SENSE_SUSPEND_DELAY_US (MSEC * 60)
 
 #define CONFIG_FLASH_SIZE 524288
+#define CONFIG_SPI_FLASH_REGS
 #define CONFIG_SPI_FLASH_W25Q40	/* FIXME: Should be GD25LQ40? */
 
 /*
@@ -167,7 +178,7 @@
 #define NPCX_JTAG_MODULE2    0 /* 0:GPIO21/17/16/20 1:GPIOD5/E2/D4/E5 as JTAG*/
 /* FIXME(dhendrix): these pins are just normal GPIOs on Reef. Do we need
  * to change some other setting to put them in GPIO mode? */
-#define NPCX_TACH_SEL2       0 /* 0:GPIO40/A4 1:GPIO93/D3 as TACH */
+#define NPCX_TACH_SEL2       0 /* 0:GPIO40/73 1:GPIO93/A6 as TACH */
 
 /* I2C ports */
 #define I2C_PORT_GYRO			NPCX_I2C_PORT1
@@ -184,25 +195,25 @@
 #define CONFIG_MKBP_USE_HOST_EVENT
 #define CONFIG_ACCELGYRO_BMI160
 #define CONFIG_ACCEL_INTERRUPTS
-#define CONFIG_ACCELGYRO_BMI160_INT_EVENT TASK_EVENT_CUSTOM(4)
-#define CONFIG_MAG_BMI160_BMM150
-#define BMM150_I2C_ADDRESS BMM150_ADDR0	/* 8-bit address */
+#define CONFIG_ACCELGYRO_BMI160_INT_EVENT \
+	TASK_EVENT_MOTION_SENSOR_INTERRUPT(BASE_ACCEL)
+#define CONFIG_MAG_BMI_BMM150
+#define CONFIG_ACCELGYRO_SEC_ADDR_FLAGS BMM150_ADDR0_FLAGS
 #define CONFIG_MAG_CALIBRATE
 #define CONFIG_ACCEL_KX022
-#define CONFIG_ALS
 #define CONFIG_ALS_OPT3001
-#define OPT3001_I2C_ADDR OPT3001_I2C_ADDR1
 #define CONFIG_BARO_BMP280
 #define CONFIG_LID_ANGLE
 #define CONFIG_LID_ANGLE_UPDATE
 #define CONFIG_LID_ANGLE_SENSOR_BASE BASE_ACCEL
 #define CONFIG_LID_ANGLE_SENSOR_LID LID_ACCEL
 
+/* Enable sensor fifo, must also define the _SIZE and _THRES */
+#define CONFIG_ACCEL_FIFO
 /* FIFO size is in power of 2. */
-#define CONFIG_ACCEL_FIFO 1024
-
+#define CONFIG_ACCEL_FIFO_SIZE 512
 /* Depends on how fast the AP boots and typical ODRs */
-#define CONFIG_ACCEL_FIFO_THRES (CONFIG_ACCEL_FIFO / 3)
+#define CONFIG_ACCEL_FIFO_THRES (CONFIG_ACCEL_FIFO_SIZE / 3)
 
 
 #ifndef __ASSEMBLER__
@@ -225,20 +236,6 @@ enum pwm_channel {
 	PWM_CH_COUNT
 };
 
-enum power_signal {
-	X86_RSMRST_N = 0,
-	X86_SLP_S3_N,
-	X86_SLP_S4_N,
-	X86_SUSPWRDNACK,
-
-	X86_ALL_SYS_PG,		/* PMIC_EC_PWROK_OD */
-	X86_PGOOD_PP3300,	/* GPIO_PP3300_PG */
-	X86_PGOOD_PP5000,	/* GPIO_PP5000_PG */
-
-	/* Number of X86 signals */
-	POWER_SIGNAL_COUNT
-};
-
 enum temp_sensor_id {
 	TEMP_SENSOR_BATTERY = 0,
 	TEMP_SENSOR_AMBIENT,
@@ -246,12 +243,13 @@ enum temp_sensor_id {
 	TEMP_SENSOR_COUNT
 };
 
-/* Light sensors */
-enum als_id {
-	ALS_OPT3001 = 0,
-
-	ALS_COUNT
-};
+/*
+ * For backward compatibility, to report ALS via ACPI,
+ * Define the number of ALS sensors: motion_sensor copy the data to the ALS
+ * memmap region.
+ */
+#define CONFIG_ALS
+#define ALS_COUNT 1
 
 /*
  * Motion sensors:
@@ -265,6 +263,8 @@ enum sensor_id {
 	BASE_GYRO,
 	BASE_MAG,
 	BASE_BARO,
+	LID_ALS,
+	SENSOR_COUNT,
 };
 
 enum reef_board_version {
@@ -279,9 +279,6 @@ enum reef_board_version {
 	BOARD_VERSION_8,
 	BOARD_VERSION_COUNT,
 };
-
-/* start as a sink in case we have no other power supply/battery */
-#define PD_DEFAULT_STATE PD_STATE_SNK_DISCONNECTED
 
 /* TODO: determine the following board specific type-C power constants */
 /* FIXME(dhendrix): verify all of the below PD_* numbers */
@@ -307,11 +304,10 @@ void board_reset_pd_mcu(void);
 int board_get_version(void);
 
 void board_set_tcpc_power_mode(int port, int mode);
-void board_print_tcpc_fw_version(int port);
 
 /* Sensors without hardware FIFO are in forced mode */
 #define CONFIG_ACCEL_FORCE_MODE_MASK \
-	((1 << LID_ACCEL) | (1 << BASE_BARO))
+	(BIT(LID_ACCEL) | BIT(BASE_BARO) | BIT(LID_ALS))
 
 #endif /* !__ASSEMBLER__ */
 

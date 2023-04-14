@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -7,10 +7,12 @@
 #include "charge_manager.h"
 #include "common.h"
 #include "console.h"
+#include "ec_commands.h"
 #include "flash.h"
 #include "gpio.h"
 #include "hooks.h"
 #include "host_command.h"
+#include "mkbp_event.h"
 #include "registers.h"
 #include "rsa.h"
 #include "sha256.h"
@@ -20,7 +22,10 @@
 #include "timer.h"
 #include "util.h"
 #include "usb_api.h"
+#include "usb_common.h"
+#include "usb_mux.h"
 #include "usb_pd.h"
+#include "usbc_ppc.h"
 #include "version.h"
 
 #ifdef CONFIG_COMMON_RUNTIME
@@ -31,600 +36,617 @@
 #define CPRINTF(format, args...)
 #endif
 
+/*
+ * This file is currently only used for TCPMv1, and would need changes before
+ * being used for TCPMv2. One example: PD_FLAGS_* are TCPMv1 only.
+ */
+#ifndef CONFIG_USB_PD_TCPMV1
+#error This file must only be used with TCPMv1
+#endif
+
 static int rw_flash_changed = 1;
 
-int pd_check_requested_voltage(uint32_t rdo)
+__overridable void pd_check_pr_role(int port,
+	enum pd_power_role pr_role, int flags)
 {
-	int max_ma = rdo & 0x3FF;
-	int op_ma = (rdo >> 10) & 0x3FF;
-	int idx = RDO_POS(rdo);
-	uint32_t pdo;
-	uint32_t pdo_ma;
-#if defined(CONFIG_USB_PD_DYNAMIC_SRC_CAP) || \
-		defined(CONFIG_USB_PD_MAX_SINGLE_SOURCE_CURRENT)
-	const uint32_t *src_pdo;
-	const int pdo_cnt = charge_manager_get_source_pdo(&src_pdo);
-#else
-	const uint32_t *src_pdo = pd_src_pdo;
-	const int pdo_cnt = pd_src_pdo_cnt;
-#endif
+	/*
+	 * If partner is dual-role power and dualrole toggling is on, consider
+	 * if a power swap is necessary.
+	 */
+	if ((flags & PD_FLAGS_PARTNER_DR_POWER) &&
+	    pd_get_dual_role(port) == PD_DRP_TOGGLE_ON) {
+		/*
+		 * If we are a sink and partner is not unconstrained, then
+		 * swap to become a source. If we are source and partner is
+		 * unconstrained, swap to become a sink.
+		 */
+		int partner_unconstrained = flags & PD_FLAGS_PARTNER_UNCONSTR;
 
-	/* Board specific check for this request */
-	if (pd_board_check_request(rdo, pdo_cnt))
-		return EC_ERROR_INVAL;
+		if ((!partner_unconstrained && pr_role == PD_ROLE_SINK) ||
+		     (partner_unconstrained && pr_role == PD_ROLE_SOURCE))
+			pd_request_power_swap(port);
+	}
+}
 
-	/* check current ... */
-	pdo = src_pdo[idx - 1];
-	pdo_ma = (pdo & 0x3ff);
-	if (op_ma > pdo_ma)
-		return EC_ERROR_INVAL; /* too much op current */
-	if (max_ma > pdo_ma && !(rdo & RDO_CAP_MISMATCH))
-		return EC_ERROR_INVAL; /* too much max current */
+__overridable void pd_check_dr_role(int port,
+	enum pd_data_role dr_role, int flags)
+{
+	/* If UFP, try to switch to DFP */
+	if ((flags & PD_FLAGS_PARTNER_DR_DATA) && dr_role == PD_ROLE_UFP)
+		pd_request_data_swap(port);
+}
 
-	CPRINTF("Requested %d V %d mA (for %d/%d mA)\n",
-		 ((pdo >> 10) & 0x3ff) * 50, (pdo & 0x3ff) * 10,
-		 op_ma * 10, max_ma * 10);
-
-	/* Accept the requested voltage */
+#ifdef CONFIG_MKBP_EVENT
+static int dp_alt_mode_entry_get_next_event(uint8_t *data)
+{
 	return EC_SUCCESS;
 }
-
-static int stub_pd_board_check_request(uint32_t rdo, int pdo_cnt)
-{
-	int idx = RDO_POS(rdo);
-
-	/* Check for invalid index */
-	return (!idx || idx > pdo_cnt) ?
-		EC_ERROR_INVAL : EC_SUCCESS;
-}
-int pd_board_check_request(uint32_t, int)
-	__attribute__((weak, alias("stub_pd_board_check_request")));
+DECLARE_EVENT_SOURCE(EC_MKBP_EVENT_DP_ALT_MODE_ENTERED,
+		     dp_alt_mode_entry_get_next_event);
+#endif /* CONFIG_MKBP_EVENT */
 
 #ifdef CONFIG_USB_PD_DUAL_ROLE
-/* Cap on the max voltage requested as a sink (in millivolts) */
-static unsigned max_request_mv = PD_MAX_VOLTAGE_MV; /* no cap */
+/* Last received source cap */
+static uint32_t pd_src_caps[CONFIG_USB_PD_PORT_MAX_COUNT][PDO_MAX_OBJECTS];
+static uint8_t pd_src_cap_cnt[CONFIG_USB_PD_PORT_MAX_COUNT];
 
-/**
- * Find PDO index that offers the most amount of power and stays within
- * max_mv voltage.
- *
- * @param cnt  the number of Power Data Objects.
- * @param src_caps Power Data Objects representing the source capabilities.
- * @param max_mv maximum voltage (or -1 if no limit)
- * @return index of PDO within source cap packet
- */
-static int pd_find_pdo_index(int cnt, uint32_t *src_caps, int max_mv)
+const uint32_t * const pd_get_src_caps(int port)
 {
-	int i, uw, mv, ma;
-	int ret = -1;
-	int __attribute__((unused)) cur_mv = 0;
-	int cur_uw = 0;
-	int prefer_cur;
-
-	/* max voltage is always limited by this boards max request */
-	max_mv = MIN(max_mv, PD_MAX_VOLTAGE_MV);
-
-	/* Get max power that is under our max voltage input */
-	for (i = 0; i < cnt; i++) {
-		mv = ((src_caps[i] >> 10) & 0x3FF) * 50;
-		/* Skip any voltage not supported by this board */
-		if (!pd_is_valid_input_voltage(mv))
-			continue;
-
-		if ((src_caps[i] & PDO_TYPE_MASK) == PDO_TYPE_BATTERY) {
-			uw = 250000 * (src_caps[i] & 0x3FF);
-		} else {
-			ma = (src_caps[i] & 0x3FF) * 10;
-			ma = MIN(ma, PD_MAX_CURRENT_MA);
-			uw = ma * mv;
-		}
-
-		if (mv > max_mv)
-			continue;
-		uw = MIN(uw, PD_MAX_POWER_MW * 1000);
-		prefer_cur = 0;
-
-		/* Apply special rules in case of 'tie' */
-#ifdef PD_PREFER_LOW_VOLTAGE
-		if (uw == cur_uw && mv < cur_mv)
-			prefer_cur = 1;
-#elif defined(PD_PREFER_HIGH_VOLTAGE)
-		if (uw == cur_uw && mv > cur_mv)
-			prefer_cur = 1;
-#endif
-		/* Prefer higher power, except for tiebreaker */
-		if (uw > cur_uw || prefer_cur) {
-			ret = i;
-			cur_uw = uw;
-			cur_mv = mv;
-		}
-	}
-	return ret;
+	return pd_src_caps[port];
 }
 
-/**
- * Extract power information out of a Power Data Object (PDO)
- *
- * @pdo Power data object
- * @ma Current we can request from that PDO
- * @mv Voltage of the PDO
- */
-static void pd_extract_pdo_power(uint32_t pdo, uint32_t *ma, uint32_t *mv)
+void pd_set_src_caps(int port, int cnt, uint32_t *src_caps)
 {
-	int max_ma, uw;
-	*mv = ((pdo >> 10) & 0x3FF) * 50;
+	int i;
 
-	if ((pdo & PDO_TYPE_MASK) == PDO_TYPE_BATTERY) {
-		uw = 250000 * (pdo & 0x3FF);
-		max_ma = 1000 * MIN(1000 * uw, PD_MAX_POWER_MW) / *mv;
-	} else {
-		max_ma = 10 * (pdo & 0x3FF);
-		max_ma = MIN(max_ma, PD_MAX_POWER_MW * 1000 / *mv);
-	}
+	pd_src_cap_cnt[port] = cnt;
 
-	*ma = MIN(max_ma, PD_MAX_CURRENT_MA);
+	for (i = 0; i < cnt; i++)
+		pd_src_caps[port][i] = *src_caps++;
 }
 
-int pd_build_request(int cnt, uint32_t *src_caps, uint32_t *rdo,
-		     uint32_t *ma, uint32_t *mv, enum pd_request_type req_type)
+uint8_t pd_get_src_cap_cnt(int port)
 {
-	int pdo_index, flags = 0;
-	int uw;
-
-	if (req_type == PD_REQUEST_VSAFE5V)
-		/* src cap 0 should be vSafe5V */
-		pdo_index = 0;
-	else
-		/* find pdo index for max voltage we can request */
-		pdo_index = pd_find_pdo_index(cnt, src_caps, max_request_mv);
-
-	/* If could not find desired pdo_index, then return error */
-	if (pdo_index == -1)
-		return -EC_ERROR_UNKNOWN;
-
-	pd_extract_pdo_power(src_caps[pdo_index], ma, mv);
-	uw = *ma * *mv;
-	/* Mismatch bit set if less power offered than the operating power */
-	if (uw < (1000 * PD_OPERATING_POWER_MW))
-		flags |= RDO_CAP_MISMATCH;
-
-	if ((src_caps[pdo_index] & PDO_TYPE_MASK) == PDO_TYPE_BATTERY) {
-		int mw = uw / 1000;
-		*rdo = RDO_BATT(pdo_index + 1, mw, mw, flags);
-	} else {
-		*rdo = RDO_FIXED(pdo_index + 1, *ma, *ma, flags);
-	}
-	return EC_SUCCESS;
-}
-
-void pd_process_source_cap(int port, int cnt, uint32_t *src_caps)
-{
-#ifdef CONFIG_CHARGE_MANAGER
-	uint32_t ma, mv;
-	int pdo_index;
-
-	/* Get max power info that we could request */
-	pdo_index = pd_find_pdo_index(cnt, src_caps, PD_MAX_VOLTAGE_MV);
-	if (pdo_index < 0)
-		pdo_index = 0;
-	pd_extract_pdo_power(src_caps[pdo_index], &ma, &mv);
-
-	/* Set max. limit, but apply 500mA ceiling */
-	charge_manager_set_ceil(port, CEIL_REQUESTOR_PD, PD_MIN_MA);
-	pd_set_input_current_limit(port, ma, mv);
-#endif
-}
-
-void pd_set_max_voltage(unsigned mv)
-{
-	max_request_mv = mv;
-}
-
-unsigned pd_get_max_voltage(void)
-{
-	return max_request_mv;
-}
-
-int pd_charge_from_device(uint16_t vid, uint16_t pid)
-{
-	/* TODO: rewrite into table if we get more of these */
-	/*
-	 * White-list Apple charge-through accessory since it doesn't set
-	 * externally powered bit, but we still need to charge from it when
-	 * we are a sink.
-	 */
-	return (vid == USB_VID_APPLE && (pid == 0x1012 || pid == 0x1013));
+	return pd_src_cap_cnt[port];
 }
 #endif /* CONFIG_USB_PD_DUAL_ROLE */
+
+static struct pd_cable cable[CONFIG_USB_PD_PORT_MAX_COUNT];
+
+enum pd_rev_type get_usb_pd_cable_revision(int port)
+{
+	return cable[port].rev;
+}
+
+bool consume_sop_prime_repeat_msg(int port, uint8_t msg_id)
+{
+
+	if (cable[port].last_sop_p_msg_id != msg_id) {
+		cable[port].last_sop_p_msg_id = msg_id;
+		return false;
+	}
+	CPRINTF("C%d SOP Prime repeat msg_id %d\n", port, msg_id);
+	return true;
+}
+
+bool consume_sop_prime_prime_repeat_msg(int port, uint8_t msg_id)
+{
+
+	if (cable[port].last_sop_p_p_msg_id != msg_id) {
+		cable[port].last_sop_p_p_msg_id = msg_id;
+		return false;
+	}
+	CPRINTF("C%d SOP Prime Prime repeat msg_id %d\n", port, msg_id);
+	return true;
+}
+
+__maybe_unused static uint8_t is_sop_prime_ready(int port)
+{
+	/*
+	 * Ref: USB PD 3.0 sec 2.5.4: When an Explicit Contract is in place the
+	 * VCONN Source (either the DFP or the UFP) can communicate with the
+	 * Cable Plug(s) using SOP’/SOP’’ Packets
+	 *
+	 * Ref: USB PD 2.0 sec 2.4.4: When an Explicit Contract is in place the
+	 * DFP (either the Source or the Sink) can communicate with the
+	 * Cable Plug(s) using SOP’/SOP” Packets.
+	 * Sec 3.6.11 : Before communicating with a Cable Plug a Port Should
+	 * ensure that it is the Vconn Source
+	 */
+	return (pd_get_vconn_state(port) && (IS_ENABLED(CONFIG_USB_PD_REV30)
+		|| (pd_get_data_role(port) == PD_ROLE_DFP)));
+}
+
+void reset_pd_cable(int port)
+{
+	memset(&cable[port], 0, sizeof(cable[port]));
+	cable[port].last_sop_p_msg_id = INVALID_MSG_ID_COUNTER;
+	cable[port].last_sop_p_p_msg_id = INVALID_MSG_ID_COUNTER;
+}
+
+bool should_enter_usb4_mode(int port)
+{
+	return IS_ENABLED(CONFIG_USB_PD_USB4) &&
+		cable[port].flags & CABLE_FLAGS_ENTER_USB_MODE;
+}
+
+void enable_enter_usb4_mode(int port)
+{
+	if (IS_ENABLED(CONFIG_USB_PD_USB4))
+		cable[port].flags |= CABLE_FLAGS_ENTER_USB_MODE;
+}
+
+void disable_enter_usb4_mode(int port)
+{
+	if (IS_ENABLED(CONFIG_USB_PD_USB4))
+		cable[port].flags &= ~CABLE_FLAGS_ENTER_USB_MODE;
+}
 
 #ifdef CONFIG_USB_PD_ALT_MODE
 
 #ifdef CONFIG_USB_PD_ALT_MODE_DFP
 
-static struct pd_policy pe[CONFIG_USB_PD_PORT_COUNT];
+static struct pd_discovery
+	discovery[CONFIG_USB_PD_PORT_MAX_COUNT][DISCOVERY_TYPE_COUNT];
+static struct partner_active_modes
+	partner_amodes[CONFIG_USB_PD_PORT_MAX_COUNT][AMODE_TYPE_COUNT];
 
-void pd_dfp_pe_init(int port)
+static bool is_vdo_present(int cnt, int index)
 {
-	memset(&pe[port], 0, sizeof(struct pd_policy));
+	return cnt > index;
 }
 
-static void dfp_consume_identity(int port, int cnt, uint32_t *payload)
+static bool is_modal(int port, int cnt, const uint32_t *payload)
 {
-	int ptype = PD_IDH_PTYPE(payload[VDO_I(IDH)]);
-	size_t identity_size = MIN(sizeof(pe[port].identity),
-				   (cnt - 1) * sizeof(uint32_t));
-	pd_dfp_pe_init(port);
-	memcpy(&pe[port].identity, payload + 1, identity_size);
-	switch (ptype) {
-	case IDH_PTYPE_AMA:
-		/* TODO(tbroch) do I disable VBUS here if power contract
-		 * requested it
-		 */
-		if (!PD_VDO_AMA_VBUS_REQ(payload[VDO_I(AMA)]))
-			pd_power_supply_reset(port);
-		break;
-		/* TODO(crosbug.com/p/30645) provide vconn support here */
-	default:
-		break;
+	return is_vdo_present(cnt, VDO_INDEX_IDH) &&
+		PD_IDH_IS_MODAL(payload[VDO_INDEX_IDH]);
+}
+
+static bool is_tbt_compat_mode(int port, int cnt, const uint32_t *payload)
+{
+	/*
+	 * Ref: USB Type-C cable and connector specification
+	 * F.2.5 TBT3 Device Discover Mode Responses
+	 */
+	return is_vdo_present(cnt, VDO_INDEX_IDH) &&
+		PD_VDO_RESP_MODE_INTEL_TBT(payload[VDO_INDEX_IDH]);
+}
+
+static bool cable_supports_tbt_speed(int port)
+{
+	enum tbt_compat_cable_speed tbt_cable_speed =
+				get_tbt_cable_speed(port);
+
+	return (tbt_cable_speed == TBT_SS_TBT_GEN3 ||
+		tbt_cable_speed == TBT_SS_U32_GEN1_GEN2);
+}
+
+static bool is_tbt_compat_enabled(int port)
+{
+	return (IS_ENABLED(CONFIG_USB_PD_TBT_COMPAT_MODE) &&
+	       (cable[port].flags & CABLE_FLAGS_TBT_COMPAT_ENABLE));
+}
+
+static void enable_tbt_compat_mode(int port)
+{
+	if (IS_ENABLED(CONFIG_USB_PD_TBT_COMPAT_MODE))
+		cable[port].flags |= CABLE_FLAGS_TBT_COMPAT_ENABLE;
+}
+
+static inline void disable_tbt_compat_mode(int port)
+{
+	if (IS_ENABLED(CONFIG_USB_PD_TBT_COMPAT_MODE))
+		cable[port].flags &= ~CABLE_FLAGS_TBT_COMPAT_ENABLE;
+}
+
+static inline void limit_tbt_cable_speed(int port)
+{
+	/* Cable flags are cleared when cable reset is called */
+	cable[port].flags |= CABLE_FLAGS_TBT_COMPAT_LIMIT_SPEED;
+}
+
+static inline bool is_limit_tbt_cable_speed(int port)
+{
+	return !!(cable[port].flags & CABLE_FLAGS_TBT_COMPAT_LIMIT_SPEED);
+}
+
+static bool is_intel_svid(int port, enum tcpm_transmit_type type)
+{
+	int i;
+
+	for (i = 0; i < discovery[port][type].svid_cnt; i++) {
+		if (pd_get_svid(port, i, type) == USB_VID_INTEL)
+			return true;
 	}
+
+	return false;
 }
 
-static int dfp_discover_svids(int port, uint32_t *payload)
+static inline bool is_usb4_mode_enabled(int port)
+{
+	return (IS_ENABLED(CONFIG_USB_PD_USB4) &&
+	       (cable[port].flags & CABLE_FLAGS_USB4_CAPABLE));
+}
+
+static inline void enable_usb4_mode(int port)
+{
+	if (IS_ENABLED(CONFIG_USB_PD_USB4))
+		cable[port].flags |= CABLE_FLAGS_USB4_CAPABLE;
+}
+
+static inline void disable_usb4_mode(int port)
+{
+	if (IS_ENABLED(CONFIG_USB_PD_USB4))
+		cable[port].flags &= ~CABLE_FLAGS_USB4_CAPABLE;
+}
+
+/*
+ * Ref: USB Type-C Cable and Connector Specification
+ * Figure 5-1 USB4 Discovery and Entry Flow Model.
+ *
+ * Note: USB Type-C Cable and Connector Specification
+ * doesn't include details for Revision 2 cables.
+ *
+ *                         Passive Cable
+ *                                |
+ *                -----------------------------------
+ *                |                                 |
+ *           Revision 2                        Revision 3
+ *          USB Signalling                   USB Signalling
+ *             |                                     |
+ *     ------------------            -------------------------
+ *     |       |        |            |       |       |       |
+ * USB2.0   USB3.1    USB3.1       USB3.2   USB4   USB3.2   USB2
+ *   |      Gen1      Gen1 Gen2    Gen2     Gen3   Gen1       |
+ *   |       |          |           |        |       |       Exit
+ *   --------           ------------         --------        USB4
+ *      |                    |                  |          Discovery.
+ *    Exit          Is DFP Gen3 Capable?     Enter USB4
+ *    USB4                  |                with respective
+ *   Discovery.   --- No ---|--- Yes ---     cable speed.
+ *                |                    |
+ *    Enter USB4 with             Is Cable TBT3
+ *    respective cable                 |
+ *    speed.                 --- No ---|--- Yes ---
+ *                           |                    |
+ *                   Enter USB4 with        Enter USB4 with
+ *                   TBT Gen2 passive       TBT Gen3 passive
+ *                   cable.                 cable.
+ *
+ */
+static bool is_cable_ready_to_enter_usb4(int port, int cnt)
+{
+	/* TODO: USB4 enter mode for Active cables */
+	struct pd_discovery *disc = &discovery[port][TCPC_TX_SOP_PRIME];
+	if (IS_ENABLED(CONFIG_USB_PD_USB4) &&
+	   (get_usb_pd_cable_type(port) == IDH_PTYPE_PCABLE) &&
+	    is_vdo_present(cnt, VDO_INDEX_PTYPE_CABLE1)) {
+		switch (cable[port].rev) {
+		case PD_REV30:
+			switch (disc->identity.product_t1.p_rev30.ss) {
+			case USB_R30_SS_U40_GEN3:
+			case USB_R30_SS_U32_U40_GEN1:
+				return true;
+			case USB_R30_SS_U32_U40_GEN2:
+				/* Check if DFP is Gen 3 capable */
+				if (IS_ENABLED(CONFIG_USB_PD_TBT_GEN3_CAPABLE))
+					return false;
+				return true;
+			default:
+				disable_usb4_mode(port);
+				return false;
+			}
+		case PD_REV20:
+			switch (disc->identity.product_t1.p_rev20.ss) {
+			case USB_R20_SS_U31_GEN1_GEN2:
+				/* Check if DFP is Gen 3 capable */
+				if (IS_ENABLED(CONFIG_USB_PD_TBT_GEN3_CAPABLE))
+					return false;
+				return true;
+			default:
+				disable_usb4_mode(port);
+				return false;
+		}
+		default:
+			disable_usb4_mode(port);
+		}
+	}
+	return false;
+}
+
+void pd_dfp_discovery_init(int port)
+{
+	memset(&discovery[port], 0, sizeof(struct pd_discovery));
+	memset(&partner_amodes[port], 0, sizeof(partner_amodes[0]));
+}
+
+static int dfp_discover_ident(uint32_t *payload)
+{
+	payload[0] = VDO(USB_SID_PD, 1, CMD_DISCOVER_IDENT);
+	return 1;
+}
+
+static int dfp_discover_svids(uint32_t *payload)
 {
 	payload[0] = VDO(USB_SID_PD, 1, CMD_DISCOVER_SVID);
 	return 1;
 }
 
-static void dfp_consume_svids(int port, uint32_t *payload)
+struct pd_discovery *pd_get_am_discovery(int port, enum tcpm_transmit_type type)
 {
-	int i;
-	uint32_t *ptr = payload + 1;
-	uint16_t svid0, svid1;
-
-	for (i = pe[port].svid_cnt; i < pe[port].svid_cnt + 12; i += 2) {
-		if (i == SVID_DISCOVERY_MAX) {
-			CPRINTF("ERR:SVIDCNT\n");
-			break;
-		}
-
-		svid0 = PD_VDO_SVID_SVID0(*ptr);
-		if (!svid0)
-			break;
-		pe[port].svids[i].svid = svid0;
-		pe[port].svid_cnt++;
-
-		svid1 = PD_VDO_SVID_SVID1(*ptr);
-		if (!svid1)
-			break;
-		pe[port].svids[i + 1].svid = svid1;
-		pe[port].svid_cnt++;
-		ptr++;
-	}
-	/* TODO(tbroch) need to re-issue discover svids if > 12 */
-	if (i && ((i % 12) == 0))
-		CPRINTF("ERR:SVID+12\n");
+	return &discovery[port][type];
 }
 
+struct partner_active_modes *pd_get_partner_active_modes(int port,
+		enum tcpm_transmit_type type)
+{
+	assert(type < AMODE_TYPE_COUNT);
+	return &partner_amodes[port][type];
+}
+
+/* Note: Enter mode flag is not needed by TCPMv1 */
+void pd_set_dfp_enter_mode_flag(int port, bool set)
+{
+}
+
+/**
+ * Return the discover alternate mode payload data
+ *
+ * @param port    USB-C port number
+ * @param payload Pointer to payload data to fill
+ * @return 1 if valid SVID present else 0
+ */
 static int dfp_discover_modes(int port, uint32_t *payload)
 {
-	uint16_t svid = pe[port].svids[pe[port].svid_idx].svid;
-	if (pe[port].svid_idx >= pe[port].svid_cnt)
+	struct pd_discovery *disc = pd_get_am_discovery(port, TCPC_TX_SOP);
+	uint16_t svid = disc->svids[disc->svid_idx].svid;
+
+	if (disc->svid_idx >= disc->svid_cnt)
 		return 0;
+
 	payload[0] = VDO(svid, 1, CMD_DISCOVER_MODES);
+
 	return 1;
 }
 
-static void dfp_consume_modes(int port, int cnt, uint32_t *payload)
+static bool is_usb4_vdo(int port, int cnt, uint32_t *payload)
 {
-	int idx = pe[port].svid_idx;
-	pe[port].svids[idx].mode_cnt = cnt - 1;
-	if (pe[port].svids[idx].mode_cnt < 0) {
-		CPRINTF("ERR:NOMODE\n");
-	} else {
-		memcpy(pe[port].svids[pe[port].svid_idx].mode_vdo, &payload[1],
-		       sizeof(uint32_t) * pe[port].svids[idx].mode_cnt);
+	enum idh_ptype ptype = PD_IDH_PTYPE(payload[VDO_I(IDH)]);
+
+	if (IS_PD_IDH_UFP_PTYPE(ptype)) {
+		/*
+		 * Ref: USB Type-C Cable and Connector Specification
+		 * Figure 5-1 USB4 Discovery and Entry Flow Model
+		 * Device USB4 VDO detection.
+		 */
+		return IS_ENABLED(CONFIG_USB_PD_USB4) &&
+			is_vdo_present(cnt, VDO_INDEX_PTYPE_UFP1_VDO) &&
+			PD_PRODUCT_IS_USB4(payload[VDO_INDEX_PTYPE_UFP1_VDO]);
 	}
-
-	pe[port].svid_idx++;
+	return false;
 }
 
-static int get_mode_idx(int port, uint16_t svid)
+static int process_am_discover_ident_sop(int port, int cnt,
+					uint32_t head, uint32_t *payload,
+					enum tcpm_transmit_type *rtype)
 {
-	int i;
+	pd_dfp_discovery_init(port);
+	dfp_consume_identity(port, TCPC_TX_SOP, cnt, payload);
 
-	for (i = 0; i < PD_AMODE_COUNT; i++) {
-		if (pe[port].amodes[i].fx->svid == svid)
-			return i;
-	}
-	return -1;
-}
+	if (IS_ENABLED(CONFIG_USB_PD_DECODE_SOP) && is_sop_prime_ready(port) &&
+	    board_is_tbt_usb4_port(port)) {
 
-static struct svdm_amode_data *get_modep(int port, uint16_t svid)
-{
-	int idx = get_mode_idx(port, svid);
+		/* Enable USB4 mode if USB4 VDO present and port partner
+		 * supports USB Rev 3.0.
+		 */
+		if (is_usb4_vdo(port, cnt, payload) &&
+		    PD_HEADER_REV(head) == PD_REV30)
+			enable_usb4_mode(port);
 
-	return (idx == -1) ? NULL : &pe[port].amodes[idx];
-}
+		/*
+		 * Enable Thunderbolt-compatible mode if the modal operation is
+		 * supported.
+		 */
+		if (is_modal(port, cnt, payload))
+			enable_tbt_compat_mode(port);
 
-int pd_alt_mode(int port, uint16_t svid)
-{
-	struct svdm_amode_data *modep = get_modep(port, svid);
-
-	return (modep) ? modep->opos : -1;
-}
-
-int allocate_mode(int port, uint16_t svid)
-{
-	int i, j;
-	struct svdm_amode_data *modep;
-	int mode_idx = get_mode_idx(port, svid);
-
-	if (mode_idx != -1)
-		return mode_idx;
-
-	/* There's no space to enter another mode */
-	if (pe[port].amode_idx == PD_AMODE_COUNT) {
-		CPRINTF("ERR:NO AMODE SPACE\n");
-		return -1;
-	}
-
-	/* Allocate ...  if SVID == 0 enter default supported policy */
-	for (i = 0; i < supported_modes_cnt; i++) {
-		if (!&supported_modes[i])
-			continue;
-
-		for (j = 0; j < pe[port].svid_cnt; j++) {
-			struct svdm_svid_data *svidp = &pe[port].svids[j];
-			if ((svidp->svid != supported_modes[i].svid) ||
-			    (svid && (svidp->svid != svid)))
-				continue;
-
-			modep = &pe[port].amodes[pe[port].amode_idx];
-			modep->fx = &supported_modes[i];
-			modep->data = &pe[port].svids[j];
-			pe[port].amode_idx++;
-			return pe[port].amode_idx - 1;
+		if (is_modal(port, cnt, payload) ||
+		    is_usb4_vdo(port, cnt, payload)) {
+			*rtype = TCPC_TX_SOP_PRIME;
+			return dfp_discover_ident(payload);
 		}
 	}
-	return -1;
+
+	return dfp_discover_svids(payload);
 }
 
-/*
- * Enter default mode ( payload[0] == 0 ) or attempt to enter mode via svid &
- * opos
-*/
-uint32_t pd_dfp_enter_mode(int port, uint16_t svid, int opos)
+static int process_am_discover_ident_sop_prime(int port, int cnt,
+					uint32_t head, uint32_t *payload)
 {
-	int mode_idx = allocate_mode(port, svid);
-	struct svdm_amode_data *modep;
-	uint32_t mode_caps;
-
-	if (mode_idx == -1)
-		return 0;
-	modep = &pe[port].amodes[mode_idx];
-
-	if (!opos) {
-		/* choose the lowest as default */
-		modep->opos = 1;
-	} else if (opos <= modep->data->mode_cnt) {
-		modep->opos = opos;
-	} else {
-		CPRINTF("opos error\n");
-		return 0;
-	}
-
-	mode_caps = modep->data->mode_vdo[modep->opos - 1];
-	if (modep->fx->enter(port, mode_caps) == -1)
-		return 0;
-
-	/* SVDM to send to UFP for mode entry */
-	return VDO(modep->fx->svid, 1, CMD_ENTER_MODE | VDO_OPOS(modep->opos));
-}
-
-static int validate_mode_request(struct svdm_amode_data *modep,
-				 uint16_t svid, int opos)
-{
-	if (!modep->fx)
-		return 0;
-
-	if (svid != modep->fx->svid) {
-		CPRINTF("ERR:svid r:0x%04x != c:0x%04x\n",
-			svid, modep->fx->svid);
-		return 0;
-	}
-
-	if (opos != modep->opos) {
-		CPRINTF("ERR:opos r:%d != c:%d\n",
-			opos, modep->opos);
-		return 0;
-	}
-
-	return 1;
-}
-
-static void dfp_consume_attention(int port, uint32_t *payload)
-{
-	uint16_t svid = PD_VDO_VID(payload[0]);
-	int opos = PD_VDO_OPOS(payload[0]);
-	struct svdm_amode_data *modep = get_modep(port, svid);
-
-	if (!modep || !validate_mode_request(modep, svid, opos))
-		return;
-
-	if (modep->fx->attention)
-		modep->fx->attention(port, payload);
-}
-
-/*
- * This algorithm defaults to choosing higher pin config over lower ones.  Pin
- * configs are organized in pairs with the following breakdown.
- *
- *  NAME | SIGNALING | OUTPUT TYPE | MULTI-FUNCTION | PIN CONFIG
- * -------------------------------------------------------------
- *  A    |  USB G2   |  ?          | no             | 00_0001
- *  B    |  USB G2   |  ?          | yes            | 00_0010
- *  C    |  DP       |  CONVERTED  | no             | 00_0100
- *  D    |  PD       |  CONVERTED  | yes            | 00_1000
- *  E    |  DP       |  DP         | no             | 01_0000
- *  F    |  PD       |  DP         | yes            | 10_0000
- *
- * if UFP has NOT asserted multi-function preferred code masks away B/D/F
- * leaving only A/C/E.  For single-output dongles that should leave only one
- * possible pin config depending on whether its a converter DP->(VGA|HDMI) or DP
- * output.  If someone creates a multi-output dongle presumably they would need
- * to either offer different mode capabilities depending upon connection type or
- * the DFP would need additional system policy to expose those options.
- */
-int pd_dfp_dp_get_pin_mode(int port, uint32_t status)
-{
-	struct svdm_amode_data *modep = get_modep(port, USB_SID_DISPLAYPORT);
-	uint32_t mode_caps;
-	uint32_t pin_caps;
-	if (!modep)
-		return 0;
-
-	mode_caps = modep->data->mode_vdo[modep->opos - 1];
-
-	/* TODO(crosbug.com/p/39656) revisit with DFP that can be a sink */
-	pin_caps = PD_DP_PIN_CAPS(mode_caps);
-
-	/* if don't want multi-function then ignore those pin configs */
-	if (!PD_VDO_DPSTS_MF_PREF(status))
-		pin_caps &= ~MODE_DP_PIN_MF_MASK;
-
-	/* TODO(crosbug.com/p/39656) revisit if DFP drives USB Gen 2 signals */
-	pin_caps &= ~MODE_DP_PIN_BR2_MASK;
-
-	/* get_next_bit returns undefined for zero */
-	if (!pin_caps)
-		return 0;
-
-	return 1 << get_next_bit(&pin_caps);
-}
-
-int pd_dfp_exit_mode(int port, uint16_t svid, int opos)
-{
-	struct svdm_amode_data *modep;
-	int idx;
+	dfp_consume_identity(port, TCPC_TX_SOP_PRIME, cnt, payload);
+	cable[port].rev = PD_HEADER_REV(head);
 
 	/*
-	 * Empty svid signals we should reset DFP VDM state by exiting all
-	 * entered modes then clearing state.  This occurs when we've
-	 * disconnected or for hard reset.
+	 * Enter USB4 mode if the cable supports USB4 operation and has USB4
+	 * VDO.
 	 */
-	if (!svid) {
-		for (idx = 0; idx < PD_AMODE_COUNT; idx++)
-			if (pe[port].amodes[idx].fx)
-				pe[port].amodes[idx].fx->exit(port);
-
-		pd_dfp_pe_init(port);
+	if (is_usb4_mode_enabled(port) &&
+	    is_cable_ready_to_enter_usb4(port, cnt)) {
+		enable_enter_usb4_mode(port);
+		usb_mux_set_safe_mode(port);
+		/*
+		 * To change the mode of operation from USB4 the port needs to
+		 * be reconfigured.
+		 * Ref: USB Type-C Cable and Connectot Spec section 5.4.4.
+		 */
+		disable_tbt_compat_mode(port);
 		return 0;
 	}
 
 	/*
-	 * TODO(crosbug.com/p/33946) : below needs revisited to allow multiple
-	 * mode exit.  Additionally it should honor OPOS == 7 as DFP's request
-	 * to exit all modes.  We currently don't have any UFPs that support
-	 * multiple modes on one SVID.
+	 * Disable Thunderbolt-compatible mode if the cable does not support
+	 * superspeed.
 	 */
-	modep = get_modep(port, svid);
-	if (!modep || !validate_mode_request(modep, svid, opos))
-		return 0;
+	if (is_tbt_compat_enabled(port) && !is_tbt_cable_superspeed(port))
+		disable_tbt_compat_mode(port);
 
-	/* call DFPs exit function */
-	modep->fx->exit(port);
-	/* exit the mode */
-	modep->opos = 0;
-	return 1;
+	return dfp_discover_svids(payload);
 }
 
-uint16_t pd_get_identity_vid(int port)
+static int process_am_discover_svids(int port, int cnt, uint32_t *payload,
+				enum tcpm_transmit_type sop,
+				enum tcpm_transmit_type *rtype)
 {
-	return PD_IDH_VID(pe[port].identity[0]);
-}
+	/*
+	 * The pd_discovery structure stores SOP and SOP' discovery results
+	 * separately, but TCPMv1 depends on one-dimensional storage of SVIDs
+	 * and modes. Therefore, always use TCPC_TX_SOP in TCPMv1.
+	 */
+	dfp_consume_svids(port, sop, cnt, payload);
 
-uint16_t pd_get_identity_pid(int port)
-{
-	return PD_PRODUCT_PID(pe[port].identity[2]);
-}
+	/*
+	 * Ref: USB Type-C Cable and Connector Specification,
+	 * figure F-1: TBT3 Discovery Flow
+	 *
+	 * For USB4 mode if device or cable doesn't have Intel SVID,
+	 * disable Thunderbolt-Compatible mode directly enter USB4 mode
+	 * with USB3.2 Gen1/Gen2 speed.
+	 *
+	 * For Thunderbolt-compatible, check if 0x8087 is received for
+	 * Discover SVID SOP. If not, disable Thunderbolt-compatible mode
+	 *
+	 * If 0x8087 is not received for Discover SVID SOP' limit to TBT
+	 * passive Gen 2 cable.
+	 */
+	if (is_tbt_compat_enabled(port)) {
+		bool intel_svid = is_intel_svid(port, sop);
+		if (!intel_svid) {
+			if (is_usb4_mode_enabled(port)) {
+				disable_tbt_compat_mode(port);
+				cable[port].cable_mode_resp.tbt_cable_speed =
+					TBT_SS_U32_GEN1_GEN2;
+				enable_enter_usb4_mode(port);
+				usb_mux_set_safe_mode(port);
+				return 0;
+			}
 
-#ifdef CONFIG_CMD_USB_PD_PE
-static void dump_pe(int port)
-{
-	const char * const idh_ptype_names[]  = {
-		"UNDEF", "Hub", "Periph", "PCable", "ACable", "AMA",
-		"RSV6", "RSV7"};
-
-	int i, j, idh_ptype;
-	struct svdm_amode_data *modep;
-	uint32_t mode_caps;
-
-	if (pe[port].identity[0] == 0) {
-		ccprintf("No identity discovered yet.\n");
-		return;
-	}
-	idh_ptype = PD_IDH_PTYPE(pe[port].identity[0]);
-	ccprintf("IDENT:\n");
-	ccprintf("\t[ID Header] %08x :: %s, VID:%04x\n", pe[port].identity[0],
-		 idh_ptype_names[idh_ptype], pd_get_identity_vid(port));
-	ccprintf("\t[Cert Stat] %08x\n", pe[port].identity[1]);
-	for (i = 2; i < ARRAY_SIZE(pe[port].identity); i++) {
-		ccprintf("\t");
-		if (pe[port].identity[i])
-			ccprintf("[%d] %08x ", i, pe[port].identity[i]);
-	}
-	ccprintf("\n");
-
-	if (pe[port].svid_cnt < 1) {
-		ccprintf("No SVIDS discovered yet.\n");
-		return;
-	}
-
-	for (i = 0; i < pe[port].svid_cnt; i++) {
-		ccprintf("SVID[%d]: %04x MODES:", i, pe[port].svids[i].svid);
-		for (j = 0; j < pe[port].svids[j].mode_cnt; j++)
-			ccprintf(" [%d] %08x", j + 1,
-				 pe[port].svids[i].mode_vdo[j]);
-		ccprintf("\n");
-		modep = get_modep(port, pe[port].svids[i].svid);
-		if (modep) {
-			mode_caps = modep->data->mode_vdo[modep->opos - 1];
-			ccprintf("MODE[%d]: svid:%04x caps:%08x\n", modep->opos,
-				 modep->fx->svid, mode_caps);
+			if (sop == TCPC_TX_SOP_PRIME)
+				limit_tbt_cable_speed(port);
+			else
+				disable_tbt_compat_mode(port);
+		} else if (sop == TCPC_TX_SOP) {
+			*rtype = TCPC_TX_SOP_PRIME;
+			return dfp_discover_svids(payload);
 		}
 	}
+
+	return dfp_discover_modes(port, payload);
 }
 
-static int command_pe(int argc, char **argv)
+static int process_tbt_compat_discover_modes(int port,
+				enum tcpm_transmit_type sop, uint32_t *payload,
+				enum tcpm_transmit_type *rtype)
 {
-	int port;
-	char *e;
-	if (argc < 3)
-		return EC_ERROR_PARAM_COUNT;
-	/* command: pe <port> <subcmd> <args> */
-	port = strtoi(argv[1], &e, 10);
-	if (*e || port >= CONFIG_USB_PD_PORT_COUNT)
-		return EC_ERROR_PARAM2;
-	if (!strncasecmp(argv[2], "dump", 4))
-		dump_pe(port);
+	int rsize;
 
-	return EC_SUCCESS;
+	/* Initialize transmit type to SOP */
+	*rtype = TCPC_TX_SOP;
+
+	/*
+	 * For active cables, Enter mode: SOP', SOP'', SOP
+	 * Ref: USB Type-C Cable and Connector Specification, figure F-1: TBT3
+	 * Discovery Flow and Section F.2.7 TBT3 Cable Enter Mode Command.
+	 */
+	if (sop == TCPC_TX_SOP_PRIME) {
+		/* Store Discover Mode SOP' response */
+		cable[port].cable_mode_resp.raw_value = payload[1];
+
+		if (is_usb4_mode_enabled(port)) {
+			/*
+			 * If Cable is not Thunderbolt Gen 3
+			 * capable or Thunderbolt Gen1_Gen2
+			 * capable, disable USB4 mode and
+			 * continue flow for
+			 * Thunderbolt-compatible mode
+			 */
+			if (cable_supports_tbt_speed(port)) {
+				enable_enter_usb4_mode(port);
+				usb_mux_set_safe_mode(port);
+				return 0;
+			}
+			disable_usb4_mode(port);
+		}
+
+		/*
+		 * Send TBT3 Cable Enter Mode (SOP') for active cables,
+		 * otherwise send TBT3 Device Enter Mode (SOP).
+		 */
+		if (get_usb_pd_cable_type(port) == IDH_PTYPE_ACABLE)
+			*rtype = TCPC_TX_SOP_PRIME;
+
+		rsize = enter_tbt_compat_mode(port, *rtype, payload);
+	} else {
+		/* Store Discover Mode SOP response */
+		cable[port].dev_mode_resp.raw_value = payload[1];
+
+		if (is_limit_tbt_cable_speed(port)) {
+			/*
+			 * Passive cable has Nacked for Discover SVID.
+			 * No need to do Discover modes of cable.
+			 * Enter into device Thunderbolt-compatible mode.
+			 */
+			rsize = enter_tbt_compat_mode(port, *rtype, payload);
+		} else {
+			/* Discover modes for SOP' */
+			discovery[port][TCPC_TX_SOP].svid_idx--;
+			rsize = dfp_discover_modes(port, payload);
+			*rtype = TCPC_TX_SOP_PRIME;
+		}
+	}
+
+	return rsize;
 }
 
-DECLARE_CONSOLE_COMMAND(pe, command_pe,
-			"<port> dump",
-			"USB PE");
-#endif /* CONFIG_CMD_USB_PD_PE */
+static int obj_cnt_enter_tbt_compat_mode(int port,
+		enum tcpm_transmit_type sop, uint32_t *payload,
+		enum tcpm_transmit_type *rtype)
+{
+	struct pd_discovery *disc = &discovery[port][TCPC_TX_SOP_PRIME];
 
+	/* Enter mode SOP' for active cables */
+	if (sop == TCPC_TX_SOP_PRIME) {
+		/* Check if the cable has a SOP'' controller */
+		if (disc->identity.product_t1.a_rev20.sop_p_p)
+			*rtype = TCPC_TX_SOP_PRIME_PRIME;
+		return enter_tbt_compat_mode(port, *rtype, payload);
+	}
+
+	/* Enter Mode SOP'' for active cables with SOP'' controller */
+	if (sop == TCPC_TX_SOP_PRIME_PRIME)
+		return enter_tbt_compat_mode(port, *rtype, payload);
+
+	/* Update Mux state to Thunderbolt-compatible mode. */
+	set_tbt_compat_mode_ready(port);
+	/* No response once device (and cable) acks */
+	return 0;
+}
 #endif /* CONFIG_USB_PD_ALT_MODE_DFP */
 
-int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload)
+int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload,
+		uint32_t head, enum tcpm_transmit_type *rtype)
 {
 	int cmd = PD_VDO_CMD(payload[0]);
 	int cmd_type = PD_VDO_CMDT(payload[0]);
 	int (*func)(int port, uint32_t *payload) = NULL;
 
 	int rsize = 1; /* VDM header at a minimum */
+
+#ifdef CONFIG_USB_PD_ALT_MODE_DFP
+	enum tcpm_transmit_type sop = PD_HEADER_GET_SOP(head);
+#endif
+
+	/* Transmit SOP messages by default */
+	*rtype = TCPC_TX_SOP;
 
 	payload[0] &= ~VDO_CMDT_MASK;
 	*rpayload = payload;
@@ -644,10 +666,12 @@ int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload)
 			func = svdm_rsp.enter_mode;
 			break;
 		case CMD_DP_STATUS:
-			func = svdm_rsp.amode->status;
+			if (svdm_rsp.amode)
+				func = svdm_rsp.amode->status;
 			break;
 		case CMD_DP_CONFIG:
-			func = svdm_rsp.amode->config;
+			if (svdm_rsp.amode)
+				func = svdm_rsp.amode->config;
 			break;
 		case CMD_EXIT_MODE:
 			func = svdm_rsp.exit_mode;
@@ -678,38 +702,75 @@ int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload)
 			payload[0] |= VDO_CMDT(CMDT_RSP_BUSY);
 			rsize = 1;
 		}
+		payload[0] |= VDO_SVDM_VERS(pd_get_vdo_ver(port, TCPC_TX_SOP));
 	} else if (cmd_type == CMDT_RSP_ACK) {
 #ifdef CONFIG_USB_PD_ALT_MODE_DFP
 		struct svdm_amode_data *modep;
 
-		modep = get_modep(port, PD_VDO_VID(payload[0]));
+		modep = pd_get_amode_data(port, TCPC_TX_SOP,
+				PD_VDO_VID(payload[0]));
 #endif
 		switch (cmd) {
 #ifdef CONFIG_USB_PD_ALT_MODE_DFP
 		case CMD_DISCOVER_IDENT:
-			dfp_consume_identity(port, cnt, payload);
-			rsize = dfp_discover_svids(port, payload);
+			/* Received a SOP' Discover Ident msg */
+			if (sop == TCPC_TX_SOP_PRIME) {
+				rsize = process_am_discover_ident_sop_prime(
+						port, cnt, head, payload);
+			/* Received a SOP Discover Ident Message */
+			} else {
+				rsize = process_am_discover_ident_sop(port,
+						cnt, head, payload, rtype);
+			}
+#ifdef CONFIG_CHARGE_MANAGER
+			if (pd_charge_from_device(pd_get_identity_vid(port),
+						  pd_get_identity_pid(port)))
+				charge_manager_update_dualrole(port,
+							       CAP_DEDICATED);
+#endif
 			break;
 		case CMD_DISCOVER_SVID:
-			dfp_consume_svids(port, payload);
-			rsize = dfp_discover_modes(port, payload);
+			rsize = process_am_discover_svids(port, cnt, payload,
+							  sop, rtype);
 			break;
 		case CMD_DISCOVER_MODES:
-			dfp_consume_modes(port, cnt, payload);
+			dfp_consume_modes(port, sop, cnt, payload);
+			if (is_tbt_compat_enabled(port) &&
+				is_tbt_compat_mode(port, cnt, payload)) {
+				rsize = process_tbt_compat_discover_modes(
+					      port, sop, payload, rtype);
+				break;
+			}
+
 			rsize = dfp_discover_modes(port, payload);
 			/* enter the default mode for DFP */
 			if (!rsize) {
-				payload[0] = pd_dfp_enter_mode(port, 0, 0);
+				/*
+				 * Disabling Thunderbolt-Compatible mode if
+				 * discover mode response doesn't include Intel
+				 * SVID.
+				 */
+				disable_tbt_compat_mode(port);
+				payload[0] = pd_dfp_enter_mode(port,
+						TCPC_TX_SOP, 0, 0);
 				if (payload[0])
 					rsize = 1;
 			}
 			break;
 		case CMD_ENTER_MODE:
-			if (!modep) {
+			if (is_tbt_compat_enabled(port)) {
+				rsize = obj_cnt_enter_tbt_compat_mode(port,
+							sop, payload, rtype);
+			/*
+			 * Continue with PD flow if Thunderbolt-compatible mode
+			 * is disabled.
+			 */
+			} else if (!modep) {
 				rsize = 0;
 			} else {
 				if (!modep->opos)
-					pd_dfp_enter_mode(port, 0, 0);
+					pd_dfp_enter_mode(port, TCPC_TX_SOP, 0,
+							0);
 
 				if (modep->opos) {
 					rsize = modep->fx->status(port,
@@ -748,6 +809,7 @@ int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload)
 		}
 
 		payload[0] |= VDO_CMDT(CMDT_INIT);
+		payload[0] |= VDO_SVDM_VERS(pd_get_vdo_ver(port, TCPC_TX_SOP));
 #ifdef CONFIG_USB_PD_ALT_MODE_DFP
 	} else if (cmd_type == CMDT_RSP_BUSY) {
 		switch (cmd) {
@@ -769,8 +831,15 @@ int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload)
 			rsize = 0;
 		}
 	} else if (cmd_type == CMDT_RSP_NAK) {
-		/* nothing to do */
-		rsize = 0;
+		/* Passive cable Nacked for Discover SVID */
+		if (cmd == CMD_DISCOVER_SVID && is_tbt_compat_enabled(port) &&
+		    sop == TCPC_TX_SOP_PRIME &&
+		    get_usb_pd_cable_type(port) == IDH_PTYPE_PCABLE) {
+			limit_tbt_cable_speed(port);
+			rsize = dfp_discover_modes(port, payload);
+		} else {
+			rsize = 0;
+		}
 #endif /* CONFIG_USB_PD_ALT_MODE_DFP */
 	} else {
 		CPRINTF("ERR:CMDT:%d\n", cmd);
@@ -782,91 +851,13 @@ int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload)
 
 #else
 
-int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload)
+int pd_svdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload,
+		uint32_t head, enum tcpm_transmit_type *rtype)
 {
 	return 0;
 }
 
 #endif /* CONFIG_USB_PD_ALT_MODE */
-
-#ifndef CONFIG_USB_PD_CUSTOM_VDM
-int pd_vdm(int port, int cnt, uint32_t *payload, uint32_t **rpayload)
-{
-	return 0;
-}
-#endif /* !CONFIG_USB_PD_CUSTOM_VDM */
-
-static void pd_usb_billboard_deferred(void)
-{
-#if defined(CONFIG_USB_PD_ALT_MODE) && !defined(CONFIG_USB_PD_ALT_MODE_DFP) \
-	&& !defined(CONFIG_USB_PD_SIMPLE_DFP) && defined(CONFIG_USB_BOS)
-
-	/*
-	 * TODO(tbroch)
-	 * 1. Will we have multiple type-C port UFPs
-	 * 2. Will there be other modes applicable to DFPs besides DP
-	 */
-	if (!pd_alt_mode(0, USB_SID_DISPLAYPORT))
-		usb_connect();
-
-#endif
-}
-DECLARE_DEFERRED(pd_usb_billboard_deferred);
-
-#ifdef CONFIG_USB_PD_ALT_MODE_DFP
-static int hc_remote_pd_discovery(struct host_cmd_handler_args *args)
-{
-	const uint8_t *port = args->params;
-	struct ec_params_usb_pd_discovery_entry *r = args->response;
-
-	if (*port >= CONFIG_USB_PD_PORT_COUNT)
-		return EC_RES_INVALID_PARAM;
-
-	r->vid = pd_get_identity_vid(*port);
-	r->ptype = PD_IDH_PTYPE(pe[*port].identity[0]);
-	/* pid only included if vid is assigned */
-	if (r->vid)
-		r->pid = PD_PRODUCT_PID(pe[*port].identity[2]);
-
-	args->response_size = sizeof(*r);
-	return EC_RES_SUCCESS;
-}
-DECLARE_HOST_COMMAND(EC_CMD_USB_PD_DISCOVERY,
-		     hc_remote_pd_discovery,
-		     EC_VER_MASK(0));
-
-static int hc_remote_pd_get_amode(struct host_cmd_handler_args *args)
-{
-	struct svdm_amode_data *modep;
-	const struct ec_params_usb_pd_get_mode_request *p = args->params;
-	struct ec_params_usb_pd_get_mode_response *r = args->response;
-
-	if (p->port >= CONFIG_USB_PD_PORT_COUNT)
-		return EC_RES_INVALID_PARAM;
-
-	/* no more to send */
-	if (p->svid_idx >= pe[p->port].svid_cnt) {
-		r->svid = 0;
-		args->response_size = sizeof(r->svid);
-		return EC_RES_SUCCESS;
-	}
-
-	r->svid = pe[p->port].svids[p->svid_idx].svid;
-	r->opos = 0;
-	memcpy(r->vdo, pe[p->port].svids[p->svid_idx].mode_vdo, 24);
-	modep = get_modep(p->port, r->svid);
-
-	if (modep)
-		r->opos = pd_alt_mode(p->port, r->svid);
-
-	args->response_size = sizeof(*r);
-	return EC_RES_SUCCESS;
-}
-DECLARE_HOST_COMMAND(EC_CMD_USB_PD_GET_AMODE,
-		     hc_remote_pd_get_amode,
-		     EC_VER_MASK(0));
-
-#endif
 
 #define FW_RW_END (CONFIG_EC_WRITABLE_STORAGE_OFF + \
 		   CONFIG_RW_STORAGE_OFF + CONFIG_RW_SIZE)
@@ -899,8 +890,8 @@ void pd_get_info(uint32_t *info_data)
 	defined(CONFIG_USB_PD_HW_DEV_ID_BOARD_MINOR)
 	info_data[5] = VDO_INFO(CONFIG_USB_PD_HW_DEV_ID_BOARD_MAJOR,
 				CONFIG_USB_PD_HW_DEV_ID_BOARD_MINOR,
-				ver_get_numcommits(),
-				(system_get_image_copy() != SYSTEM_IMAGE_RO));
+				ver_get_num_commits(system_get_image_copy()),
+				(system_get_image_copy() != EC_IMAGE_RO));
 #else
 	info_data[5] = 0;
 #endif
@@ -913,7 +904,7 @@ int pd_custom_flash_vdm(int port, int cnt, uint32_t *payload)
 
 	switch (PD_VDO_CMD(payload[0])) {
 	case VDO_CMD_VERSION:
-		memcpy(payload + 1, &version_data.version, 24);
+		memcpy(payload + 1, &current_image_data.version, 24);
 		rsize = 7;
 		break;
 	case VDO_CMD_REBOOT:
@@ -928,7 +919,7 @@ int pd_custom_flash_vdm(int port, int cnt, uint32_t *payload)
 		break;
 	case VDO_CMD_FLASH_ERASE:
 		/* do not kill the code under our feet */
-		if (system_get_image_copy() != SYSTEM_IMAGE_RO)
+		if (system_get_image_copy() != EC_IMAGE_RO)
 			break;
 		pd_log_event(PD_EVENT_ACC_RW_ERASE, 0, 0, NULL);
 		flash_offset = CONFIG_EC_WRITABLE_STORAGE_OFF +
@@ -939,7 +930,7 @@ int pd_custom_flash_vdm(int port, int cnt, uint32_t *payload)
 		break;
 	case VDO_CMD_FLASH_WRITE:
 		/* do not kill the code under our feet */
-		if ((system_get_image_copy() != SYSTEM_IMAGE_RO) ||
+		if ((system_get_image_copy() != EC_IMAGE_RO) ||
 		    (flash_offset < CONFIG_EC_WRITABLE_STORAGE_OFF +
 				    CONFIG_RW_STORAGE_OFF))
 			break;
@@ -966,22 +957,3 @@ int pd_custom_flash_vdm(int port, int cnt, uint32_t *payload)
 	}
 	return rsize;
 }
-
-#ifdef CONFIG_USB_PD_DISCHARGE
-void pd_set_vbus_discharge(int port, int enable)
-{
-	static struct mutex discharge_lock[CONFIG_USB_PD_PORT_COUNT];
-
-	mutex_lock(&discharge_lock[port]);
-	enable &= !board_vbus_source_enabled(port);
-#ifdef CONFIG_USB_PD_DISCHARGE_GPIO
-	gpio_set_level(port ? GPIO_USB_C1_DISCHARGE :
-			      GPIO_USB_C0_DISCHARGE, enable);
-#elif defined(CONFIG_USB_PD_DISCHARGE_TCPC)
-	tcpc_discharge_vbus(port, enable);
-#else
-#error "PD discharge implementation not defined"
-#endif
-	mutex_unlock(&discharge_lock[port]);
-}
-#endif /* CONFIG_USB_PD_DISCHARGE */

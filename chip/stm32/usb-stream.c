@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -12,19 +12,20 @@
 #include "task.h"
 #include "timer.h"
 #include "util.h"
-#include "usb_descriptor.h"
+#include "usart.h"
+#include "usb_hw.h"
 #include "usb-stream.h"
 
 static size_t rx_read(struct usb_stream_config const *config)
 {
 	uintptr_t address = btable_ep[config->endpoint].rx_addr;
-	size_t    count   = btable_ep[config->endpoint].rx_count & 0x3ff;
+	size_t count = btable_ep[config->endpoint].rx_count & RX_COUNT_MASK;
 
 	/*
 	 * Only read the received USB packet if there is enough space in the
 	 * receive queue.
 	 */
-	if (count >= queue_space(config->producer.queue))
+	if (count > queue_space(config->producer.queue))
 		return 0;
 
 	return queue_add_memcpy(config->producer.queue,
@@ -77,22 +78,12 @@ static void usb_written(struct consumer const *consumer, size_t count)
 	hook_call_deferred(config->deferred, 0);
 }
 
-static void usb_flush(struct consumer const *consumer)
-{
-	struct usb_stream_config const *config =
-		DOWNCAST(consumer, struct usb_stream_config, consumer);
-
-	while (tx_valid(config) || queue_count(consumer->queue))
-		;
-}
-
 struct producer_ops const usb_stream_producer_ops = {
 	.read = usb_read,
 };
 
 struct consumer_ops const usb_stream_consumer_ops = {
 	.written = usb_written,
-	.flush   = usb_flush,
 };
 
 void usb_stream_deferred(struct usb_stream_config const *config)
@@ -126,9 +117,15 @@ static usb_uint usb_ep_rx_size(size_t bytes)
 		return 0x8000 | ((bytes - 32) << 5);
 }
 
-void usb_stream_reset(struct usb_stream_config const *config)
+void usb_stream_event(struct usb_stream_config const *config,
+		      enum usb_ep_event evt)
 {
-	int i = config->endpoint;
+	int i;
+
+	if (evt != USB_EVENT_RESET)
+		return;
+
+	i = config->endpoint;
 
 	btable_ep[i].tx_addr  = usb_sram_addr(config->tx_ram);
 	btable_ep[i].tx_count = 0;
@@ -142,4 +139,42 @@ void usb_stream_reset(struct usb_stream_config const *config)
 			   (2 <<  4) | /* TX NAK */
 			   (0 <<  9) | /* Bulk EP */
 			   (rx_disabled(config) ? EP_RX_NAK : EP_RX_VALID));
+}
+
+int usb_usart_interface(struct usb_stream_config const *config,
+			struct usart_config const *usart,
+			int interface,
+			usb_uint *rx_buf, usb_uint *tx_buf)
+{
+	struct usb_setup_packet req;
+
+	usb_read_setup_packet(rx_buf, &req);
+
+	if (req.bmRequestType != (USB_DIR_OUT |
+				  USB_TYPE_VENDOR |
+				  USB_RECIP_INTERFACE))
+		return -1;
+
+	if (req.wIndex  != interface ||
+	    req.wLength != 0)
+		return -1;
+
+	switch (req.bRequest) {
+	/* Set parity. */
+	case USB_USART_SET_PARITY:
+		usart_set_parity(usart, req.wValue);
+		break;
+	case USB_USART_SET_BAUD:
+		usart_set_baud(usart, req.wValue * 100);
+		break;
+
+	/* TODO(nsanders): support reading parity. */
+	/* TODO(nsanders): support reading baud. */
+	default:
+		return -1;
+	}
+
+	btable_ep[0].tx_count = 0;
+	STM32_TOGGLE_EP(0, EP_TX_RX_MASK, EP_TX_RX_VALID, EP_STATUS_OUT);
+	return 0;
 }

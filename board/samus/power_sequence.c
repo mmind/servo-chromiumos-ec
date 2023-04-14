@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -65,9 +65,10 @@
 static int throttle_cpu;      /* Throttle CPU? */
 static uint32_t pp5000_in_g3; /* Turn PP5000 on in G3? */
 
-void chipset_force_shutdown(void)
+void chipset_force_shutdown(enum chipset_shutdown_reason reason)
 {
-	CPRINTS("%s()", __func__);
+	CPRINTS("%s(%d)", __func__, reason);
+	report_ap_reset(reason);
 
 	/*
 	 * Force off. This condition will reset once the state machine
@@ -111,41 +112,23 @@ static void chipset_reset_rtc(void)
 	udelay(10 * MSEC);
 }
 
-void chipset_reset(int cold_reset)
+void chipset_reset(enum chipset_reset_reason reason)
 {
-	CPRINTS("%s(%d)", __func__, cold_reset);
-	if (cold_reset) {
-		/*
-		 * Drop and restore PWROK.  This causes the PCH to reboot,
-		 * regardless of its after-G3 setting.  This type of reboot
-		 * causes the PCH to assert PLTRST#, SLP_S3#, and SLP_S5#, so
-		 * we actually drop power to the rest of the system (hence, a
-		 * "cold" reboot).
-		 */
+	CPRINTS("%s(%d)", __func__, reason);
+	report_ap_reset(reason);
 
-		/* Ignore if PWROK is already low */
-		if (gpio_get_level(GPIO_PCH_PWROK) == 0)
-			return;
+	/*
+	 * Send a RCIN# pulse to the PCH.  This just causes it to
+	 * assert INIT# to the CPU without dropping power or asserting
+	 * PLTRST# to reset the rest of the system.
+	 */
 
-		/* PWROK must deassert for at least 3 RTC clocks = 91 us */
-		gpio_set_level(GPIO_PCH_PWROK, 0);
-		udelay(100);
-		gpio_set_level(GPIO_PCH_PWROK, 1);
-
-	} else {
-		/*
-		 * Send a RCIN# pulse to the PCH.  This just causes it to
-		 * assert INIT# to the CPU without dropping power or asserting
-		 * PLTRST# to reset the rest of the system.
-		 */
-
-		/*
-		 * Pulse must be at least 16 PCI clocks long = 500 ns.
-		 */
-		gpio_set_level(GPIO_PCH_RCIN_L, 0);
-		udelay(10);
-		gpio_set_level(GPIO_PCH_RCIN_L, 1);
-	}
+	/*
+	 * Pulse must be at least 16 PCI clocks long = 500 ns.
+	 */
+	gpio_set_level(GPIO_PCH_RCIN_L, 0);
+	udelay(10);
+	gpio_set_level(GPIO_PCH_RCIN_L, 1);
 }
 
 void chipset_throttle_cpu(int throttle)
@@ -203,7 +186,7 @@ enum power_state power_handle_state(enum power_state state)
 		/* Check for state transitions */
 		if (!power_has_signals(IN_PGOOD_S3)) {
 			/* Required rail went away */
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_POWERFAIL);
 			return POWER_S3S5;
 		} else if (gpio_get_level(GPIO_PCH_SLP_S3_L) == 1) {
 			/* Power up to next state */
@@ -217,7 +200,7 @@ enum power_state power_handle_state(enum power_state state)
 	case POWER_S0:
 		if (!power_has_signals(IN_PGOOD_S0)) {
 			/* Required rail went away */
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_POWERFAIL);
 			return POWER_S0S3;
 		} else if (gpio_get_level(GPIO_PCH_SLP_S3_L) == 0) {
 			/* Power down to next state */
@@ -310,7 +293,7 @@ enum power_state power_handle_state(enum power_state state)
 		if (power_wait_signals(IN_PGOOD_S3)) {
 			gpio_set_level(GPIO_PP1800_EN, 0);
 			gpio_set_level(GPIO_PP1200_EN, 0);
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_WAIT);
 			return POWER_S5;
 		}
 
@@ -357,7 +340,7 @@ enum power_state power_handle_state(enum power_state state)
 			gpio_set_level(GPIO_TOUCHSCREEN_RESET_L, 0);
 			wireless_set_state(WIRELESS_OFF);
 			gpio_set_level(GPIO_PP3300_DSW_GATED_EN, 1);
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_WAIT);
 			return POWER_S3;
 		}
 
@@ -396,7 +379,7 @@ enum power_state power_handle_state(enum power_state state)
 			gpio_set_level(GPIO_TOUCHSCREEN_RESET_L, 0);
 			gpio_set_level(GPIO_PP3300_DSW_GATED_EN, 1);
 			wireless_set_state(WIRELESS_OFF);
-			chipset_force_shutdown();
+			chipset_force_shutdown(CHIPSET_SHUTDOWN_WAIT);
 			return POWER_S3;
 		}
 
@@ -479,6 +462,9 @@ enum power_state power_handle_state(enum power_state state)
 		gpio_set_level(GPIO_TOUCHSCREEN_RESET_L, 0);
 		gpio_set_level(GPIO_LIGHTBAR_RESET_L, 0);
 
+		/* Call hooks after we remove power rails */
+		hook_notify(HOOK_CHIPSET_SHUTDOWN_COMPLETE);
+
 		return power_get_pause_in_s5() ? POWER_S5 : POWER_S5G3;
 
 	case POWER_S5G3:
@@ -518,7 +504,7 @@ void set_pp5000_in_g3(int mask, int enable)
 	if (enable)
 		atomic_or(&pp5000_in_g3, mask);
 	else
-		atomic_clear(&pp5000_in_g3, mask);
+		atomic_clear_bits(&pp5000_in_g3, mask);
 
 	/* if we are in G3 now, then set the rail accordingly */
 	if (chipset_in_state(CHIPSET_STATE_HARD_OFF))

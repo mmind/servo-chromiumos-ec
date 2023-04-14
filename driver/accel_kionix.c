@@ -17,6 +17,7 @@
 #include "driver/accel_kxcj9.h"
 #include "i2c.h"
 #include "math_util.h"
+#include "motion_orientation.h"
 #include "spi.h"
 #include "task.h"
 #include "util.h"
@@ -40,6 +41,9 @@
 #else
 #define T(s_) V(s_)
 #endif /* !defined(CONFIG_ACCEL_KXCJ9) || !defined(CONFIG_ACCEL_KX022) */
+
+STATIC_IF(CONFIG_KX022_ORIENTATION_SENSOR) int check_orientation_locked(
+					const struct motion_sensor_t *s);
 
 /* List of range values in +/-G's and their associated register values. */
 static const struct accel_param_pair ranges[][3] = {
@@ -133,24 +137,27 @@ static int find_param_index(const int eng_val, const int round_up,
 /**
  * Read register from accelerometer.
  */
-static int raw_read8(const int port, const int addr, const int reg,
-					 int *data_ptr)
+static int raw_read8(const int port,
+		     const uint16_t i2c_spi_addr_flags,
+		     const int reg, int *data_ptr)
 {
 	int rv = EC_ERROR_INVAL;
 
-	if (KIONIX_IS_SPI(addr)) {
+	if (SLAVE_IS_SPI(i2c_spi_addr_flags)) {
 #ifdef CONFIG_SPI_ACCEL_PORT
 		uint8_t val;
 		uint8_t cmd = 0x80 | reg;
 
-		rv = spi_transaction(&spi_devices[KIONIX_SPI_ADDRESS(addr)],
-				     &cmd, 1, &val, 1);
+		rv = spi_transaction(
+			&spi_devices[SLAVE_GET_SPI_ADDR(i2c_spi_addr_flags)],
+			&cmd, 1, &val, 1);
 		if (rv == EC_SUCCESS)
 			*data_ptr = val;
 
 #endif
 	} else {
-		rv = i2c_read8(port, addr, reg, data_ptr);
+		rv = i2c_read8(port, i2c_spi_addr_flags,
+			       reg, data_ptr);
 	}
 	return rv;
 }
@@ -158,39 +165,43 @@ static int raw_read8(const int port, const int addr, const int reg,
 /**
  * Write register from accelerometer.
  */
-static int raw_write8(const int port, const int addr, const int reg, int data)
+static int raw_write8(const int port,
+		      const uint16_t i2c_spi_addr_flags,
+		      const int reg, int data)
 {
 	int rv = EC_ERROR_INVAL;
 
-	if (KIONIX_IS_SPI(addr)) {
+	if (SLAVE_IS_SPI(i2c_spi_addr_flags)) {
 #ifdef CONFIG_SPI_ACCEL_PORT
 		uint8_t cmd[2] = { reg, data };
 
-		rv = spi_transaction(&spi_devices[KIONIX_SPI_ADDRESS(addr)],
-				     cmd, 2, NULL, 0);
+		rv = spi_transaction(
+			&spi_devices[SLAVE_GET_SPI_ADDR(i2c_spi_addr_flags)],
+			cmd, 2, NULL, 0);
 #endif
 	} else {
-		rv = i2c_write8(port, addr, reg, data);
+		rv = i2c_write8(port, i2c_spi_addr_flags,
+				reg, data);
 	}
 	return rv;
 }
 
-static int raw_read_multi(const int port, int addr, uint8_t reg,
-			  uint8_t *rxdata, int rxlen)
+static int raw_read_multi(const int port,
+			  const uint16_t i2c_spi_addr_flags,
+			  uint8_t reg, uint8_t *rxdata, int rxlen)
 {
 	int rv = EC_ERROR_INVAL;
 
-	if (KIONIX_IS_SPI(addr)) {
+	if (SLAVE_IS_SPI(i2c_spi_addr_flags)) {
 #ifdef CONFIG_SPI_ACCEL_PORT
 		reg |= 0x80;
-		rv = spi_transaction(&spi_devices[KIONIX_SPI_ADDRESS(addr)],
-				     &reg, 1, rxdata, rxlen);
+		rv = spi_transaction(
+			&spi_devices[SLAVE_GET_SPI_ADDR(i2c_spi_addr_flags)],
+			&reg, 1, rxdata, rxlen);
 #endif
 	} else {
-		i2c_lock(port, 1);
-		rv = i2c_xfer(port, addr, &reg, 1, rxdata, rxlen,
-			      I2C_XFER_SINGLE);
-		i2c_lock(port, 0);
+		rv = i2c_read_block(port, i2c_spi_addr_flags,
+				    reg, rxdata, rxlen);
 	}
 	return rv;
 }
@@ -218,13 +229,15 @@ static int disable_sensor(const struct motion_sensor_t *s, int *reg_val)
 	 * so that we can restore it later.
 	 */
 	for (i = 0; i < SENSOR_ENABLE_ATTEMPTS; i++) {
-		ret = raw_read8(s->port, s->addr, reg, reg_val);
+		ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+				reg, reg_val);
 		if (ret != EC_SUCCESS)
 			continue;
 
 		*reg_val &= ~pc1_field;
 
-		ret = raw_write8(s->port, s->addr, reg, *reg_val);
+		ret = raw_write8(s->port, s->i2c_spi_addr_flags,
+				 reg, *reg_val);
 		if (ret == EC_SUCCESS)
 			return EC_SUCCESS;
 	}
@@ -249,13 +262,20 @@ static int enable_sensor(const struct motion_sensor_t *s, int reg_val)
 	pc1_field = KIONIX_PC1_FIELD(V(s));
 
 	for (i = 0; i < SENSOR_ENABLE_ATTEMPTS; i++) {
-		ret = raw_read8(s->port, s->addr, reg, &reg_val);
+		ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+				reg, &reg_val);
 		if (ret != EC_SUCCESS)
 			continue;
 
+		/* Enable tilt orientation mode  if lid sensor */
+		if (IS_ENABLED(CONFIG_KX022_ORIENTATION_SENSOR) &&
+		    (s->location == MOTIONSENSE_LOC_LID) &&
+		    (V(s) == 0))
+			reg_val |= KX022_CNTL1_TPE;
+
 		/* Enable accelerometer based on reg_val value. */
-		ret = raw_write8(s->port, s->addr, reg,
-				reg_val | pc1_field);
+		ret = raw_write8(s->port, s->i2c_spi_addr_flags,
+				 reg, reg_val | pc1_field);
 
 		/* On first success, we are done. */
 		if (ret == EC_SUCCESS)
@@ -289,7 +309,8 @@ static int set_value(const struct motion_sensor_t *s, int reg, int val,
 
 	/* Determine new value of control reg and attempt to write it. */
 	reg_val_new = (reg_val & ~field) | val;
-	ret = raw_write8(s->port, s->addr, reg, reg_val_new);
+	ret = raw_write8(s->port, s->i2c_spi_addr_flags,
+			 reg, reg_val_new);
 
 	/* If successfully written, then save the range. */
 	if (ret == EC_SUCCESS)
@@ -300,10 +321,9 @@ static int set_value(const struct motion_sensor_t *s, int reg, int val,
 	return ret;
 }
 
-static int set_range(const struct motion_sensor_t *s, int range, int rnd)
+static int set_range(struct motion_sensor_t *s, int range, int rnd)
 {
 	int ret, index, reg, range_field, range_val;
-	struct kionix_accel_data *data = s->drv_data;
 
 	/* Find index for interface pair matching the specified range. */
 	index = find_param_index(range, rnd, ranges[T(s)],
@@ -314,14 +334,8 @@ static int set_range(const struct motion_sensor_t *s, int range, int rnd)
 
 	ret = set_value(s, reg, range_val, range_field);
 	if (ret == EC_SUCCESS)
-		data->sensor_range = index;
+		s->current_range = ranges[T(s)][index].val;
 	return ret;
-}
-
-static int get_range(const struct motion_sensor_t *s)
-{
-	struct kionix_accel_data *data = s->drv_data;
-	return ranges[T(s)][data->sensor_range].val;
 }
 
 static int set_resolution(const struct motion_sensor_t *s, int res, int rnd)
@@ -338,14 +352,15 @@ static int set_resolution(const struct motion_sensor_t *s, int res, int rnd)
 
 	ret = set_value(s, reg, res_val, res_field);
 	if (ret == EC_SUCCESS)
-		data->sensor_resolution = index;
+		data->sensor_resolution = resolutions[T(s)][index].val;
 	return ret;
 }
 
 static int get_resolution(const struct motion_sensor_t *s)
 {
 	struct kionix_accel_data *data = s->drv_data;
-	return resolutions[T(s)][data->sensor_resolution].val;
+
+	return data->sensor_resolution;
 }
 
 static int set_data_rate(const struct motion_sensor_t *s, int rate, int rnd)
@@ -362,14 +377,15 @@ static int set_data_rate(const struct motion_sensor_t *s, int rate, int rnd)
 
 	ret = set_value(s, reg, odr_val, odr_field);
 	if (ret == EC_SUCCESS)
-		data->sensor_datarate = index;
+		data->base.odr =  datarates[T(s)][index].val;
 	return ret;
 }
 
 static int get_data_rate(const struct motion_sensor_t *s)
 {
 	struct kionix_accel_data *data = s->drv_data;
-	return datarates[T(s)][data->sensor_datarate].val;
+
+	return data->base.odr;
 }
 
 static int set_offset(const struct motion_sensor_t *s, const int16_t *offset,
@@ -394,17 +410,90 @@ static int get_offset(const struct motion_sensor_t *s, int16_t *offset,
 	return EC_SUCCESS;
 }
 
-static int read(const struct motion_sensor_t *s, vector_3_t v)
+static __maybe_unused enum motionsensor_orientation kx022_convert_orientation(
+		const struct motion_sensor_t *s,
+		int orientation)
+{
+	enum motionsensor_orientation res = MOTIONSENSE_ORIENTATION_UNKNOWN;
+
+	switch (orientation) {
+	case KX022_ORIENT_PORTRAIT:
+		res = MOTIONSENSE_ORIENTATION_PORTRAIT;
+		break;
+	case KX022_ORIENT_INVERT_PORTRAIT:
+		res = MOTIONSENSE_ORIENTATION_UPSIDE_DOWN_PORTRAIT;
+		break;
+	case KX022_ORIENT_LANDSCAPE:
+		res = MOTIONSENSE_ORIENTATION_LANDSCAPE;
+		break;
+	case KX022_ORIENT_INVERT_LANDSCAPE:
+		res = MOTIONSENSE_ORIENTATION_UPSIDE_DOWN_LANDSCAPE;
+		break;
+	default:
+		break;
+	}
+	res = motion_orientation_remap(s, res);
+	return res;
+}
+
+#ifdef CONFIG_KX022_ORIENTATION_SENSOR
+static int check_orientation_locked(const struct motion_sensor_t *s)
+{
+	struct kionix_accel_data *data = s->drv_data;
+	int orientation, raw_orientation;
+	int ret;
+
+	ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+			KX022_TSCP, &raw_orientation);
+	if (ret != EC_SUCCESS)
+		return ret;
+
+	/* mask off up and down events, we don't care about those */
+	raw_orientation &= KX022_ORIENT_MASK;
+	if (raw_orientation && (raw_orientation != data->raw_orientation)) {
+		data->raw_orientation = raw_orientation;
+		orientation = kx022_convert_orientation(s, raw_orientation);
+		*motion_orientation_ptr(s) = orientation;
+	}
+	return ret;
+}
+
+bool motion_orientation_changed(const struct motion_sensor_t *s)
+{
+	return ((struct kionix_accel_data *)s->drv_data)->orientation !=
+		((struct kionix_accel_data *)s->drv_data)->last_orientation;
+}
+
+enum motionsensor_orientation *motion_orientation_ptr(
+		const struct motion_sensor_t *s)
+{
+	return &((struct kionix_accel_data *)s->drv_data)->orientation;
+}
+
+void motion_orientation_update(const struct motion_sensor_t *s)
+{
+	((struct kionix_accel_data *)s->drv_data)->last_orientation =
+		((struct kionix_accel_data *)s->drv_data)->orientation;
+}
+
+#endif
+
+static int read(const struct motion_sensor_t *s, intv3_t v)
 {
 	uint8_t acc[6];
 	uint8_t reg;
-	int ret, i, range, resolution;
+	int ret, i, resolution;
 	struct kionix_accel_data *data = s->drv_data;
 
 	/* Read 6 bytes starting at XOUT_L. */
 	reg = KIONIX_XOUT_L(V(s));
 	mutex_lock(s->mutex);
-	ret = raw_read_multi(s->port, s->addr, reg, acc, 6);
+	ret = raw_read_multi(s->port, s->i2c_spi_addr_flags, reg, acc, 6);
+	if (IS_ENABLED(CONFIG_KX022_ORIENTATION_SENSOR) &&
+	    (s->location == MOTIONSENSE_LOC_LID) &&
+	    (V(s) == 0) &&
+	    (ret == EC_SUCCESS))
+		ret = check_orientation_locked(s);
 	mutex_unlock(s->mutex);
 
 	if (ret != EC_SUCCESS)
@@ -438,92 +527,129 @@ static int read(const struct motion_sensor_t *s, vector_3_t v)
 	rotate(v, *s->rot_standard_ref, v);
 
 	/* apply offset in the device coordinates */
-	range = get_range(s);
 	for (i = X; i <= Z; i++)
-		v[i] += (data->offset[i] << 5) / range;
+		v[i] += (data->offset[i] << 5) / s->current_range;
 
 	return EC_SUCCESS;
 }
 
-static int init(const struct motion_sensor_t *s)
+static int init(struct motion_sensor_t *s)
 {
 	int ret, val, reg, reset_field;
 	uint8_t timeout;
 
-	/* The chip can take up to 10ms to boot */
 	mutex_lock(s->mutex);
-	reg = KIONIX_WHO_AM_I(V(s));
-	timeout = 0;
-	do {
-		msleep(1);
-		/* Read WHO_AM_I to be sure the device has booted */
-		ret = raw_read8(s->port, s->addr, reg, &val);
-		if (ret == EC_SUCCESS)
-			break;
+	if (V(s)) {
+		/* The chip can take up to 10ms to boot */
+		reg = KIONIX_WHO_AM_I(V(s));
+		timeout = 0;
+		do {
+			msleep(1);
+			/* Read WHO_AM_I to be sure the device has booted */
+			ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+					reg, &val);
+			if (ret == EC_SUCCESS)
+				break;
 
-		/* Check for timeout. */
-		if (timeout++ > 20) {
-			ret = EC_ERROR_TIMEOUT;
-			break;
+			/* Check for timeout. */
+			if (timeout++ > 20) {
+				ret = EC_ERROR_TIMEOUT;
+				break;
+			}
+		} while (1);
+	} else {
+		/* Write 0x00 to the internal register for KX022 */
+		reg = KX022_INTERNAL;
+		ret = raw_write8(s->port, s->i2c_spi_addr_flags,
+				 reg, 0x0);
+		if (ret != EC_SUCCESS) {
+			/*
+			 * For I2C communication, if ACK was not received
+			 * from the first address, resend the command using
+			 * the second address.
+			 */
+			if (!SLAVE_IS_SPI(s->i2c_spi_addr_flags)) {
+				const uint16_t i2c_alt_addr_flags =
+					I2C_STRIP_FLAGS(
+						s->i2c_spi_addr_flags)
+					& ~2;
+				ret = raw_write8(s->port,
+						 i2c_alt_addr_flags,
+						 reg, 0x0);
+			}
 		}
-	} while (1);
-	if (ret != EC_SUCCESS) {
-		mutex_unlock(s->mutex);
-		return ret;
 	}
 
+	if (ret != EC_SUCCESS)
+		goto reset_failed;
+
+	/* Issue a software reset. */
 	reg = KIONIX_CTRL2_REG(V(s));
 	reset_field = KIONIX_RESET_FIELD(V(s));
 
-	/* Issue a software reset. */
+	if (V(s)) {
+		/* Place the sensor in standby mode to make changes. */
+		ret = disable_sensor(s, &val);
+		if (ret != EC_SUCCESS)
+			goto reset_failed;
+		ret = raw_read8(s->port, s->i2c_spi_addr_flags, reg, &val);
+		if (ret != EC_SUCCESS)
+			goto reset_failed;
 
-	/* Place the sensor in standby mode to make changes. */
-	ret = disable_sensor(s, &val);
-	if (ret != EC_SUCCESS) {
-		mutex_unlock(s->mutex);
-		return ret;
-	}
-	ret = raw_read8(s->port, s->addr, reg, &val);
-	if (ret != EC_SUCCESS) {
-		mutex_unlock(s->mutex);
-		return ret;
-	}
-	val |= reset_field;
-	ret = raw_write8(s->port, s->addr, reg, val);
-	if (ret != EC_SUCCESS) {
-		mutex_unlock(s->mutex);
-		return ret;
+		val |= reset_field;
+	} else {
+		/* Write 0 to CTRL2 for KX022 */
+		ret = raw_write8(s->port, s->i2c_spi_addr_flags, reg, 0x0);
+		if (ret != EC_SUCCESS)
+			goto reset_failed;
+
+		val = reset_field;
 	}
 
-	/* The SRST will be cleared when reset is complete. */
-	timeout = 0;
-	do {
-		msleep(1);
+	ret = raw_write8(s->port, s->i2c_spi_addr_flags, reg, val);
+	if (ret != EC_SUCCESS)
+		goto reset_failed;
 
-		ret = raw_read8(s->port, s->addr, reg, &val);
-		if (ret != EC_SUCCESS) {
-			mutex_unlock(s->mutex);
-			return ret;
+	if (V(s)) {
+		/* The SRST will be cleared when reset is complete. */
+		timeout = 0;
+		do {
+			msleep(1);
+
+			ret = raw_read8(s->port, s->i2c_spi_addr_flags,
+					reg, &val);
+			/* Reset complete. */
+			if ((ret == EC_SUCCESS) && !(val & reset_field))
+				break;
+			/* Check for timeout. */
+			if (timeout++ > 20) {
+				ret = EC_ERROR_TIMEOUT;
+				goto reset_failed;
+			}
+		} while (1);
+	} else {
+		/* Wait 2 milliseconds for completion of the software reset. */
+		msleep(2);
+
+		reg = KX022_COTR;
+		ret = raw_read8(s->port, s->i2c_spi_addr_flags, reg, &val);
+		if (val != KX022_COTR_VAL_DEFAULT) {
+			CPRINTF("[%s: the software reset failed]\n", s->name);
+			ret = EC_ERROR_HW_INTERNAL;
+			goto reset_failed;
 		}
+	}
 
-		/* Reset complete. */
-		if ((ret == EC_SUCCESS) && !(val & reset_field))
-			break;
+	reg = KIONIX_WHO_AM_I(V(s));
+	ret = raw_read8(s->port, s->i2c_spi_addr_flags, reg, &val);
+	if (ret != EC_SUCCESS || val != KIONIX_WHO_AM_I_VAL(V(s))) {
+		ret = EC_ERROR_HW_INTERNAL;
+		goto reset_failed;
+	}
 
-		/* Check for timeout. */
-		if (timeout++ > 5) {
-			ret = EC_ERROR_TIMEOUT;
-			mutex_unlock(s->mutex);
-			return ret;
-		}
-	} while (1);
 	mutex_unlock(s->mutex);
 
 	/* Initialize with the desired parameters. */
-	ret = set_range(s, s->default_range, 1);
-	if (ret != EC_SUCCESS)
-		return ret;
-
 	if (V(s))
 		ret = set_resolution(s, 12, 1);
 	else
@@ -531,9 +657,9 @@ static int init(const struct motion_sensor_t *s)
 	if (ret != EC_SUCCESS)
 		return ret;
 
-	CPRINTF("[%T %s: Done Init type:0x%X range:%d]\n",
-		s->name, s->type, get_range(s));
+	return sensor_init_done(s);
 
+reset_failed:
 	mutex_unlock(s->mutex);
 	return ret;
 }
@@ -542,7 +668,6 @@ const struct accelgyro_drv kionix_accel_drv = {
 	.init = init,
 	.read = read,
 	.set_range = set_range,
-	.get_range = get_range,
 	.set_resolution = set_resolution,
 	.get_resolution = get_resolution,
 	.set_data_rate = set_data_rate,

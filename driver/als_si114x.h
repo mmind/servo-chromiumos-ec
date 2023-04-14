@@ -22,7 +22,7 @@
 #ifndef __CROS_EC_ALS_SI114X_H
 #define __CROS_EC_ALS_SI114X_H
 
-#define SI114X_ADDR                     (0x5a << 1)
+#define SI114X_ADDR_FLAGS               0x5a
 
 #define SI114X_REG_PART_ID		0x00
 #define SI114X_SI1141_ID                     0x41
@@ -75,7 +75,7 @@
 #define SI114X_REG_PS2_DATA1		0x29
 #define SI114X_REG_PS3_DATA0		0x2a
 #define SI114X_REG_PS3_DATA1		0x2b
-#define SI114X_PS_INVERSION(_data) ((1 << 16) / (_data))
+#define SI114X_PS_INVERSION(_data) (BIT(16) / (_data))
 #define SI114X_REG_AUX_DATA0		0x2c
 #define SI114X_REG_AUX_DATA1		0x2d
 #define SI114X_REG_PARAM_RD		0x2e
@@ -211,6 +211,18 @@
 /* Time to wait before re-initializing the device if access is denied */
 #define SI114X_DENIED_THRESHOLD		(10 * SECOND)
 
+/* Delay used for deferred callback when polling is enabled */
+#define SI114x_POLLING_DELAY (8 * MSEC)
+
+/* Min and Max sampling frequency in mHz */
+#define SI114X_PROX_MIN_FREQ            504
+#define SI114X_PROX_MAX_FREQ            50000
+#define SI114X_LIGHT_MIN_FREQ           504
+#define SI114X_LIGHT_MAX_FREQ           50000
+#if (CONFIG_EC_MAX_SENSOR_FREQ_MILLIHZ <= SI114X_PROX_MAX_FREQ)
+#error "EC too slow for light sensor"
+#endif
+
 extern const struct accelgyro_drv si114x_drv;
 
 enum si114x_state {
@@ -249,7 +261,6 @@ struct si114x_drv_data_t {
 #define SI114X_GET_TYPED_DATA(_s) \
 	(&SI114X_GET_DATA(_s)->type_data[(_s)->type - MOTIONSENSE_TYPE_PROX])
 
-extern struct si114x_drv_data_t g_si114x_data;
 void si114x_interrupt(enum gpio_signal signal);
 
 #endif	/* __CROS_EC_ALS_SI114X_H */

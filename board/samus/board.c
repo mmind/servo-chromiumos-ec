@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -18,6 +18,7 @@
 #include "driver/accel_kxcj9.h"
 #include "driver/accelgyro_lsm6ds0.h"
 #include "driver/als_isl29035.h"
+#include "driver/charger/bq24773.h"
 #include "driver/temp_sensor/tmp006.h"
 #include "extpower.h"
 #include "fan.h"
@@ -26,8 +27,9 @@
 #include "hooks.h"
 #include "host_command.h"
 #include "i2c.h"
-#include "jtag.h"
 #include "keyboard_scan.h"
+#include "keyboard_8042.h"
+#include "keyboard_8042_sharedlib.h"
 #include "lid_switch.h"
 #include "lightbar.h"
 #include "motion_sense.h"
@@ -39,6 +41,7 @@
 #include "pwm_chip.h"
 #include "registers.h"
 #include "switch.h"
+#include "system.h"
 #include "task.h"
 #include "temp_sensor.h"
 #include "temp_sensor_chip.h"
@@ -57,15 +60,15 @@ static void pd_mcu_interrupt(enum gpio_signal signal)
 
 /* power signal list.  Must match order of enum power_signal. */
 const struct power_signal_info power_signal_list[] = {
-	{GPIO_PP1050_PGOOD,  1, "PGOOD_PP1050"},
-	{GPIO_PP1200_PGOOD,  1, "PGOOD_PP1200"},
-	{GPIO_PP1800_PGOOD,  1, "PGOOD_PP1800"},
-	{GPIO_VCORE_PGOOD,   1, "PGOOD_VCORE"},
-	{GPIO_PCH_SLP_S0_L,  1, "SLP_S0_DEASSERTED"},
-	{GPIO_PCH_SLP_S3_L,  1, "SLP_S3_DEASSERTED"},
-	{GPIO_PCH_SLP_S5_L,  1, "SLP_S5_DEASSERTED"},
-	{GPIO_PCH_SLP_SUS_L, 1, "SLP_SUS_DEASSERTED"},
-	{GPIO_PCH_SUSWARN_L, 1, "SUSWARN_DEASSERTED"},
+	{GPIO_PP1050_PGOOD,  POWER_SIGNAL_ACTIVE_HIGH, "PGOOD_PP1050"},
+	{GPIO_PP1200_PGOOD,  POWER_SIGNAL_ACTIVE_HIGH, "PGOOD_PP1200"},
+	{GPIO_PP1800_PGOOD,  POWER_SIGNAL_ACTIVE_HIGH, "PGOOD_PP1800"},
+	{GPIO_VCORE_PGOOD,   POWER_SIGNAL_ACTIVE_HIGH, "PGOOD_VCORE"},
+	{GPIO_PCH_SLP_S0_L,  POWER_SIGNAL_ACTIVE_HIGH, "SLP_S0_DEASSERTED"},
+	{GPIO_PCH_SLP_S3_L,  POWER_SIGNAL_ACTIVE_HIGH, "SLP_S3_DEASSERTED"},
+	{GPIO_PCH_SLP_S5_L,  POWER_SIGNAL_ACTIVE_HIGH, "SLP_S5_DEASSERTED"},
+	{GPIO_PCH_SLP_SUS_L, POWER_SIGNAL_ACTIVE_HIGH, "SLP_SUS_DEASSERTED"},
+	{GPIO_PCH_SUSWARN_L, POWER_SIGNAL_ACTIVE_HIGH, "SUSWARN_DEASSERTED"},
 };
 BUILD_ASSERT(ARRAY_SIZE(power_signal_list) == POWER_SIGNAL_COUNT);
 
@@ -85,7 +88,7 @@ const struct adc_t adc_channels[] = {
 	 * now.
 	 */
 	{"BatteryTemp", LM4_ADC_SEQ2, 1, 1, 0,
-	 LM4_AIN(10), 0x06 /* IE0 | END0 */, LM4_GPIO_B, (1<<4)},
+	 LM4_AIN(10), 0x06 /* IE0 | END0 */, LM4_GPIO_B, BIT(4)},
 };
 BUILD_ASSERT(ARRAY_SIZE(adc_channels) == ADC_CH_COUNT);
 
@@ -96,23 +99,29 @@ const struct pwm_t pwm_channels[] = {
 BUILD_ASSERT(ARRAY_SIZE(pwm_channels) == PWM_CH_COUNT);
 
 /* Physical fans. These are logically separate from pwm_channels. */
+const struct fan_conf fan_conf_0 = {
+	.flags = FAN_USE_RPM_MODE,
+	.ch = 2,	/* Use MFT id to control fan */
+	.pgood_gpio = -1,
+	.enable_gpio = -1,
+};
+
+const struct fan_conf fan_conf_1 = {
+	.flags = FAN_USE_RPM_MODE,
+	.ch = 3,	/* Use MFT id to control fan */
+	.pgood_gpio = -1,
+	.enable_gpio = -1,
+};
+
+const struct fan_rpm fan_rpm_0 = {
+	.rpm_min = 1000,
+	.rpm_start = 1000,
+	.rpm_max = 6350,
+};
+
 const struct fan_t fans[] = {
-	{.flags = FAN_USE_RPM_MODE,
-	 .rpm_min = 1000,
-	 .rpm_start = 1000,
-	 .rpm_max = 6350,
-	 .ch = 2,
-	 .pgood_gpio = -1,
-	 .enable_gpio = -1,
-	},
-	{.flags = FAN_USE_RPM_MODE,
-	 .rpm_min = 1000,
-	 .rpm_start = 1000,
-	 .rpm_max = 6350,
-	 .ch = 3,
-	 .pgood_gpio = -1,
-	 .enable_gpio = -1,
-	},
+	{ .conf = &fan_conf_0, .rpm = &fan_rpm_0, },
+	{ .conf = &fan_conf_1, .rpm = &fan_rpm_0, },
 };
 BUILD_ASSERT(ARRAY_SIZE(fans) == CONFIG_FANS);
 
@@ -124,47 +133,62 @@ const struct i2c_port_t i2c_ports[] = {
 };
 const unsigned int i2c_ports_used = ARRAY_SIZE(i2c_ports);
 
-#define TEMP_U40_REG_ADDR	((0x40 << 1) | I2C_FLAG_BIG_ENDIAN)
-#define TEMP_U41_REG_ADDR	((0x44 << 1) | I2C_FLAG_BIG_ENDIAN)
-#define TEMP_U42_REG_ADDR	((0x41 << 1) | I2C_FLAG_BIG_ENDIAN)
-#define TEMP_U43_REG_ADDR	((0x45 << 1) | I2C_FLAG_BIG_ENDIAN)
-#define TEMP_U115_REG_ADDR	((0x42 << 1) | I2C_FLAG_BIG_ENDIAN)
-#define TEMP_U116_REG_ADDR	((0x43 << 1) | I2C_FLAG_BIG_ENDIAN)
+/* Charger chips */
+const struct charger_config_t chg_chips[] = {
+	{
+		.i2c_port = I2C_PORT_CHARGER,
+		.i2c_addr_flags = I2C_ADDR_CHARGER_FLAGS,
+		.drv = &bq2477x_drv,
+	},
+};
 
-#define TEMP_U40_ADDR TMP006_ADDR(I2C_PORT_THERMAL, TEMP_U40_REG_ADDR)
-#define TEMP_U41_ADDR TMP006_ADDR(I2C_PORT_THERMAL, TEMP_U41_REG_ADDR)
-#define TEMP_U42_ADDR TMP006_ADDR(I2C_PORT_THERMAL, TEMP_U42_REG_ADDR)
-#define TEMP_U43_ADDR TMP006_ADDR(I2C_PORT_THERMAL, TEMP_U43_REG_ADDR)
-#define TEMP_U115_ADDR TMP006_ADDR(I2C_PORT_THERMAL, TEMP_U115_REG_ADDR)
-#define TEMP_U116_ADDR TMP006_ADDR(I2C_PORT_THERMAL, TEMP_U116_REG_ADDR)
+#define TEMP_U40_REG_ADDR_FLAGS		(0x40 | I2C_FLAG_BIG_ENDIAN)
+#define TEMP_U41_REG_ADDR_FLAGS		(0x44 | I2C_FLAG_BIG_ENDIAN)
+#define TEMP_U42_REG_ADDR_FLAGS		(0x41 | I2C_FLAG_BIG_ENDIAN)
+#define TEMP_U43_REG_ADDR_FLAGS		(0x45 | I2C_FLAG_BIG_ENDIAN)
+#define TEMP_U115_REG_ADDR_FLAGS	(0x42 | I2C_FLAG_BIG_ENDIAN)
+#define TEMP_U116_REG_ADDR_FLAGS	(0x43 | I2C_FLAG_BIG_ENDIAN)
+
+#define TEMP_U40_ADDR_FLAGS TMP006_ADDR(I2C_PORT_THERMAL,\
+					TEMP_U40_REG_ADDR_FLAGS)
+#define TEMP_U41_ADDR_FLAGS TMP006_ADDR(I2C_PORT_THERMAL,\
+					TEMP_U41_REG_ADDR_FLAGS)
+#define TEMP_U42_ADDR_FLAGS TMP006_ADDR(I2C_PORT_THERMAL,\
+					TEMP_U42_REG_ADDR_FLAGS)
+#define TEMP_U43_ADDR_FLAGS TMP006_ADDR(I2C_PORT_THERMAL,\
+					TEMP_U43_REG_ADDR_FLAGS)
+#define TEMP_U115_ADDR_FLAGS TMP006_ADDR(I2C_PORT_THERMAL,\
+					 TEMP_U115_REG_ADDR_FLAGS)
+#define TEMP_U116_ADDR_FLAGS TMP006_ADDR(I2C_PORT_THERMAL,\
+					 TEMP_U116_REG_ADDR_FLAGS)
 
 const struct tmp006_t tmp006_sensors[TMP006_COUNT] = {
-	{"Charger", TEMP_U40_ADDR},
-	{"CPU", TEMP_U41_ADDR},
-	{"Left C", TEMP_U42_ADDR},
-	{"Right C", TEMP_U43_ADDR},
-	{"Right D", TEMP_U115_ADDR},
-	{"Left D", TEMP_U116_ADDR},
+	{"Charger", TEMP_U40_ADDR_FLAGS},
+	{"CPU", TEMP_U41_ADDR_FLAGS},
+	{"Left C", TEMP_U42_ADDR_FLAGS},
+	{"Right C", TEMP_U43_ADDR_FLAGS},
+	{"Right D", TEMP_U115_ADDR_FLAGS},
+	{"Left D", TEMP_U116_ADDR_FLAGS},
 };
 BUILD_ASSERT(ARRAY_SIZE(tmp006_sensors) == TMP006_COUNT);
 
 /* Temperature sensors data; must be in same order as enum temp_sensor_id. */
 const struct temp_sensor_t temp_sensors[] = {
-	{"PECI", TEMP_SENSOR_TYPE_CPU, peci_temp_sensor_get_val, 0, 2},
-	{"ECInternal", TEMP_SENSOR_TYPE_BOARD, chip_temp_sensor_get_val, 0, 4},
-	{"I2C-Charger-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 0, 7},
-	{"I2C-Charger-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 1, 7},
-	{"I2C-CPU-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 2, 7},
-	{"I2C-CPU-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 3, 7},
-	{"I2C-Left C-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 4, 7},
-	{"I2C-Left C-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 5, 7},
-	{"I2C-Right C-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 6, 7},
-	{"I2C-Right C-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 7, 7},
-	{"I2C-Right D-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 8, 7},
-	{"I2C-Right D-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 9, 7},
-	{"I2C-Left D-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 10, 7},
-	{"I2C-Left D-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 11, 7},
-	{"Battery", TEMP_SENSOR_TYPE_BATTERY, charge_get_battery_temp, 0, 4},
+	{"PECI", TEMP_SENSOR_TYPE_CPU, peci_temp_sensor_get_val, 0},
+	{"ECInternal", TEMP_SENSOR_TYPE_BOARD, chip_temp_sensor_get_val, 0},
+	{"I2C-Charger-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 0},
+	{"I2C-Charger-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 1},
+	{"I2C-CPU-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 2},
+	{"I2C-CPU-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 3},
+	{"I2C-Left C-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 4},
+	{"I2C-Left C-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 5},
+	{"I2C-Right C-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 6},
+	{"I2C-Right C-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 7},
+	{"I2C-Right D-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 8},
+	{"I2C-Right D-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 9},
+	{"I2C-Left D-Die", TEMP_SENSOR_TYPE_BOARD, tmp006_get_val, 10},
+	{"I2C-Left D-Object", TEMP_SENSOR_TYPE_CASE, tmp006_get_val, 11},
+	{"Battery", TEMP_SENSOR_TYPE_BATTERY, charge_get_battery_temp, 0},
 };
 BUILD_ASSERT(ARRAY_SIZE(temp_sensors) == TEMP_SENSOR_COUNT);
 
@@ -181,21 +205,21 @@ BUILD_ASSERT(ARRAY_SIZE(als) == ALS_COUNT);
 struct ec_thermal_config thermal_params[] = {
 	/* {Twarn, Thigh, Thalt}, fan_off, fan_max */
 	{{C_TO_K(95), C_TO_K(101), C_TO_K(104)},
-	 C_TO_K(55), C_TO_K(90)},		/* PECI */
-	{{0, 0, 0}, 0, 0},			/* EC */
-	{{0, 0, 0}, C_TO_K(41), C_TO_K(55)},	/* Charger die */
-	{{0, 0, 0}, 0, 0},
-	{{0, 0, 0}, C_TO_K(35), C_TO_K(49)},	/* CPU die */
-	{{0, 0, 0}, 0, 0},
-	{{0, 0, 0}, 0, 0},			/* Left C die */
-	{{0, 0, 0}, 0, 0},
-	{{0, 0, 0}, 0, 0},			/* Right C die */
-	{{0, 0, 0}, 0, 0},
-	{{0, 0, 0}, 0, 0},			/* Right D die */
-	{{0, 0, 0}, 0, 0},
-	{{0, 0, 0}, C_TO_K(43), C_TO_K(54)},	/* Left D die */
-	{{0, 0, 0}, 0, 0},
-	{{0, 0, 0}, 0, 0},			/* Battery */
+	 {0, 0, 0}, C_TO_K(55), C_TO_K(90)},		/* PECI */
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},			/* EC */
+	{{0, 0, 0}, {0, 0, 0}, C_TO_K(41), C_TO_K(55)},	/* Charger die */
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},
+	{{0, 0, 0}, {0, 0, 0}, C_TO_K(35), C_TO_K(49)},	/* CPU die */
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},			/* Left C die */
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},			/* Right C die */
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},			/* Right D die */
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},
+	{{0, 0, 0}, {0, 0, 0}, C_TO_K(43), C_TO_K(54)},	/* Left D die */
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},
+	{{0, 0, 0}, {0, 0, 0}, 0, 0},			/* Battery */
 };
 BUILD_ASSERT(ARRAY_SIZE(thermal_params) == TEMP_SENSOR_COUNT);
 
@@ -267,6 +291,16 @@ void board_reset_pd_mcu(void)
 	gpio_set_level(GPIO_USB_MCU_RST, 0);
 }
 
+void sensor_board_proc_double_tap(void)
+{
+	lightbar_sequence(LIGHTBAR_TAP);
+}
+
+const int usb_port_enable[CONFIG_USB_PORT_POWER_SMART_PORT_COUNT] = {
+	GPIO_USB1_ENABLE,
+	GPIO_USB2_ENABLE,
+};
+
 /* Base Sensor mutex */
 static struct mutex g_base_mutex;
 
@@ -281,13 +315,13 @@ struct lsm6ds0_data g_saved_data[2];
 
 /* Four Motion sensors */
 /* Matrix to rotate accelrator into standard reference frame */
-const matrix_3x3_t base_standard_ref = {
+const mat33_fp_t base_standard_ref = {
 	{FLOAT_TO_FP(-1),  0,  0},
 	{ 0, FLOAT_TO_FP(-1),  0},
 	{ 0,  0, FLOAT_TO_FP(-1)}
 };
 
-const matrix_3x3_t lid_standard_ref = {
+const mat33_fp_t lid_standard_ref = {
 	{ 0,  FLOAT_TO_FP(1),  0},
 	{FLOAT_TO_FP(-1),  0,  0},
 	{ 0,  0, FLOAT_TO_FP(-1)}
@@ -308,15 +342,12 @@ struct motion_sensor_t motion_sensors[] = {
 	 .mutex = &g_base_mutex,
 	 .drv_data = &g_saved_data[0],
 	 .port = I2C_PORT_ACCEL,
-	 .addr = LSM6DS0_ADDR1,
+	 .i2c_spi_addr_flags = LSM6DS0_ADDR1_FLAGS,
 	 .rot_standard_ref = &base_standard_ref,
-	 .default_range = 2,  /* g, enough for laptop. */
+	 .default_range = 4,  /* g, to meet CDD 7.3.1/C-1-4 reqs */
+	 .min_frequency = LSM6DS0_ACCEL_MIN_FREQ,
+	 .max_frequency = LSM6DS0_ACCEL_MAX_FREQ,
 	 .config = {
-		 /* AP: by default shutdown all sensors */
-		 [SENSOR_CONFIG_AP] = {
-			 .odr = 0,
-			 .ec_rate = 0,
-		 },
 		 /* EC use accel for angle detection */
 		 [SENSOR_CONFIG_EC_S0] = {
 			 .odr = 119000 | ROUND_UP_FLAG,
@@ -324,11 +355,11 @@ struct motion_sensor_t motion_sensors[] = {
 		 },
 		 /* Used for double tap */
 		 [SENSOR_CONFIG_EC_S3] = {
-			 .odr = TAP_ODR | ROUND_UP_FLAG,
+			 .odr = TAP_ODR_LSM6DS0 | ROUND_UP_FLAG,
 			 .ec_rate = CONFIG_GESTURE_SAMPLING_INTERVAL_MS * MSEC,
 		 },
 		 [SENSOR_CONFIG_EC_S5] = {
-			 .odr = TAP_ODR | ROUND_UP_FLAG,
+			 .odr = TAP_ODR_LSM6DS0 | ROUND_UP_FLAG,
 			 .ec_rate = CONFIG_GESTURE_SAMPLING_INTERVAL_MS * MSEC,
 		 },
 	 },
@@ -343,28 +374,16 @@ struct motion_sensor_t motion_sensors[] = {
 	 .mutex = &g_lid_mutex,
 	 .drv_data = &g_kxcj9_data,
 	 .port = I2C_PORT_ACCEL,
-	 .addr = KXCJ9_ADDR0,
+	 .i2c_spi_addr_flags = KXCJ9_ADDR0_FLAGS,
 	 .rot_standard_ref = &lid_standard_ref,
-	 .default_range = 2,  /* g, enough for laptop. */
+	 .default_range = 2,  /* g, to support lid angle calculation. */
+	 .min_frequency = KXCJ9_ACCEL_MIN_FREQ,
+	 .max_frequency = KXCJ9_ACCEL_MAX_FREQ,
 	 .config = {
-		 /* AP: by default shutdown all sensors */
-		 [SENSOR_CONFIG_AP] = {
-			 .odr = 0,
-			 .ec_rate = 0,
-		 },
 		 /* EC use accel for angle detection */
 		 [SENSOR_CONFIG_EC_S0] = {
 			 .odr = 100000 | ROUND_UP_FLAG,
 			 .ec_rate = 100 * MSEC,
-		 },
-		 /* unused */
-		 [SENSOR_CONFIG_EC_S3] = {
-			 .odr = 0,
-			 .ec_rate = 0,
-		 },
-		 [SENSOR_CONFIG_EC_S5] = {
-			 .odr = 0,
-			 .ec_rate = 0,
 		 },
 	 },
 	},
@@ -378,31 +397,104 @@ struct motion_sensor_t motion_sensors[] = {
 	 .mutex = &g_base_mutex,
 	 .drv_data = &g_saved_data[1],
 	 .port = I2C_PORT_ACCEL,
-	 .addr = LSM6DS0_ADDR1,
+	 .i2c_spi_addr_flags = LSM6DS0_ADDR1_FLAGS,
 	 .rot_standard_ref = NULL,
-	 .default_range = 2000,  /* g, enough for laptop. */
-	 .config = {
-		 /* AP: by default shutdown all sensors */
-		 [SENSOR_CONFIG_AP] = {
-			 .odr = 0,
-			 .ec_rate = 0,
-		 },
-		 /* EC use accel for angle detection */
-		 [SENSOR_CONFIG_EC_S0] = {
-			 .odr = 119000 | ROUND_UP_FLAG,
-			 .ec_rate = 100 * MSEC,
-		 },
-		 /* unused */
-		 [SENSOR_CONFIG_EC_S3] = {
-			 .odr = 0,
-			 .ec_rate = 0,
-		 },
-		 [SENSOR_CONFIG_EC_S5] = {
-			 .odr = 0,
-			 .ec_rate = 0,
-		 },
-	 }
+	 .default_range = 2000,  /* dps, enough for laptop. */
+	 .min_frequency = LSM6DS0_GYRO_MIN_FREQ,
+	 .max_frequency = LSM6DS0_GYRO_MAX_FREQ,
 	},
 
 };
 const unsigned int motion_sensor_count = ARRAY_SIZE(motion_sensors);
+
+#ifdef CONFIG_LOW_POWER_IDLE
+void jtag_interrupt(enum gpio_signal signal)
+{
+	/*
+	 * This interrupt is the first sign someone is trying to use
+	 * the JTAG. Disable slow speed sleep so that the JTAG action
+	 * can take place.
+	 */
+	disable_sleep(SLEEP_MASK_JTAG);
+
+	/*
+	 * Once we get this interrupt, disable it from occurring again
+	 * to avoid repeated interrupts when debugging via JTAG.
+	 */
+	gpio_disable_interrupt(GPIO_JTAG_TCK);
+}
+#endif /* CONFIG_LOW_POWER_IDLE */
+
+
+enum ec_error_list keyboard_scancode_callback(uint16_t *make_code,
+					      int8_t pressed)
+{
+	const uint16_t k = *make_code;
+	static uint8_t s;
+	static const uint16_t a[] = {
+		SCANCODE_UP, SCANCODE_UP, SCANCODE_DOWN, SCANCODE_DOWN,
+		SCANCODE_LEFT, SCANCODE_RIGHT, SCANCODE_LEFT, SCANCODE_RIGHT,
+		SCANCODE_B, SCANCODE_A};
+
+	if (!pressed)
+		return EC_SUCCESS;
+
+	/* Lightbar demo mode: keyboard can fake the battery state */
+	switch (k) {
+	case SCANCODE_UP:
+		demo_battery_level(1);
+		break;
+	case SCANCODE_DOWN:
+		demo_battery_level(-1);
+		break;
+	case SCANCODE_LEFT:
+		demo_is_charging(0);
+		break;
+	case SCANCODE_RIGHT:
+		demo_is_charging(1);
+		break;
+	case SCANCODE_F6:  /* dim */
+		demo_brightness(-1);
+		break;
+	case SCANCODE_F7:  /* bright */
+		demo_brightness(1);
+		break;
+	case SCANCODE_T:
+		demo_tap();
+		break;
+	}
+
+	if (k == a[s])
+		s++;
+	else if (k != a[0])
+		s = 0;
+	else if (s != 2)
+		s = 1;
+
+	if (s == ARRAY_SIZE(a)) {
+		s = 0;
+		lightbar_sequence(LIGHTBAR_KONAMI);
+	}
+	return EC_SUCCESS;
+}
+
+/*
+ * Use to define going in to hibernate early if low on battery.
+ * HIBERNATE_BATT_PCT specifies the low battery threshold
+ * for going into hibernate early, and HIBERNATE_BATT_SEC defines
+ * the minimum amount of time to stay in G3 before checking for low
+ * battery hibernate.
+ */
+#define HIBERNATE_BATT_PCT 10
+#define HIBERNATE_BATT_SEC (3600 * 24)
+
+__override enum critical_shutdown board_system_is_idle(
+		uint64_t last_shutdown_time, uint64_t *target, uint64_t now)
+{
+	if (charge_get_percent() <= HIBERNATE_BATT_PCT) {
+		uint64_t t = last_shutdown_time + HIBERNATE_BATT_SEC * SEC_UL;
+		*target = MIN(*target, t);
+	}
+	return now > *target ?
+			CRITICAL_SHUTDOWN_HIBERNATE : CRITICAL_SHUTDOWN_IGNORE;
+}

@@ -59,8 +59,12 @@ int tx_stream_handler(struct usb_stream_config const *config)
 }
 
 /* Reset stream */
-void usb_stream_reset(struct usb_stream_config const *config)
+void usb_stream_event(struct usb_stream_config const *config,
+		enum usb_ep_event evt)
 {
+	if (evt != USB_EVENT_RESET)
+		return;
+
 	epN_reset(config->endpoint);
 
 	*(config->is_reset) = 1;
@@ -86,22 +90,10 @@ static void usb_written(struct consumer const *consumer, size_t count)
 	hook_call_deferred(config->deferred_tx, 0);
 }
 
-static void usb_flush(struct consumer const *consumer)
-{
-	struct usb_stream_config const *config =
-		DOWNCAST(consumer, struct usb_stream_config, consumer);
-
-	while (queue_count(consumer->queue)) {
-		tx_stream_handler(config);
-		usleep(10);
-	}
-}
-
 struct producer_ops const usb_stream_producer_ops = {
 	.read = usb_read,
 };
 
 struct consumer_ops const usb_stream_consumer_ops = {
 	.written = usb_written,
-	.flush   = usb_flush,
 };

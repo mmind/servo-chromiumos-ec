@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -32,7 +32,7 @@ typedef union {
 #define STACK_UNUSED_VALUE 0xdeadd00d
 
 /* declare task routine prototypes */
-#define TASK(n, r, d, s) void r(void);
+#define TASK(n, r, d, s) void r(void *);
 void __idle(void);
 CONFIG_TASK_LIST
 CONFIG_TEST_TASK_LIST
@@ -51,15 +51,18 @@ static const char * const task_names[] = {
 
 #ifdef CONFIG_TASK_PROFILING
 static uint64_t task_start_time; /* Time task scheduling started */
-static uint64_t exc_start_time;  /* Time of task->exception transition */
-static uint64_t exc_end_time;    /* Time of exception->task transition */
+/*
+ * We only keep 32-bit values for exception start/end time, to avoid
+ * accounting errors when we service interrupt when the timer wraps around.
+ */
+static uint32_t exc_start_time;  /* Time of task->exception transition */
+static uint32_t exc_end_time;    /* Time of exception->task transition */
 static uint64_t exc_total_time;  /* Total time in exceptions */
 static uint32_t svc_calls;       /* Number of service calls */
 static uint32_t task_switches;   /* Number of times active task changed */
 static uint32_t irq_dist[CONFIG_IRQ_COUNT];  /* Distribution of IRQ calls */
 #endif
 
-extern void __switchto(task_ *from, task_ *to);
 extern int __task_start(int *task_stack_ready);
 
 #ifndef CONFIG_LOW_POWER_IDLE
@@ -95,7 +98,7 @@ static const struct {
 	uint32_t r0;
 	uint32_t pc;
 	uint16_t stack_size;
-} const tasks_init[] = {
+} tasks_init[] = {
 	TASK(IDLE, __idle, 0, IDLE_TASK_STACK_SIZE)
 	CONFIG_TASK_LIST
 	CONFIG_TEST_TASK_LIST
@@ -105,7 +108,7 @@ static const struct {
 
 /* Contexts for all tasks */
 static task_ tasks[TASK_ID_COUNT];
-/* Sanity checks about static task invariants */
+/* Validity checks about static task invariants */
 BUILD_ASSERT(TASK_ID_COUNT <= sizeof(unsigned) * 8);
 BUILD_ASSERT(TASK_ID_COUNT < (1 << (sizeof(task_id_t) * 8)));
 
@@ -124,7 +127,7 @@ uint8_t task_stacks[0
 /* Reserve space to discard context on first context switch. */
 uint32_t scratchpad[17];
 
-static task_ *current_task = (task_ *)scratchpad;
+task_ *current_task = (task_ *)scratchpad;
 
 /*
  * Bitmap of all tasks ready to be run.
@@ -133,7 +136,13 @@ static task_ *current_task = (task_ *)scratchpad;
  * can do their init within a task switching context.  The hooks task will then
  * make a call to enable all tasks.
  */
-static uint32_t tasks_ready = (1 << TASK_ID_HOOKS);
+static uint32_t tasks_ready = BIT(TASK_ID_HOOKS);
+/*
+ * Initially allow only the HOOKS and IDLE task to run, regardless of ready
+ * status, in order for HOOK_INIT to complete before other tasks.
+ * task_enable_all_tasks() will open the flood gates.
+ */
+static uint32_t tasks_enabled = BIT(TASK_ID_HOOKS) | BIT(TASK_ID_IDLE);
 
 static int start_called;  /* Has task swapping started */
 
@@ -160,7 +169,7 @@ inline int in_interrupt_context(void)
 	return ret;
 }
 
-inline int get_interrupt_context(void)
+static inline int get_interrupt_context(void)
 {
 	int ret;
 	asm("mrs %0, ipsr\n" : "=r"(ret)); /* read exception number */
@@ -195,7 +204,7 @@ task_  __attribute__((noinline)) *__svc_handler(int desched, task_id_t resched)
 	task_ *current, *next;
 #ifdef CONFIG_TASK_PROFILING
 	int exc = get_interrupt_context();
-	uint64_t t;
+	uint32_t t;
 #endif
 
 	/* Priority is already at 0 we cannot be interrupted */
@@ -206,7 +215,7 @@ task_  __attribute__((noinline)) *__svc_handler(int desched, task_id_t resched)
 	 * start time explicitly.
 	 */
 	if (exc == 0xb) {
-		t = get_time().val;
+		t = get_time().le.lo;
 		current_task->runtime += (t - exc_end_time);
 		exc_end_time = t;
 		svc_calls++;
@@ -234,12 +243,12 @@ task_  __attribute__((noinline)) *__svc_handler(int desched, task_id_t resched)
 	}
 	tasks_ready |= 1 << resched;
 
-	ASSERT(tasks_ready);
-	next = __task_id_to_ptr(__fls(tasks_ready));
+	ASSERT(tasks_ready & tasks_enabled);
+	next = __task_id_to_ptr(__fls(tasks_ready & tasks_enabled));
 
 #ifdef CONFIG_TASK_PROFILING
 	/* Track additional time in re-sched exception context */
-	t = get_time().val;
+	t = get_time().le.lo;
 	exc_total_time += (t - exc_end_time);
 
 	exc_end_time = t;
@@ -254,36 +263,12 @@ task_  __attribute__((noinline)) *__svc_handler(int desched, task_id_t resched)
 	return current;
 }
 
-void svc_handler(int desched, task_id_t resched)
-{
-	/*
-	 * The layout of the this routine (and the __svc_handler companion one)
-	 * ensures that we are getting the right tail call optimization from
-	 * the compiler.
-	 */
-	task_ *prev = __svc_handler(desched, resched);
-	if (current_task != prev)
-		__switchto(prev, current_task);
-}
-
 void __schedule(int desched, int resched)
 {
 	register int p0 asm("r0") = desched;
 	register int p1 asm("r1") = resched;
 
 	asm("svc 0" : : "r"(p0), "r"(p1));
-}
-
-void pendsv_handler(void)
-{
-	/* Clear pending flag */
-	CPU_SCB_ICSR = (1 << 27);
-
-	/* ensure we have priority 0 during re-scheduling */
-	__asm__ __volatile__("cpsid i");
-	/* re-schedule the highest priority task */
-	svc_handler(0, 0);
-	__asm__ __volatile__("cpsie i");
 }
 
 #ifdef CONFIG_TASK_PROFILING
@@ -293,7 +278,7 @@ void task_start_irq_handler(void *excep_return)
 	 * Get time before checking depth, in case this handler is
 	 * pre-empted.
 	 */
-	uint64_t t = get_time().val;
+	uint32_t t = get_time().le.lo;
 	int irq = get_interrupt_context() - 16;
 
 	/*
@@ -320,7 +305,7 @@ void task_start_irq_handler(void *excep_return)
 
 void task_end_irq_handler(void *excep_return)
 {
-	uint64_t t = get_time().val;
+	uint32_t t = get_time().le.lo;
 	/*
 	 * Continue iff the tasks are ready and we are not called from another
 	 * exception (as the time accouting is done in the outer irq).
@@ -349,7 +334,7 @@ static uint32_t __wait_evt(int timeout_us, task_id_t resched)
 		ret = timer_arm(deadline, me);
 		ASSERT(ret == EC_SUCCESS);
 	}
-	while (!(evt = atomic_read_clear(&tsk->events))) {
+	while (!(evt = atomic_clear(&tsk->events))) {
 		/*
 		 * We need to ensure that the execution priority is actually
 		 * decreased after the "cpsie i" in the atomic operation above
@@ -364,12 +349,12 @@ static uint32_t __wait_evt(int timeout_us, task_id_t resched)
 	if (timeout_us > 0) {
 		timer_cancel(me);
 		/* Ensure timer event is clear, we no longer care about it */
-		atomic_clear(&tsk->events, TASK_EVENT_TIMER);
+		atomic_clear_bits(&tsk->events, TASK_EVENT_TIMER);
 	}
 	return evt;
 }
 
-uint32_t task_set_event(task_id_t tskid, uint32_t event, int wait)
+uint32_t task_set_event(task_id_t tskid, uint32_t event)
 {
 	task_ *receiver = __task_id_to_ptr(tskid);
 	ASSERT(receiver);
@@ -386,22 +371,18 @@ uint32_t task_set_event(task_id_t tskid, uint32_t event, int wait)
 			 * Trigger the scheduler when there's
 			 * no other irqs happening.
 			 */
-			CPU_SCB_ICSR = (1 << 28);
+			CPU_SCB_ICSR = BIT(28);
 		}
 	} else {
-		if (wait) {
-			return __wait_evt(-1, tskid);
-		} else {
-			/*
-			 * We need to ensure that the execution priority is
-			 * actually decreased after the "cpsie i" in the atomic
-			 * operation above else the "svc" in the __schedule
-			 * call below will trigger a HardFault.
-			 * Use a barrier to force it at that point.
-			 */
-			asm volatile("isb");
-			__schedule(0, tskid);
-		}
+		/*
+		 * We need to ensure that the execution priority is
+		 * actually decreased after the "cpsie i" in the atomic
+		 * operation above else the "svc" in the __schedule
+		 * call below will trigger a HardFault.
+		 * Use a barrier to force it at that point.
+		 */
+		asm volatile("isb");
+		__schedule(0, tskid);
 	}
 
 	return 0;
@@ -442,10 +423,23 @@ uint32_t task_wait_event_mask(uint32_t event_mask, int timeout_us)
 
 void task_enable_all_tasks(void)
 {
-	/* Mark all tasks as ready to run. */
-	tasks_ready = (1 << TASK_ID_COUNT) - 1;
+	/* Mark all tasks as ready and able to run. */
+	tasks_ready = tasks_enabled = BIT(TASK_ID_COUNT) - 1;
 	/* Reschedule the highest priority task. */
 	__schedule(0, 0);
+}
+
+void task_enable_task(task_id_t tskid)
+{
+	atomic_or(&tasks_enabled, BIT(tskid));
+}
+
+void task_disable_task(task_id_t tskid)
+{
+	atomic_clear_bits(&tasks_enabled, BIT(tskid));
+
+	if (!in_interrupt_context() && tskid == task_get_current())
+		__schedule(0, 0);
 }
 
 void task_enable_irq(int irq)
@@ -491,15 +485,8 @@ static void __nvic_init_irqs(void)
 
 	/* Set priorities */
 	for (i = 0; i < exc_calls; i++) {
-		uint8_t irq = __irqprio[i].irq;
-		uint8_t prio = __irqprio[i].priority;
-		uint32_t prio_shift = irq % 4 * 8 + 6;
-		if (prio > 0x3)
-			prio = 0x3;
-		CPU_NVIC_PRI(irq / 4) =
-				(CPU_NVIC_PRI(irq / 4) &
-				 ~(0x3 << prio_shift)) |
-				(prio << prio_shift);
+		cpu_set_interrupt_priority(__irqprio[i].irq,
+					   __irqprio[i].priority);
 	}
 }
 
@@ -522,7 +509,7 @@ void mutex_lock(struct mutex *mtx)
 	mtx->lock = 2;
 	__asm__ __volatile__("cpsie i");
 
-	atomic_clear(&mtx->waiters, id);
+	atomic_clear_bits(&mtx->waiters, id);
 }
 
 void mutex_unlock(struct mutex *mtx)
@@ -530,21 +517,25 @@ void mutex_unlock(struct mutex *mtx)
 	uint32_t waiters;
 	task_ *tsk = current_task;
 
-	__asm__ __volatile__("   ldr     %0, [%2]\n"
-			     "   str     %3, [%1]\n"
-			     : "=&r" (waiters)
-			     : "r" (&mtx->lock), "r" (&mtx->waiters), "r" (0)
-			     : "cc");
+	/*
+	 * Add a critical section to keep the unlock and the snapshotting of
+	 * waiters atomic in case a task switching occurs between them.
+	 */
+	interrupt_disable();
+	waiters = mtx->waiters;
+	mtx->lock = 0;
+	interrupt_enable();
+
 	while (waiters) {
 		task_id_t id = __fls(waiters);
-		waiters &= ~(1 << id);
+		waiters &= ~BIT(id);
 
 		/* Somebody is waiting on the mutex */
-		task_set_event(id, TASK_EVENT_MUTEX, 0);
+		task_set_event(id, TASK_EVENT_MUTEX);
 	}
 
 	/* Ensure no event is remaining from mutex wake-up */
-	atomic_clear(&tsk->events, TASK_EVENT_MUTEX);
+	atomic_clear_bits(&tsk->events, TASK_EVENT_MUTEX);
 }
 
 void task_print_list(void)
@@ -564,7 +555,7 @@ void task_print_list(void)
 		     sp++)
 			stackused -= sizeof(uint32_t);
 
-		ccprintf("%4d %c %-16s %08x %11.6ld  %3d/%3d\n", i, is_ready,
+		ccprintf("%4d %c %-16s %08x %11.6lld  %3d/%3d\n", i, is_ready,
 			 task_names[i], tasks[i].events, tasks[i].runtime,
 			 stackused, tasks_init[i].stack_size);
 		cflush();
@@ -592,10 +583,10 @@ int command_task_info(int argc, char **argv)
 	ccprintf("Service calls:          %11d\n", svc_calls);
 	ccprintf("Total exceptions:       %11d\n", total + svc_calls);
 	ccprintf("Task switches:          %11d\n", task_switches);
-	ccprintf("Task switching started: %11.6ld s\n", task_start_time);
-	ccprintf("Time in tasks:          %11.6ld s\n",
+	ccprintf("Task switching started: %11.6lld s\n", task_start_time);
+	ccprintf("Time in tasks:          %11.6lld s\n",
 		 get_time().val - task_start_time);
-	ccprintf("Time in exceptions:     %11.6ld s\n", exc_total_time);
+	ccprintf("Time in exceptions:     %11.6lld s\n", exc_total_time);
 #endif
 
 	return EC_SUCCESS;
@@ -672,7 +663,10 @@ void task_pre_init(void)
 int task_start(void)
 {
 #ifdef CONFIG_TASK_PROFILING
-	task_start_time = exc_end_time = get_time().val;
+	timestamp_t t = get_time();
+
+	task_start_time = t.val;
+	exc_end_time = t.le.lo;
 #endif
 
 	return __task_start(&start_called);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -19,12 +19,16 @@ static uint32_t led_auto_control_flags = ~0x00;
 static int led_is_supported(enum ec_led_id led_id)
 {
 	int i;
+	static int supported_leds = -1;
 
-	for (i = 0; i < supported_led_ids_count; i++)
-		if (led_id == supported_led_ids[i])
-			return 1;
+	if (supported_leds == -1) {
+		supported_leds = 0;
 
-	return 0;
+		for (i = 0; i < supported_led_ids_count; i++)
+			supported_leds |= (1 << supported_led_ids[i]);
+	}
+
+	return ((1 << (int)led_id) & supported_leds);
 }
 
 void led_auto_control(enum ec_led_id led_id, int enable)
@@ -37,10 +41,13 @@ void led_auto_control(enum ec_led_id led_id, int enable)
 
 int led_auto_control_is_enabled(enum ec_led_id led_id)
 {
+	if (!led_is_supported(led_id))
+		return 0;
+
 	return (led_auto_control_flags & LED_AUTO_CONTROL_FLAG(led_id)) != 0;
 }
 
-static int led_command_control(struct host_cmd_handler_args *args)
+static enum ec_status led_command_control(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_led_control *p = args->params;
 	struct ec_response_led_control *r = args->response;
@@ -71,3 +78,12 @@ static int led_command_control(struct host_cmd_handler_args *args)
 	return EC_RES_SUCCESS;
 }
 DECLARE_HOST_COMMAND(EC_CMD_LED_CONTROL, led_command_control, EC_VER_MASK(1));
+
+__attribute__((weak))
+void led_control(enum ec_led_id led_id, enum ec_led_state state)
+{
+	/*
+	 * Default weak implementation that does not affect the state of
+	 * LED. Boards can provide their own implementation.
+	 */
+}

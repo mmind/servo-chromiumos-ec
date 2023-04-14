@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -123,7 +123,7 @@ void uart_host_interrupt(void)
 	/* Clear transmit and receive interrupt status */
 	LM4_UART_ICR(CONFIG_UART_HOST) = 0x70;
 
-#ifdef CONFIG_LPC
+#ifdef CONFIG_HOSTCMD_LPC
 	/*
 	 * If we have space in our FIFO and a character is pending in LPC,
 	 * handle that character.
@@ -193,7 +193,7 @@ void uart_init(void)
 	clock_enable_peripheral(CGC_OFFSET_UART, mask, CGC_MODE_ALL);
 
 #ifdef CONFIG_UART_HOST
-	mask |= (1 << CONFIG_UART_HOST);
+	mask |= BIT(CONFIG_UART_HOST);
 #endif
 
 	clock_enable_peripheral(CGC_OFFSET_UART, mask,

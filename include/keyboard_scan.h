@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -9,6 +9,7 @@
 #define __CROS_EC_KEYBOARD_SCAN_H
 
 #include "common.h"
+#include "compile_time_macros.h"
 #include "keyboard_config.h"
 
 struct keyboard_scan_config {
@@ -30,7 +31,7 @@ struct keyboard_scan_config {
 	/* Revert to interrupt mode after no keyboard activity for this long */
 	uint32_t poll_timeout_us;
 	/* Mask with 1 bits only for keys that actually exist */
-	uint8_t actual_key_mask[KEYBOARD_COLS];
+	uint8_t actual_key_mask[KEYBOARD_COLS_MAX];
 };
 
 /**
@@ -51,12 +52,12 @@ extern struct keyboard_scan_config keyscan_config;
 enum boot_key {
 	/* No keys other than keyboard-controlled reset keys */
 	BOOT_KEY_NONE = 0,
-	BOOT_KEY_ESC = (1 << 0),
-	BOOT_KEY_DOWN_ARROW = (1 << 1),
-	BOOT_KEY_LEFT_SHIFT = (1 << 2),
+	BOOT_KEY_ESC = BIT(0),
+	BOOT_KEY_DOWN_ARROW = BIT(1),
+	BOOT_KEY_LEFT_SHIFT = BIT(2),
 };
 
-#ifdef HAS_TASK_KEYSCAN
+#if defined(HAS_TASK_KEYSCAN) && defined(CONFIG_KEYBOARD_BOOT_KEYS)
 /**
  * Returns mask of all the keys held down at boot time in addition to the
  * keyboard-controlled reset keys. If more than one boot key is held, mask bits
@@ -78,7 +79,7 @@ static inline uint32_t keyboard_scan_get_boot_keys(void)
 
 /**
  * Return a pointer to the current debounced keyboard matrix state, which is
- * KEYBOARD_COLS bytes long.
+ * KEYBOARD_COLS_MAX bytes long.
  */
 const uint8_t *keyboard_scan_get_state(void);
 
@@ -87,6 +88,7 @@ enum kb_scan_disable_masks {
 	KB_SCAN_DISABLE_LID_CLOSED   = (1<<0),
 	KB_SCAN_DISABLE_POWER_BUTTON = (1<<1),
 	KB_SCAN_DISABLE_LID_ANGLE    = (1<<2),
+	KB_SCAN_DISABLE_USB_SUSPENDED = (1<<3),
 };
 
 #ifdef HAS_TASK_KEYSCAN
@@ -98,6 +100,11 @@ enum kb_scan_disable_masks {
  * @param mask Disable reasons from kb_scan_disable_masks
  */
 void keyboard_scan_enable(int enable, enum kb_scan_disable_masks mask);
+
+/**
+ * Clears typematic key
+ */
+void clear_typematic_key(void);
 #else
 static inline void keyboard_scan_enable(int enable,
 		enum kb_scan_disable_masks mask) { }
@@ -110,6 +117,22 @@ static inline void keyboard_scan_enable(int enable,
  * Boards may supply this function to suppress audio noise.
  */
 void keyboard_suppress_noise(void);
+#endif
+
+#ifdef CONFIG_KEYBOARD_LANGUAGE_ID
+/**
+ * Get the KEYBOARD ID for a keyboard
+ *
+ * @return A value that identifies keyboard variants. Its meaning and
+ * the number of bits actually used is the supported keyboard layout.
+ */
+int keyboard_get_keyboard_id(void);
+#endif
+
+#ifdef CONFIG_KEYBOARD_RUNTIME_KEYS
+void set_vol_up_key(uint8_t row, uint8_t col);
+#else
+static inline void set_vol_up_key(uint8_t row, uint8_t col) {}
 #endif
 
 #endif  /* __CROS_EC_KEYBOARD_SCAN_H */

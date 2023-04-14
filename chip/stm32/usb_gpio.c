@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -42,7 +42,7 @@ void usb_gpio_rx(struct usb_gpio_config const *config)
 	config->state->set_mask = set_mask;
 	config->state->clear_mask = clear_mask;
 
-	if ((btable_ep[config->endpoint].rx_count & 0x3ff) ==
+	if ((btable_ep[config->endpoint].rx_count & RX_COUNT_MASK) ==
 	    USB_GPIO_RX_PACKET_SIZE) {
 		for (i = 0; i < config->num_gpios; ++i, mask <<= 1) {
 			if (ignore_mask & mask)
@@ -60,9 +60,14 @@ void usb_gpio_rx(struct usb_gpio_config const *config)
 	STM32_TOGGLE_EP(config->endpoint, EP_RX_MASK, EP_RX_VALID, 0);
 }
 
-void usb_gpio_reset(struct usb_gpio_config const *config)
+void usb_gpio_event(struct usb_gpio_config const *config, enum usb_ep_event evt)
 {
-	int i = config->endpoint;
+	int i;
+
+	if (evt != USB_EVENT_RESET)
+		return;
+
+	i = config->endpoint;
 
 	btable_ep[i].tx_addr  = usb_sram_addr(config->tx_ram);
 	btable_ep[i].tx_count = USB_GPIO_TX_PACKET_SIZE;

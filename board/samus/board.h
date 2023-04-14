@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -18,9 +18,8 @@
 #define CONFIG_ACCELGYRO_LSM6DS0
 #define CONFIG_ACCEL_KXCJ9
 #define CONFIG_ACCEL_STD_REF_FRAME_OLD
-#define CONFIG_ALS
 #define CONFIG_ALS_ISL29035
-#define CONFIG_BOARD_VERSION
+#define CONFIG_BOARD_VERSION_GPIO
 #define CONFIG_CMD_ACCELS
 #define CONFIG_CMD_ACCEL_INFO
 #undef  CONFIG_BATTERY_CRITICAL_SHUTDOWN_TIMEOUT
@@ -30,10 +29,11 @@
 #define CONFIG_POWER_SHUTDOWN_PAUSE_IN_S5
 #define CONFIG_CHIPSET_CAN_THROTTLE
 #define CONFIG_I2C
-#define CONFIG_I2C_MASTER
+#define CONFIG_I2C_CONTROLLER
 #define CONFIG_KEYBOARD_BOARD_CONFIG
 #define CONFIG_KEYBOARD_PROTOCOL_8042
 #define CONFIG_KEYBOARD_COL2_INVERTED
+#define CONFIG_KEYBOARD_SCANCODE_CALLBACK
 #define CONFIG_LID_ANGLE
 #define CONFIG_LIGHTBAR_POWER_RAILS
 #define CONFIG_LOW_POWER_IDLE
@@ -41,14 +41,12 @@
 #define CONFIG_POWER_BUTTON_X86
 /* Note: not CONFIG_BACKLIGHT_LID. It's handled specially for Samus. */
 #define CONFIG_BACKLIGHT_REQ_GPIO GPIO_PCH_BL_EN
-#define CONFIG_BATTERY_SAMUS
 /* TODO(crosbug.com/p/29467): remove this workaround when possible. */
 #define CONFIG_BATTERY_REQUESTS_NIL_WHEN_DEAD
 #define CONFIG_CHARGER_PROFILE_OVERRIDE
 #define CONFIG_BATTERY_SMART
 #define CONFIG_BATTERY_REVIVE_DISCONNECT
 #define CONFIG_CHARGER
-#define CONFIG_CHARGER_V2
 #define CONFIG_CHARGER_BQ24773
 #define CONFIG_CHARGER_ILIM_PIN_DISABLED
 #define CONFIG_CHARGER_SENSE_RESISTOR 5
@@ -61,12 +59,12 @@
 #define CONFIG_FAN_UPDATE_PERIOD 10
 #define CONFIG_FPU
 #define CONFIG_GESTURE_DETECTION
+/* SW gesture detection */
+#define CONFIG_GESTURE_DETECTION_MASK 0
 #define CONFIG_GESTURE_SW_DETECTION
 #define CONFIG_GESTURE_SAMPLING_INTERVAL_MS 5
 #undef  CONFIG_HIBERNATE_DELAY_SEC
 #define CONFIG_HIBERNATE_DELAY_SEC (3600 * 24 * 7)
-#define CONFIG_HIBERNATE_BATT_PCT 10
-#define CONFIG_HIBERNATE_BATT_SEC (3600 * 24)
 #define CONFIG_HOSTCMD_PD
 #define CONFIG_HOSTCMD_PD_CHG_CTRL
 #define CONFIG_HOSTCMD_PD_PANIC
@@ -81,6 +79,8 @@
 #define CONFIG_USB_PORT_POWER_SMART
 #define CONFIG_USB_PORT_POWER_SMART_DEFAULT_MODE USB_CHARGE_MODE_CDP
 #define CONFIG_USB_PORT_POWER_SMART_INVERTED
+#define GPIO_USB1_ILIM_SEL GPIO_USB1_ILIM_SEL_L
+#define GPIO_USB2_ILIM_SEL GPIO_USB2_ILIM_SEL_L
 #define CONFIG_VBOOT_HASH
 #define CONFIG_WIRELESS
 #define CONFIG_WIRELESS_SUSPEND \
@@ -174,6 +174,13 @@ enum temp_sensor_id {
 	TEMP_SENSOR_COUNT
 };
 
+enum sensor_id {
+	BASE_ACCEL,
+	LID_ACCEL,
+	BASE_GYRO,
+	SENSOR_COUNT,
+};
+
 /* The number of TMP006 sensor chips on the board. */
 #define TMP006_COUNT 6
 
@@ -197,24 +204,26 @@ void board_reset_pd_mcu(void);
 /* Backboost detected interrupt */
 void bkboost_det_interrupt(enum gpio_signal signal);
 
+/* Interrupt handler for JTAG clock */
+void jtag_interrupt(enum gpio_signal signal);
+
 /* Bit masks for turning on PP5000 rail in G3 */
-#define PP5000_IN_G3_AC       (1 << 0)
-#define PP5000_IN_G3_LIGHTBAR (1 << 1)
+#define PP5000_IN_G3_AC       BIT(0)
+#define PP5000_IN_G3_LIGHTBAR BIT(1)
 
 /* Enable/disable PP5000 rail mask in G3 */
 void set_pp5000_in_g3(int mask, int enable);
 
 /* Define for sensor tasks */
-#define CONFIG_GESTURE_SENSOR_BATTERY_TAP 0
+#define CONFIG_GESTURE_SENSOR_DOUBLE_TAP
 #define CONFIG_GESTURE_TAP_OUTER_WINDOW_T 200
 #define CONFIG_GESTURE_TAP_INNER_WINDOW_T 30
 #define CONFIG_GESTURE_TAP_MIN_INTERSTICE_T 120
 #define CONFIG_GESTURE_TAP_MAX_INTERSTICE_T 500
-/* event 2 to 9 are reserved for hardware interrupt */
-#define CONFIG_GESTURE_TAP_EVENT          TASK_EVENT_CUSTOM(1024)
+#define CONFIG_GESTURE_TAP_SENSOR 0
 
-#define CONFIG_LID_ANGLE_SENSOR_BASE 0
-#define CONFIG_LID_ANGLE_SENSOR_LID 1
+#define CONFIG_LID_ANGLE_SENSOR_BASE BASE_ACCEL
+#define CONFIG_LID_ANGLE_SENSOR_LID LID_ACCEL
 
 #endif /* !__ASSEMBLER__ */
 

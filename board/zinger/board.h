@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -49,17 +49,20 @@
 #undef CONFIG_LID_SWITCH
 #define CONFIG_LTO
 #define CONFIG_RSA
+#define CONFIG_RWSIG_TYPE_USBPD1
 #define CONFIG_SHA256
 #undef CONFIG_TASK_PROFILING
 #define CONFIG_USB_POWER_DELIVERY
+#define CONFIG_USB_PD_TCPMV1
 #define CONFIG_USB_PD_ALT_MODE
-#define CONFIG_USB_PD_CUSTOM_VDM
+#define CONFIG_USB_PD_CUSTOM_PDO
 #undef CONFIG_USB_PD_DUAL_ROLE
 #undef CONFIG_USB_PD_INTERNAL_COMP
 #define CONFIG_USB_PD_LOGGING
-#define CONFIG_USB_PD_LOG_SIZE 256
+#undef  CONFIG_EVENT_LOG_SIZE
+#define CONFIG_EVENT_LOG_SIZE 256
 #define CONFIG_USB_PD_LOW_POWER_IDLE_WHEN_CONNECTED
-#define CONFIG_USB_PD_PORT_COUNT 1
+#define CONFIG_USB_PD_PORT_MAX_COUNT 1
 #define CONFIG_USB_PD_TCPC
 #define CONFIG_USB_PD_TCPM_STUB
 #undef CONFIG_USB_PD_RX_COMP_IRQ
@@ -104,9 +107,6 @@ enum adc_channel {
 /* 3.0A Rp */
 #define PD_SRC_VNC (PD_SRC_3_0_VNC_MV * 4096 / 3300/* 12-bit ADC, 3.3V range */)
 
-/* we are a power supply, boot as a power source waiting for a sink */
-#define PD_DEFAULT_STATE PD_STATE_SRC_DISCONNECTED
-
 /* delay necessary for the voltage transition on the power supply */
 #define PD_POWER_SUPPLY_TURN_ON_DELAY  50000 /* us */
 #define PD_POWER_SUPPLY_TURN_OFF_DELAY 50000 /* us */
@@ -125,13 +125,6 @@ int flash_physical_is_permanently_protected(void);
 uint8_t *flash_hash_rw(void);
 int is_ro_mode(void);
 
-/* RTC functions */
-void rtc_init(void);
-void set_rtc_alarm(uint32_t delay_s, uint32_t delay_us,
-		   uint32_t *rtc, uint32_t *rtcss);
-void reset_rtc_alarm(uint32_t *rtc, uint32_t *rtcss);
-int32_t get_rtc_diff(uint32_t rtc0, uint32_t rtc0ss,
-		     uint32_t rtc1, uint32_t rtc1ss);
 void __enter_hibernate(uint32_t seconds, uint32_t microseconds);
 
 #endif /* !__ASSEMBLER__ */

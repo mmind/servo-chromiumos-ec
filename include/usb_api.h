@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -42,11 +42,44 @@ void usb_disconnect(void);
  */
 void usb_release(void);
 
-#ifdef CONFIG_USB_SELECT_PHY
-/* Select which PHY to use. */
-void usb_select_phy(uint32_t phy);
+/*
+ * Returns true if USB device is currently suspended.
+ * Requires CONFIG_USB_SUSPEND to be defined.
+ */
+int usb_is_suspended(void);
 
-/* Get the current PHY */
-uint32_t usb_get_phy(void);
+/*
+ * Returns true if USB remote wakeup is currently enabled by host.
+ * Requires CONFIG_USB_SUSPEND to be defined, always return 0 if
+ * CONFIG_USB_REMOTE_WAKEUP is not defined.
+ */
+int usb_is_remote_wakeup_enabled(void);
+
+/*
+ * Preserve in non-volatile memory the state of the USB hardware registers
+ * which cannot be simply re-initialized when powered up again.
+ */
+void usb_save_suspended_state(void);
+
+/*
+ * Restore from non-volatile memory the state of the USB hardware registers
+ * which was lost by powering them down.
+ */
+void usb_restore_suspended_state(void);
+
+/*
+ * Tell the host to wake up. Does nothing if CONFIG_USB_REMOTE_WAKEUP is not
+ * defined.
+ *
+ * Returns immediately, suspend status can be checked using usb_is_suspended.
+ */
+#ifdef CONFIG_USB_REMOTE_WAKEUP
+void usb_wake(void);
+#else
+static inline void usb_wake(void) {}
 #endif
+
+/* Board-specific USB wake, for side-band wake, called by usb_wake above. */
+void board_usb_wake(void);
+
 #endif /* __CROS_EC_USB_API_H */

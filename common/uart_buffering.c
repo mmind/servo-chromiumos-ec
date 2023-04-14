@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -11,6 +11,7 @@
 #include "console.h"
 #include "hooks.h"
 #include "host_command.h"
+#include "link_defs.h"
 #include "printf.h"
 #include "system.h"
 #include "task.h"
@@ -27,6 +28,10 @@
 #define TX_BUF_DIFF(i, j) (((i) - (j)) & (CONFIG_UART_TX_BUF_SIZE - 1))
 #define RX_BUF_DIFF(i, j) (((i) - (j)) & (CONFIG_UART_RX_BUF_SIZE - 1))
 
+/* Check if both UART TX/RX buffer sizes are power of two. */
+BUILD_ASSERT((CONFIG_UART_TX_BUF_SIZE & (CONFIG_UART_TX_BUF_SIZE - 1)) == 0);
+BUILD_ASSERT((CONFIG_UART_RX_BUF_SIZE & (CONFIG_UART_RX_BUF_SIZE - 1)) == 0);
+
 /*
  * Interval between rechecking the receive DMA head pointer, after a character
  * of input has been detected by the normal tick task.  There will be
@@ -36,16 +41,35 @@
 				 (CONFIG_UART_RX_DMA_RECHECKS + 1))
 
 /* Transmit and receive buffers */
-static volatile char tx_buf[CONFIG_UART_TX_BUF_SIZE];
-static volatile int tx_buf_head;
-static volatile int tx_buf_tail;
-static volatile char rx_buf[CONFIG_UART_RX_BUF_SIZE];
+static volatile char tx_buf[CONFIG_UART_TX_BUF_SIZE]
+			__uncached __preserved_logs(tx_buf);
+static volatile int tx_buf_head __preserved_logs(tx_buf_head);
+static volatile int tx_buf_tail __preserved_logs(tx_buf_tail);
+static volatile char rx_buf[CONFIG_UART_RX_BUF_SIZE] __uncached;
 static volatile int rx_buf_head;
 static volatile int rx_buf_tail;
 static int tx_snapshot_head;
 static int tx_snapshot_tail;
 static int tx_last_snapshot_head;
 static int tx_next_snapshot_head;
+static int tx_checksum __preserved_logs(tx_checksum);
+
+static int uart_buffer_calc_checksum(void)
+{
+	return tx_buf_head ^ tx_buf_tail;
+}
+
+
+void uart_init_buffer(void)
+{
+	if (tx_checksum != uart_buffer_calc_checksum() ||
+	    !IN_RANGE(tx_buf_head, 0, CONFIG_UART_TX_BUF_SIZE) ||
+	    !IN_RANGE(tx_buf_tail, 0, CONFIG_UART_TX_BUF_SIZE)) {
+		tx_buf_head = 0;
+		tx_buf_tail = 0;
+		tx_checksum = 0;
+	}
+}
 
 /**
  * Put a single character into the transmit buffer.
@@ -56,13 +80,9 @@ static int tx_next_snapshot_head;
  * @param c		Character to write.
  * @return 0 if the character was transmitted, 1 if it was dropped.
  */
-static int __tx_char(void *context, int c)
+static int __tx_char_raw(void *context, int c)
 {
 	int tx_buf_next, tx_buf_new_tail;
-
-	/* Do newline to CRLF translation */
-	if (c == '\n' && __tx_char(NULL, '\r'))
-		return 1;
 
 #if defined CONFIG_POLLING_UART
 	(void) tx_buf_next;
@@ -91,8 +111,19 @@ static int __tx_char(void *context, int c)
 
 	tx_buf[tx_buf_head] = c;
 	tx_buf_head = tx_buf_next;
+
+	if (IS_ENABLED(CONFIG_PRESERVE_LOGS))
+		tx_checksum = uart_buffer_calc_checksum();
 #endif
 	return 0;
+}
+
+static int __tx_char(void *context, int c)
+{
+	/* Translate '\n' to '\r\n' */
+	if (c == '\n' && __tx_char_raw(NULL, '\r'))
+		return 1;
+	return __tx_char_raw(context, c);
 }
 
 #ifdef CONFIG_UART_TX_DMA
@@ -120,6 +151,9 @@ void uart_process_output(void)
 		tx_buf_tail = (tx_buf_tail + tx_dma_in_progress) &
 			(CONFIG_UART_TX_BUF_SIZE - 1);
 		tx_dma_in_progress = 0;
+
+		if (IS_ENABLED(CONFIG_PRESERVE_LOGS))
+			tx_checksum = uart_buffer_calc_checksum();
 	}
 
 	/* Disable DMA-done interrupt if nothing to send */
@@ -146,6 +180,9 @@ void uart_process_output(void)
 	while (uart_tx_ready() && (tx_buf_head != tx_buf_tail)) {
 		uart_write_char(tx_buf[tx_buf_tail]);
 		tx_buf_tail = TX_BUF_NEXT(tx_buf_tail);
+
+		if (IS_ENABLED(CONFIG_PRESERVE_LOGS))
+			tx_checksum = uart_buffer_calc_checksum();
 	}
 
 	/* If output buffer is empty, disable transmit interrupt */
@@ -218,6 +255,14 @@ void uart_process_input(void)
 		console_has_input();
 }
 
+void uart_clear_input(void)
+{
+	int scratch __attribute__ ((unused));
+	while (uart_rx_available())
+		scratch = uart_read_char();
+	rx_buf_head = rx_buf_tail = 0;
+}
+
 #endif /* !CONFIG_UART_RX_DMA */
 
 int uart_putc(int c)
@@ -241,6 +286,34 @@ int uart_puts(const char *outstr)
 
 	/* Successful if we consumed all output */
 	return *outstr ? EC_ERROR_OVERFLOW : EC_SUCCESS;
+}
+
+int uart_put(const char *out, int len)
+{
+	/* Put all characters in the output buffer */
+	while (len--) {
+		if (__tx_char(NULL, *out++) != 0)
+			break;
+	}
+
+	uart_tx_start();
+
+	/* Successful if we consumed all output */
+	return len ? EC_ERROR_OVERFLOW : EC_SUCCESS;
+}
+
+int uart_put_raw(const char *out, int len)
+{
+	/* Put all characters in the output buffer */
+	while (len--) {
+		if (__tx_char_raw(NULL, *out++) != 0)
+			break;
+	}
+
+	uart_tx_start();
+
+	/* Successful if we consumed all output */
+	return len ? EC_ERROR_OVERFLOW : EC_SUCCESS;
 }
 
 int uart_vprintf(const char *format, va_list args)
@@ -315,6 +388,11 @@ int uart_buffer_empty(void)
 	return tx_buf_head == tx_buf_tail;
 }
 
+int uart_buffer_full(void)
+{
+	return TX_BUF_NEXT(tx_buf_head) == tx_buf_tail;
+}
+
 #ifdef CONFIG_UART_RX_DMA
 static void uart_rx_dma_init(void)
 {
@@ -327,7 +405,53 @@ DECLARE_HOOK(HOOK_INIT, uart_rx_dma_init, HOOK_PRIO_DEFAULT);
 /*****************************************************************************/
 /* Host commands */
 
-static int host_command_console_snapshot(struct host_cmd_handler_args *args)
+static enum ec_status
+host_command_console_snapshot(struct host_cmd_handler_args *args)
+{
+	return uart_console_read_buffer_init();
+}
+DECLARE_HOST_COMMAND(EC_CMD_CONSOLE_SNAPSHOT,
+		     host_command_console_snapshot,
+		     EC_VER_MASK(0));
+
+static enum ec_status
+host_command_console_read(struct host_cmd_handler_args *args)
+{
+	if (args->version == 0) {
+		/*
+		 * Prior versions of this command only support reading from
+		 * an entire snapshot, not just the output since the last
+		 * snapshot.
+		 */
+		return uart_console_read_buffer(
+				CONSOLE_READ_NEXT,
+				(char *)args->response,
+				args->response_max,
+				&args->response_size);
+#ifdef CONFIG_CONSOLE_ENABLE_READ_V1
+	} else if (args->version == 1) {
+		const struct ec_params_console_read_v1 *p;
+
+		/* Check the params to figure out where to start reading. */
+		p = args->params;
+		return uart_console_read_buffer(
+				p->subcmd,
+				(char *)args->response,
+				args->response_max,
+				&args->response_size);
+#endif
+	}
+	return EC_RES_INVALID_PARAM;
+}
+DECLARE_HOST_COMMAND(EC_CMD_CONSOLE_READ,
+		     host_command_console_read,
+		     EC_VER_MASK(0)
+#ifdef CONFIG_CONSOLE_ENABLE_READ_V1
+		     | EC_VER_MASK(1)
+#endif
+		     );
+
+enum ec_status uart_console_read_buffer_init(void)
 {
 	/* Assume the whole circular buffer is full */
 	tx_snapshot_head = tx_buf_head;
@@ -354,26 +478,31 @@ static int host_command_console_snapshot(struct host_cmd_handler_args *args)
 
 	return EC_RES_SUCCESS;
 }
-DECLARE_HOST_COMMAND(EC_CMD_CONSOLE_SNAPSHOT,
-		     host_command_console_snapshot,
-		     EC_VER_MASK(0));
 
-/*
- * Common code for host_command_console_read and
- * host_command_console_read_recent.
- */
-static int console_read_helper(struct host_cmd_handler_args *args,
-			       int *tail)
+int uart_console_read_buffer(uint8_t type,
+			     char *dest,
+			     uint16_t dest_size,
+			     uint16_t *write_count)
 {
-	char *dest = (char *)args->response;
+	int *tail;
+
+	switch (type) {
+	case CONSOLE_READ_NEXT:
+		tail = &tx_snapshot_tail;
+		break;
+	case CONSOLE_READ_RECENT:
+		tail = &tx_last_snapshot_head;
+		break;
+	default:
+		return EC_RES_INVALID_PARAM;
+	}
 
 	/* If no snapshot data, return empty response */
 	if (tx_snapshot_head == *tail)
 		return EC_RES_SUCCESS;
 
 	/* Copy data to response */
-	while (*tail != tx_snapshot_head &&
-	       args->response_size < args->response_max - 1) {
+	while (*tail != tx_snapshot_head && *write_count < dest_size - 1) {
 
 		/*
 		 * Copy only non-zero bytes, so that we don't copy unused
@@ -381,7 +510,7 @@ static int console_read_helper(struct host_cmd_handler_args *args,
 		 */
 		if (tx_buf[*tail]) {
 			*(dest++) = tx_buf[*tail];
-			args->response_size++;
+			(*write_count)++;
 		}
 
 		*tail = TX_BUF_NEXT(*tail);
@@ -389,33 +518,7 @@ static int console_read_helper(struct host_cmd_handler_args *args,
 
 	/* Null-terminate */
 	*(dest++) = '\0';
-	args->response_size++;
+	(*write_count)++;
 
 	return EC_RES_SUCCESS;
 }
-
-static int host_command_console_read(struct host_cmd_handler_args *args)
-{
-	const struct ec_params_console_read_v1 *p;
-
-	if (args->version == 0) {
-		/*
-		 * Prior versions of this command only support reading from
-		 * an entire snapshot, not just the output since the last
-		 * snapshot.
-		 */
-		return console_read_helper(args, &tx_snapshot_tail);
-	} else if (args->version == 1) {
-		/* Check the params to figure out where to start reading. */
-		p = args->params;
-		if (p->subcmd == CONSOLE_READ_NEXT)
-			return console_read_helper(args, &tx_snapshot_tail);
-		else if (p->subcmd == CONSOLE_READ_RECENT)
-			return console_read_helper(args,
-						   &tx_last_snapshot_head);
-	}
-	return EC_RES_INVALID_PARAM;
-}
-DECLARE_HOST_COMMAND(EC_CMD_CONSOLE_READ,
-		     host_command_console_read,
-		     EC_VER_MASK(0) | EC_VER_MASK(1));

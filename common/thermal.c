@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -42,7 +42,7 @@ int thermal_fan_percent(int low, int high, int cur)
 }
 
 /* The logic below is hard-coded for only three thresholds: WARN, HIGH, HALT.
- * This is just a sanity check to be sure we catch any changes in thermal.h
+ * This is just a validity check to be sure we catch any changes in thermal.h
  */
 BUILD_ASSERT(EC_TEMP_THRESH_COUNT == 3);
 
@@ -59,6 +59,10 @@ static void thermal_control(void)
 	int fmax;
 	int temp_fan_configured;
 
+#ifdef CONFIG_CUSTOM_FAN_CONTROL
+	int temp[TEMP_SENSOR_COUNT];
+#endif
+
 	/* Get ready to count things */
 	memset(count_over, 0, sizeof(count_over));
 	memset(count_under, 0, sizeof(count_under));
@@ -72,6 +76,12 @@ static void thermal_control(void)
 
 		/* read one */
 		rv = temp_sensor_read(i, &t);
+
+#ifdef CONFIG_CUSTOM_FAN_CONTROL
+		/* Store all sensors value */
+		temp[i] = K_TO_C(t);
+#endif
+
 		if (rv != EC_SUCCESS)
 			continue;
 		else
@@ -80,12 +90,17 @@ static void thermal_control(void)
 		/* check all the limits */
 		for (j = 0; j < EC_TEMP_THRESH_COUNT; j++) {
 			int limit = thermal_params[i].temp_host[j];
+			int release = thermal_params[i].temp_host_release[j];
 			if (limit) {
 				num_valid_limits[j]++;
-				if (t > limit)
+				if (t > limit) {
 					count_over[j]++;
-				else if (t < limit)
+				} else if (release) {
+					if (t < release)
+						count_under[j]++;
+				} else if (t < limit) {
 					count_under[j]++;
+				}
 			}
 		}
 
@@ -114,8 +129,15 @@ static void thermal_control(void)
 		 * bringup of a new board, where we haven't debugged the I2C
 		 * bus to the sensors; forcing a shutdown in that case would
 		 * merely hamper board bringup.
+		 *
+		 * If in G3, then there is no need trigger an SMI event since
+		 * the AP is off and this can be an expected state if
+		 * temperature sensors are powered by a power rail that's only
+		 * on if the AP is out of G3. Note this could be 'ANY_OFF' as
+		 * well, but that causes the thermal unit test to fail.
 		 */
-		smi_sensor_failure_warning();
+		if (!chipset_in_state(CHIPSET_STATE_HARD_OFF))
+			smi_sensor_failure_warning();
 		return;
 	}
 
@@ -130,12 +152,11 @@ static void thermal_control(void)
 			cond_set_false(&cond_hot[j]);
 	}
 
-
 	/* What do we do about it? (note hard-coded logic). */
 
 	if (cond_went_true(&cond_hot[EC_TEMP_THRESH_HALT])) {
 		CPRINTS("thermal SHUTDOWN");
-		chipset_force_shutdown();
+		chipset_force_shutdown(CHIPSET_SHUTDOWN_THERMAL);
 	} else if (cond_went_false(&cond_hot[EC_TEMP_THRESH_HALT])) {
 		/* We don't reboot automatically - the user has to push
 		 * the power button. It's likely that we can't even
@@ -163,13 +184,23 @@ static void thermal_control(void)
 
 	if (temp_fan_configured) {
 #ifdef CONFIG_FANS
-	/* TODO(crosbug.com/p/23797): For now, we just treat all fans the
-	 * same. It would be better if we could assign different thermal
-	 * profiles to each fan - in case one fan cools the CPU while another
-	 * cools the radios or battery.
-	 */
-		for (i = 0; i < CONFIG_FANS; i++)
+#ifdef CONFIG_CUSTOM_FAN_CONTROL
+		for (i = 0; i < fan_get_count(); i++) {
+			if (!is_thermal_control_enabled(i))
+				continue;
+
+			board_override_fan_control(i, temp);
+		}
+#else
+		/* TODO(crosbug.com/p/23797): For now, we just treat all
+		 * fans the same. It would be better if we could assign
+		 * different thermal profiles to each fan - in case one
+		 * fan cools the CPU while another cools the radios or
+		 * battery.
+		 */
+		for (i = 0; i < fan_get_count(); i++)
 			fan_set_percent_needed(i, fmax);
+#endif
 #endif
 	}
 }
@@ -254,7 +285,8 @@ DECLARE_CONSOLE_COMMAND(thermalset, command_thermalset,
  * not version 0. Different structs, different meanings.
  */
 
-static int thermal_command_set_threshold(struct host_cmd_handler_args *args)
+static enum ec_status
+thermal_command_set_threshold(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_thermal_set_threshold_v1 *p = args->params;
 
@@ -269,7 +301,8 @@ DECLARE_HOST_COMMAND(EC_CMD_THERMAL_SET_THRESHOLD,
 		     thermal_command_set_threshold,
 		     EC_VER_MASK(1));
 
-static int thermal_command_get_threshold(struct host_cmd_handler_args *args)
+static enum ec_status
+thermal_command_get_threshold(struct host_cmd_handler_args *args)
 {
 	const struct ec_params_thermal_get_threshold_v1 *p = args->params;
 	struct ec_thermal_config *r = args->response;

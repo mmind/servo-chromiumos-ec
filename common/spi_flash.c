@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+ * Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -65,7 +65,7 @@ static int spi_flash_write_enable(void)
 
 /**
  * Returns the contents of SPI flash status register 1
- * @return register contents or -1 on error
+ * @return register contents or 0xff on error
  */
 uint8_t spi_flash_get_status1(void)
 {
@@ -73,14 +73,14 @@ uint8_t spi_flash_get_status1(void)
 	uint8_t resp;
 
 	if (spi_transaction(SPI_FLASH_DEVICE, &cmd, 1, &resp, 1) != EC_SUCCESS)
-		return -1;
+		return 0xff;
 
 	return resp;
 }
 
 /**
  * Returns the contents of SPI flash status register 2
- * @return register contents or -1 on error
+ * @return register contents or 0xff on error
  */
 uint8_t spi_flash_get_status2(void)
 {
@@ -93,7 +93,7 @@ uint8_t spi_flash_get_status2(void)
 #endif
 
 	if (spi_transaction(SPI_FLASH_DEVICE, &cmd, 1, &resp, 1) != EC_SUCCESS)
-		return -1;
+		return 0xff;
 
 	return resp;
 }
@@ -151,16 +151,16 @@ int spi_flash_set_status(int reg1, int reg2)
  */
 int spi_flash_read(uint8_t *buf_usr, unsigned int offset, unsigned int bytes)
 {
-	int i, read_size, ret;
+	int i, read_size, ret, spi_addr;
 	uint8_t cmd[4];
 	if (offset + bytes > CONFIG_FLASH_SIZE)
 		return EC_ERROR_INVAL;
 	cmd[0] = SPI_FLASH_READ;
 	for (i = 0; i < bytes; i += read_size) {
-		offset += i;
-		cmd[1] = (offset >> 16) & 0xFF;
-		cmd[2] = (offset >> 8) & 0xFF;
-		cmd[3] = offset & 0xFF;
+		spi_addr = offset + i;
+		cmd[1] = (spi_addr >> 16) & 0xFF;
+		cmd[2] = (spi_addr >> 8) & 0xFF;
+		cmd[3] = spi_addr & 0xFF;
 		read_size = MIN((bytes - i), SPI_FLASH_MAX_READ_SIZE);
 		ret = spi_transaction(SPI_FLASH_DEVICE,
 			cmd,
@@ -275,7 +275,7 @@ int spi_flash_erase(unsigned int offset, unsigned int bytes)
  * @return EC_SUCCESS, or non-zero if any error.
  */
 int spi_flash_write(unsigned int offset, unsigned int bytes,
-	const uint8_t const *data)
+	const uint8_t *data)
 {
 	int rv, write_size;
 
@@ -435,7 +435,7 @@ int spi_flash_check_protect(unsigned int offset, unsigned int bytes)
 	int rv = EC_SUCCESS;
 
 	/* Invalid value */
-	if (sr1 == -1 || sr2 == -1 || offset + bytes > CONFIG_FLASH_SIZE)
+	if (sr1 == 0xff || sr2 == 0xff || offset + bytes > CONFIG_FLASH_SIZE)
 		return EC_ERROR_INVAL;
 
 	/* Compute current protect range */
@@ -466,7 +466,7 @@ int spi_flash_set_protect(unsigned int offset, unsigned int bytes)
 	uint8_t sr2 = spi_flash_get_status2();
 
 	/* Invalid values */
-	if (sr1 == -1 || sr2 == -1 || offset + bytes > CONFIG_FLASH_SIZE)
+	if (sr1 == 0xff || sr2 == 0xff || offset + bytes > CONFIG_FLASH_SIZE)
 		return EC_ERROR_INVAL;
 
 	/* Compute desired protect range */
@@ -507,7 +507,7 @@ DECLARE_CONSOLE_COMMAND(spi_flashinfo, command_spi_flashinfo,
 	"Print SPI flash info");
 
 #ifdef CONFIG_HOSTCMD_FLASH_SPI_INFO
-static int flash_command_spi_info(struct host_cmd_handler_args *args)
+static enum ec_status flash_command_spi_info(struct host_cmd_handler_args *args)
 {
 	struct ec_response_flash_spi_info *r = args->response;
 

@@ -48,20 +48,20 @@ static void nrf2ble_packet(struct ble_pdu *ble_p,
 		ble_p->header_type_adv = 1;
 		ble_p->header.adv.type = radio_p->s0 & 0xf;
 		ble_p->header.adv.txaddr = (radio_p->s0 &
-			(1 << BLE_ADV_HEADER_TXADD_SHIFT)) != 0;
+			BIT(BLE_ADV_HEADER_TXADD_SHIFT)) != 0;
 		ble_p->header.adv.rxaddr = (radio_p->s0 &
-			(1 << BLE_ADV_HEADER_RXADD_SHIFT)) != 0;
+			BIT(BLE_ADV_HEADER_RXADD_SHIFT)) != 0;
 		/* Length check? 6-37 Bytes */
 		ble_p->header.adv.length = radio_p->length;
 	} else {
 		ble_p->header_type_adv = 0;
 		ble_p->header.data.llid = radio_p->s0 & 0x3;
 		ble_p->header.data.nesn = (radio_p->s0 &
-			(1 << BLE_DATA_HEADER_NESN_SHIFT)) != 0;
+			BIT(BLE_DATA_HEADER_NESN_SHIFT)) != 0;
 		ble_p->header.data.sn = (radio_p->s0 &
-			(1 << BLE_DATA_HEADER_SN_SHIFT)) != 0;
+			BIT(BLE_DATA_HEADER_SN_SHIFT)) != 0;
 		ble_p->header.data.md = (radio_p->s0 &
-			(1 << BLE_DATA_HEADER_MD_SHIFT)) != 0;
+			BIT(BLE_DATA_HEADER_MD_SHIFT)) != 0;
 		/* Length check? 0-31 Bytes */
 		ble_p->header.data.length = radio_p->length;
 	}
@@ -170,8 +170,8 @@ int ble_rx(struct ble_pdu *pdu, int timeout, int adv)
 	 */
 	ppi_channel_requested = NRF51_PPI_CH_RADIO_ADDR__TIMER0CC1;
 	if (ppi_request_channel(&ppi_channel_requested) == EC_SUCCESS) {
-		NRF51_PPI_CHEN |= (1 << ppi_channel_requested);
-		NRF51_PPI_CHENSET |= (1 << ppi_channel_requested);
+		NRF51_PPI_CHEN |= BIT(ppi_channel_requested);
+		NRF51_PPI_CHENSET |= BIT(ppi_channel_requested);
 	}
 
 
@@ -213,14 +213,14 @@ int ble_rx(struct ble_pdu *pdu, int timeout, int adv)
 	return EC_SUCCESS;
 }
 
-/* White list handling */
-int ble_radio_clear_white_list(void)
+/* Allow list handling */
+int ble_radio_clear_allow_list(void)
 {
 	NRF51_RADIO_DACNF = 0;
 	return EC_SUCCESS;
 }
 
-int ble_radio_read_white_list_size(uint8_t *ret_size)
+int ble_radio_read_allow_list_size(uint8_t *ret_size)
 {
 	int i, size = 0;
 	uint32_t dacnf = NRF51_RADIO_DACNF;
@@ -235,7 +235,7 @@ int ble_radio_read_white_list_size(uint8_t *ret_size)
 	return EC_SUCCESS;
 }
 
-int ble_radio_add_device_to_white_list(const uint8_t *addr_ptr, uint8_t rand)
+int ble_radio_add_device_to_allow_list(const uint8_t *addr_ptr, uint8_t rand)
 {
 	uint32_t dacnf = NRF51_RADIO_DACNF;
 	int i;
@@ -262,7 +262,7 @@ int ble_radio_add_device_to_white_list(const uint8_t *addr_ptr, uint8_t rand)
 	return EC_SUCCESS;
 }
 
-int ble_radio_remove_device_from_white_list(const uint8_t *addr_ptr,
+int ble_radio_remove_device_from_allow_list(const uint8_t *addr_ptr,
 					    uint8_t rand)
 {
 	int i, dacnf = NRF51_RADIO_DACNF;
@@ -453,7 +453,7 @@ static int command_ble_adv(int argc, char **argv)
 	rv = ble_radio_init(BLE_ADV_ACCESS_ADDRESS, BLE_ADV_CRCINIT);
 
 
-		CPRINTS("ADV @%p", &adv_packet);
+		CPRINTS("ADV @%pP", &adv_packet);
 
 	((uint32_t *)&addr)[0] = 0xA3A2A1A0 | type;
 	((uint32_t *)&addr)[1] = BLE_RANDOM_ADDR_MSBS_STATIC << 8 | 0x5A4;
@@ -513,7 +513,7 @@ static int command_ble_adv_scan(int argc, char **argv)
 
 	CPRINTS("ADV Listen");
 	if (addr_lsbyte != -1)
-		CPRINTS("filtered (%x)\n", addr_lsbyte);
+		CPRINTS("filtered (%x)", addr_lsbyte);
 
 	for (i = 0; i < packets; i++) {
 		rv = ble_rx(&rcv_packet, 1000000, 1);
@@ -527,7 +527,7 @@ static int command_ble_adv_scan(int argc, char **argv)
 
 	rv = radio_disable();
 
-	CPRINTS("on_air payload rcvd %p", &rx_packet);
+	CPRINTS("on_air payload rcvd %pP", &rx_packet);
 
 	return rv;
 }

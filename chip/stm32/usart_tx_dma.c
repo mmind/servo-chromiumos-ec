@@ -1,4 +1,4 @@
-/* Copyright (c) 2015 The Chromium OS Authors. All rights reserved.
+/* Copyright 2015 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -17,21 +17,6 @@ void usart_tx_dma_written(struct consumer const *consumer, size_t count)
 		DOWNCAST(consumer, struct usart_config, consumer);
 
 	task_trigger_irq(config->hw->irq);
-}
-
-void usart_tx_dma_flush(struct consumer const *consumer)
-{
-	struct usart_config const *config =
-		DOWNCAST(consumer, struct usart_config, consumer);
-
-	/*
-	 * Enable the USART interrupt.  This causes the USART interrupt handler
-	 * to start fetching from the TX queue if it wasn't already.
-	 */
-	task_trigger_irq(config->hw->irq);
-
-	while (queue_count(consumer->queue))
-		;
 }
 
 void usart_tx_dma_init(struct usart_config const *config)
@@ -66,9 +51,9 @@ static void usart_tx_dma_start(struct usart_config const *config,
 	 * that would hold up any additional writes to the TX queue
 	 * unnecessarily.
 	 */
-	state->chunk.length = MIN(state->chunk.length, dma_config->max_bytes);
+	state->chunk.count = MIN(state->chunk.count, dma_config->max_bytes);
 
-	dma_prepare_tx(&options, state->chunk.length, state->chunk.buffer);
+	dma_prepare_tx(&options, state->chunk.count, state->chunk.buffer);
 
 	state->dma_active = 1;
 
@@ -105,11 +90,11 @@ void usart_tx_dma_interrupt(struct usart_config const *config)
 		 * units from the queue if we had an active DMA transfer.
 		 */
 		if (state->dma_active)
-			queue_advance_head(queue, state->chunk.length);
+			queue_advance_head(queue, state->chunk.count);
 
 		state->chunk = queue_get_read_chunk(queue);
 
-		if (state->chunk.length)
+		if (state->chunk.count)
 			usart_tx_dma_start(config, dma_config);
 		else
 			usart_tx_dma_stop(config, dma_config);

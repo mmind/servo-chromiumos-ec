@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -287,7 +287,7 @@ static int test_overwrite_current(void)
 	uint32_t offset, size;
 
 	/* Test that we cannot overwrite current image */
-	if (system_get_image_copy() == SYSTEM_IMAGE_RO) {
+	if (system_get_image_copy() == EC_IMAGE_RO) {
 		offset = CONFIG_RO_STORAGE_OFF;
 		size = CONFIG_RO_SIZE;
 	} else {
@@ -313,7 +313,7 @@ static int test_overwrite_other(void)
 	uint32_t offset, size;
 
 	/* Test that we can overwrite the other image */
-	if (system_get_image_copy() == SYSTEM_IMAGE_RW) {
+	if (system_is_in_rw()) {
 		offset = CONFIG_RO_STORAGE_OFF;
 		size = CONFIG_RO_SIZE;
 	} else {
@@ -348,9 +348,9 @@ static int test_op_failure(void)
 
 static int test_flash_info(void)
 {
-	struct ec_response_flash_info resp;
+	struct ec_response_flash_info_1 resp;
 
-	TEST_ASSERT(test_send_host_command(EC_CMD_FLASH_INFO, 0, NULL, 0,
+	TEST_ASSERT(test_send_host_command(EC_CMD_FLASH_INFO, 1, NULL, 0,
 		    &resp, sizeof(resp)) == EC_RES_SUCCESS);
 
 	TEST_CHECK((resp.flash_size == CONFIG_FLASH_SIZE) &&
@@ -363,12 +363,17 @@ static int test_region_info(void)
 {
 	VERIFY_REGION_INFO(EC_FLASH_REGION_RO,
 			   CONFIG_EC_PROTECTED_STORAGE_OFF +
-			   CONFIG_RO_STORAGE_OFF, CONFIG_RO_SIZE);
-	VERIFY_REGION_INFO(EC_FLASH_REGION_RW,
+			   CONFIG_RO_STORAGE_OFF, EC_FLASH_REGION_RO_SIZE);
+	VERIFY_REGION_INFO(EC_FLASH_REGION_ACTIVE,
 			   CONFIG_EC_WRITABLE_STORAGE_OFF +
-			   CONFIG_RW_STORAGE_OFF, CONFIG_RW_SIZE);
+			   CONFIG_RW_STORAGE_OFF,
+			   CONFIG_EC_WRITABLE_STORAGE_SIZE);
 	VERIFY_REGION_INFO(EC_FLASH_REGION_WP_RO,
 			   CONFIG_WP_STORAGE_OFF, CONFIG_WP_STORAGE_SIZE);
+	VERIFY_REGION_INFO(EC_FLASH_REGION_UPDATE,
+			   CONFIG_EC_WRITABLE_STORAGE_OFF +
+			   CONFIG_RW_STORAGE_OFF,
+			   CONFIG_EC_WRITABLE_STORAGE_SIZE);
 
 	return EC_SUCCESS;
 }
@@ -495,7 +500,7 @@ int task_test(void *data)
 	return EC_SUCCESS;
 }
 
-void run_test(void)
+void run_test(int argc, char **argv)
 {
 	msleep(30); /* Wait for TASK_ID_TEST to initialize */
 	task_wake(TASK_ID_TEST);

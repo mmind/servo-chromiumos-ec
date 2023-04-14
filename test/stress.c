@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -30,11 +30,8 @@ struct i2c_test_param_t {
 	int addr;
 	int offset;
 	int data; /* Non-negative represents data to write. -1 to read. */
-} i2c_test_params[] = {
-#if defined(BOARD_PIT)
-	{8, 0, 0x90, 0x19, -1},
-#endif
-};
+} i2c_test_params[];
+
 /* Disable I2C test for boards without test configuration */
 #if defined(BOARD_BDS) || defined(BOARD_AURON)
 #undef CONFIG_I2C
@@ -78,29 +75,29 @@ static int stress(const char *name,
 
 /*****************************************************************************/
 /* Tests */
-#ifdef CONFIG_I2C_MASTER
+#ifdef CONFIG_I2C_CONTROLLER
 static int test_i2c(void)
 {
 	int res = EC_ERROR_UNKNOWN;
-	int dummy_data;
+	int mock_data;
 	struct i2c_test_param_t *param;
 	param = i2c_test_params + (prng_no_seed() % (sizeof(i2c_test_params) /
 				   sizeof(struct i2c_test_param_t)));
 	if (param->width == 8 && param->data == -1)
 		res = i2c_read8(param->port, param->addr,
-				param->offset, &dummy_data);
+				param->offset, &mock_data);
 	else if (param->width == 8 && param->data >= 0)
 		res = i2c_write8(param->port, param->addr,
 				 param->offset, param->data);
 	else if (param->width == 16 && param->data == -1)
 		res = i2c_read16(param->port, param->addr,
-				 param->offset, &dummy_data);
+				 param->offset, &mock_data);
 	else if (param->width == 16 && param->data >= 0)
 		res = i2c_write16(param->port, param->addr,
 				  param->offset, param->data);
 	else if (param->width == 32 && param->data == -1)
 		res = i2c_read32(param->port, param->addr,
-				 param->offset, &dummy_data);
+				 param->offset, &mock_data);
 	else if (param->width == 32 && param->data >= 0)
 		res = i2c_write32(param->port, param->addr,
 				  param->offset, param->data);
@@ -131,11 +128,11 @@ static int test_adc(void)
 }
 #endif
 
-void run_test(void)
+void run_test(int argc, char **argv)
 {
 	test_reset();
 
-#ifdef CONFIG_I2C_MASTER
+#ifdef CONFIG_I2C_CONTROLLER
 	RUN_STRESS_TEST("I2C Stress Test", test_i2c, I2C_TEST_ITERATION);
 #endif
 #ifdef CONFIG_ADC

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -59,13 +59,23 @@ stm32_dma_chan_t *dma_get_channel(enum dma_channel channel)
 	return &dma->chan[channel % STM32_DMAC_PER_CTLR];
 }
 
-#ifdef STM32_DMA_CSELR
+#ifdef STM32_DMAMUX_CxCR
+void dma_select_channel(enum dma_channel channel, uint8_t req)
+{
+	/*
+	 * STM32G4 includes a DMAMUX block which is used to handle dma requests
+	 * by peripherals. The correct 'req' number for a given peripheral is
+	 * given in ST doc RM0440.
+	 */
+	STM32_DMAMUX_CxCR(channel) = req;
+}
+#elif defined(STM32_DMA_CSELR)
 void dma_select_channel(enum dma_channel channel, unsigned char stream)
 {
 	/* Local channel # starting from 0 on each DMA controller */
 	const unsigned char ch = channel % STM32_DMAC_PER_CTLR;
 	const unsigned char shift = STM32_DMA_PERIPHERALS_PER_CHANNEL;
-	const unsigned char mask = (1 << shift) - 1;
+	const unsigned char mask = BIT(shift) - 1;
 	uint32_t val;
 
 	ASSERT(ch < STM32_DMAC_PER_CTLR);
@@ -73,21 +83,7 @@ void dma_select_channel(enum dma_channel channel, unsigned char stream)
 	val = STM32_DMA_CSELR(channel) & ~(mask << ch * shift);
 	STM32_DMA_CSELR(channel) = val | (stream << ch * shift);
 }
-#elif defined(CHIP_FAMILY_STM32F4)
-void dma_select_channel(enum dma_channel channel, unsigned char stream)
-{
-	stm32_dma_chan_t *chan = dma_get_channel(channel);
-	uint32_t val;
-
-	ASSERT(channel < STM32_DMAC_COUNT);
-	ASSERT(stream < STM32_DMA_MAX_STREAMS);
-
-	/* Set stream input for channel */
-	val = chan->ccr &
-		~(STM32_DMA_CCR_CHMASK << STM32_DMA_CCR_CHOFF);
-	chan->ccr = val | (stream << STM32_DMA_CCR_CHOFF);
-}
-#endif
+#endif /* STM32_DMAMUX_CxCR/STM32_DMA_CSELR */
 
 void dma_disable(enum dma_channel channel)
 {
@@ -118,13 +114,14 @@ void dma_disable_all(void)
  *				STM32_DMA_CCR_MINC | STM32_DMA_CCR_DIR for tx
  *				0 for rx
  */
-static void prepare_channel(stm32_dma_chan_t *chan, unsigned count,
+static void prepare_channel(enum dma_channel channel, unsigned count,
 		void *periph, void *memory, unsigned flags)
 {
+	stm32_dma_chan_t *chan = dma_get_channel(channel);
 	uint32_t ccr = STM32_DMA_CCR_PL_VERY_HIGH;
 
-	if (chan->ccr & STM32_DMA_CCR_EN)
-		chan->ccr &= ~STM32_DMA_CCR_EN;
+	dma_disable(channel);
+	dma_clear_isr(channel);
 
 	/* Following the order in Doc ID 15965 Rev 5 p194 */
 	chan->cpar = (uint32_t)periph;
@@ -137,7 +134,7 @@ static void prepare_channel(stm32_dma_chan_t *chan, unsigned count,
 
 void dma_go(stm32_dma_chan_t *chan)
 {
-	/* Flush data in write buffer so that DMA can get the lastest data */
+	/* Flush data in write buffer so that DMA can get the latest data */
 	asm volatile("dsb;");
 
 	/* Fire it up */
@@ -147,13 +144,11 @@ void dma_go(stm32_dma_chan_t *chan)
 void dma_prepare_tx(const struct dma_option *option, unsigned count,
 		    const void *memory)
 {
-	stm32_dma_chan_t *chan = dma_get_channel(option->channel);
-
 	/*
 	 * Cast away const for memory pointer; this is ok because we know
 	 * we're preparing the channel for transmit.
 	 */
-	prepare_channel(chan, count, option->periph, (void *)memory,
+	prepare_channel(option->channel, count, option->periph, (void *)memory,
 			STM32_DMA_CCR_MINC | STM32_DMA_CCR_DIR |
 			option->flags);
 }
@@ -162,17 +157,19 @@ void dma_start_rx(const struct dma_option *option, unsigned count,
 		  void *memory)
 {
 	stm32_dma_chan_t *chan = dma_get_channel(option->channel);
-
-	prepare_channel(chan, count, option->periph, memory,
+	prepare_channel(option->channel, count, option->periph, memory,
 			STM32_DMA_CCR_MINC | option->flags);
 	dma_go(chan);
 }
 
 int dma_bytes_done(stm32_dma_chan_t *chan, int orig_count)
 {
-	if (!(chan->ccr & STM32_DMA_CCR_EN))
-		return 0;
 	return orig_count - chan->cndtr;
+}
+
+bool dma_is_enabled(stm32_dma_chan_t *chan)
+{
+	return (chan->ccr & STM32_DMA_CCR_EN);
 }
 
 #ifdef CONFIG_DMA_HELP
@@ -244,8 +241,11 @@ void dma_test(enum dma_channel channel)
 
 void dma_init(void)
 {
-#if defined(CHIP_FAMILY_STM32L4) || defined(CHIP_FAMILY_STM32F4)
+#if defined(CHIP_FAMILY_STM32L4)
 	STM32_RCC_AHB1ENR |= STM32_RCC_AHB1ENR_DMA1EN|STM32_RCC_AHB1ENR_DMA2EN;
+#elif defined(CHIP_FAMILY_STM32G4)
+	STM32_RCC_AHB1ENR |= STM32_RCC_AHB1ENR_DMA1EN|STM32_RCC_AHB1ENR_DMA2EN |
+		STM32_RCC_AHB1ENR_DMAMUXEN;
 #else
 	STM32_RCC_AHBENR |= STM32_RCC_HB_DMA1;
 #endif
@@ -258,19 +258,6 @@ void dma_init(void)
 
 int dma_wait(enum dma_channel channel)
 {
-#if defined(CHIP_FAMILY_STM32F4)
-	timestamp_t deadline;
-
-	deadline.val = get_time().val + DMA_TRANSFER_TIMEOUT_US;
-
-	/* Wait for TCIF completion */
-	while ((STM32_DMA_GET_ISR(channel) & STM32_DMA_TCIF) == 0) {
-		if (deadline.val <= get_time().val)
-			return EC_ERROR_TIMEOUT;
-
-		udelay(DMA_POLLING_INTERVAL_US);
-	}
-#else
 	stm32_dma_regs_t *dma = STM32_DMA_REGS(channel);
 	const uint32_t mask = STM32_DMA_ISR_TCIF(channel);
 	timestamp_t deadline;
@@ -282,7 +269,6 @@ int dma_wait(enum dma_channel channel)
 
 		udelay(DMA_POLLING_INTERVAL_US);
 	}
-#endif
 	return EC_SUCCESS;
 }
 
@@ -290,7 +276,7 @@ static inline void _dma_wake_callback(void *cb_data)
 {
 	task_id_t id = (task_id_t)(int)cb_data;
 	if (id != TASK_ID_INVALID)
-		task_set_event(id, TASK_EVENT_DMA_TC, 0);
+		task_set_event(id, TASK_EVENT_DMA_TC);
 }
 
 void dma_enable_tc_interrupt(enum dma_channel channel)
@@ -325,13 +311,9 @@ void dma_disable_tc_interrupt(enum dma_channel channel)
 
 void dma_clear_isr(enum dma_channel channel)
 {
-#if defined(CHIP_FAMILY_STM32F4)
-	STM32_DMA_SET_IFCR(channel, STM32_DMA_ALL);
-#else
 	stm32_dma_regs_t *dma = STM32_DMA_REGS(channel);
 
 	dma->ifcr |= STM32_DMA_ISR_ALL(channel);
-#endif
 }
 
 #ifdef CONFIG_DMA_DEFAULT_HANDLERS
@@ -364,8 +346,9 @@ DECLARE_IRQ(STM32_IRQ_DMA_CHANNEL_2_3, dma_event_interrupt_channel_2_3, 1);
 void dma_event_interrupt_channel_4_7(void)
 {
 	int i;
+	const unsigned int max_chan = MIN(STM32_DMAC_CH7, STM32_DMAC_COUNT);
 
-	for (i = STM32_DMAC_CH4; i <= STM32_DMAC_CH7; i++) {
+	for (i = STM32_DMAC_CH4; i <= max_chan; i++) {
 		if (STM32_DMA1_REGS->isr & STM32_DMA_ISR_TCIF(i)) {
 			dma_clear_isr(i);
 			if (dma_irq[i].cb != NULL)

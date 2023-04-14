@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+/* Copyright 2014 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -8,6 +8,28 @@
 
 /* CPU core BFD configuration */
 #include "core/cortex-m/config_core.h"
+
+/*
+ * Set the chip family version to 4 digits to keep the flexibility in case
+ * we need the minor version for chip variants in a family.
+ */
+#define NPCX_FAMILY_NPCX5        5000
+#define NPCX_FAMILY_NPCX7        7000
+#define NPCX_FAMILY_NPCX9        9000
+
+/* Features depend on chip family */
+#if defined(CHIP_FAMILY_NPCX5)
+#include "config_chip-npcx5.h"
+#define NPCX_FAMILY_VERSION      NPCX_FAMILY_NPCX5
+#elif defined(CHIP_FAMILY_NPCX7)
+#include "config_chip-npcx7.h"
+#define NPCX_FAMILY_VERSION      NPCX_FAMILY_NPCX7
+#elif defined(CHIP_FAMILY_NPCX9)
+#include "config_chip-npcx9.h"
+#define NPCX_FAMILY_VERSION      NPCX_FAMILY_NPCX9
+#else
+#error "Unsupported chip family"
+#endif
 
 /* 32k hz internal oscillator frequency (FRCLK) */
 #define INT_32K_CLOCK 32768
@@ -26,76 +48,40 @@
 #define HOOK_TICK_INTERVAL_MS 200
 #define HOOK_TICK_INTERVAL    (HOOK_TICK_INTERVAL_MS * MSEC)
 
-/*
- * Number of I2C controllers. Controller 0 has 2 ports, so the chip has one
- * additional port.
- */
-#define CONFIG_I2C_MULTI_PORT_CONTROLLER
-/* Number of I2C controllers */
-#define I2C_CONTROLLER_COUNT	4
-/* Number of I2C ports */
-#define I2C_PORT_COUNT		5
-
-
-/* Number of PWM ports */
-#define PWM_COUNT 8
-
-/*****************************************************************************/
-/* Memory mapping */
-#define CONFIG_RAM_BASE            0x200C0000 /* memory address of data ram */
-#define CONFIG_RAM_SIZE            (0x00008000 - 0x800) /* 30KB data ram */
-#define CONFIG_LPRAM_BASE          0x40001600 /* memory address of lpwr ram */
-#define CONFIG_LPRAM_SIZE	   0x00000620 /* 1568B low power ram */
-
-/* Use chip variant to specify the size and start address of program memory */
-#if defined(CHIP_VARIANT_NPCX5M5G)
-/* 96KB RAM for FW code */
-#define NPCX_PROGRAM_MEMORY_SIZE (96 * 1024)
-/* program memory base address for 128KB RAM */
-#define CONFIG_PROGRAM_MEMORY_BASE 0x100A8000
-#elif defined(CHIP_VARIANT_NPCX5M6G)
-/* 224KB RAM for FW code */
-#define NPCX_PROGRAM_MEMORY_SIZE (224 * 1024)
-/* program memory base address for 256KB RAM */
-#define CONFIG_PROGRAM_MEMORY_BASE 0x10088000
-#else
-#error "Unsupported chip variant"
-#endif
-
 /* System stack size */
 #define CONFIG_STACK_SIZE       1024
 
 /* non-standard task stack sizes */
-#define IDLE_TASK_STACK_SIZE		512
-#define LARGER_TASK_STACK_SIZE		640
-#define VENTI_TASK_STACK_SIZE		768
+#define IDLE_TASK_STACK_SIZE		672
+#define LARGER_TASK_STACK_SIZE		800
+#define VENTI_TASK_STACK_SIZE		928
+#define ULTRA_TASK_STACK_SIZE		1056
+#define TRENTA_TASK_STACK_SIZE		1184
 
-#define CHARGER_TASK_STACK_SIZE		640
-#define HOOKS_TASK_STACK_SIZE		640
-#define CONSOLE_TASK_STACK_SIZE		640
+#define CHARGER_TASK_STACK_SIZE		800
+#define HOOKS_TASK_STACK_SIZE		800
+#define CONSOLE_TASK_STACK_SIZE		800
 
 /* Default task stack size */
-#define TASK_STACK_SIZE			512
+#define TASK_STACK_SIZE			672
 
 /* Address of RAM log used by Booter */
 #define ADDR_BOOT_RAMLOG        0x100C7FC0
-
-/* SPI Flash Spec of W25Q20CV */
-#define CONFIG_FLASH_BANK_SIZE	0x00001000  /* protect bank size 4K bytes */
-#define CONFIG_FLASH_ERASE_SIZE	0x00001000  /* sector erase size 4K bytes */
-#define CONFIG_FLASH_WRITE_SIZE	0x00000001  /* minimum write size */
-
-#define CONFIG_FLASH_WRITE_IDEAL_SIZE 256   /* one page size for write */
 
 #include "config_flash_layout.h"
 
 /* Optional features present on this chip */
 #define CONFIG_ADC
-#define CONFIG_PECI
+#define CONFIG_RTC
 #define CONFIG_SWITCH
 #define CONFIG_MPU
 
-#define GPIO_PIN(port, index) GPIO_##port, (1 << index)
-#define GPIO_PIN_MASK(port, mask) GPIO_##port, (mask)
+/* Chip needs to do custom pre-init */
+#define CONFIG_CHIP_PRE_INIT
+/* Default use UART1 as console */
+#define CONFIG_CONSOLE_UART    0
+
+#define GPIO_PIN(port, index) GPIO_##port, BIT(index)
+#define GPIO_PIN_MASK(p, m) .port = GPIO_##p, .mask = (m)
 
 #endif  /* __CROS_EC_CONFIG_CHIP_H */

@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+/* Copyright 2012 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -314,23 +314,23 @@ int flash_physical_get_protect(int block)
 		return 1;
 
 	/* Check the active write protect status */
-	return STM32_FLASH_WRPR & (1 << block);
+	return STM32_FLASH_WRPR & BIT(block);
 }
 
-int flash_physical_protect_at_boot(enum flash_wp_range range)
+int flash_physical_protect_at_boot(uint32_t new_flags)
 {
 	uint32_t prot;
-	uint32_t mask = ((1 << WP_BANK_COUNT) - 1) << WP_BANK_OFFSET;
+	uint32_t mask = (BIT(WP_BANK_COUNT) - 1) << WP_BANK_OFFSET;
 	int rv;
 
-	if (range == FLASH_WP_ALL)
+	if (new_flags & EC_FLASH_PROTECT_ALL_AT_BOOT)
 		return EC_ERROR_UNIMPLEMENTED;
 
 	/* Read the current protection status */
 	prot = read_optb_wrp();
 
 	/* Set/clear bits */
-	if (range == FLASH_WP_RO)
+	if (new_flags & EC_FLASH_PROTECT_RO_AT_BOOT)
 		prot |= mask;
 	else
 		prot &= ~mask;
@@ -436,7 +436,7 @@ int flash_pre_init(void)
 	 * If we have already jumped between images, an earlier image could
 	 * have applied write protection. Nothing additional needs to be done.
 	 */
-	if (reset_flags & RESET_FLAG_SYSJUMP)
+	if (reset_flags & EC_RESET_FLAG_SYSJUMP)
 		return EC_SUCCESS;
 
 	if (prot_flags & EC_FLASH_PROTECT_GPIO_ASSERTED) {
@@ -448,7 +448,7 @@ int flash_pre_init(void)
 			 * update to the write protect register and reboot so
 			 * it takes effect.
 			 */
-			flash_protect_at_boot(FLASH_WP_RO);
+			flash_protect_at_boot(EC_FLASH_PROTECT_RO_AT_BOOT);
 			need_reset = 1;
 		}
 
@@ -457,9 +457,8 @@ int flash_pre_init(void)
 			 * Write protect register was in an inconsistent state.
 			 * Set it back to a good state and reboot.
 			 */
-			flash_protect_at_boot(
-				(prot_flags & EC_FLASH_PROTECT_RO_AT_BOOT) ?
-				FLASH_WP_RO : FLASH_WP_NONE);
+			flash_protect_at_boot(prot_flags &
+					EC_FLASH_PROTECT_RO_AT_BOOT);
 			need_reset = 1;
 		}
 	} else if (prot_flags & (EC_FLASH_PROTECT_RO_NOW |

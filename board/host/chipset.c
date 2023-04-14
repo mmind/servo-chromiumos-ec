@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 The Chromium OS Authors. All rights reserved.
+/* Copyright 2013 The Chromium OS Authors. All rights reserved.
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -16,9 +16,9 @@ static int chipset_state = CHIPSET_STATE_SOFT_OFF;
 static int power_on_req;
 static int power_off_req;
 
-test_mockable void chipset_reset(int cold_reset)
+test_mockable void chipset_reset(enum chipset_reset_reason reason)
 {
-	fprintf(stderr, "Chipset reset!\n");
+	fprintf(stderr, "Chipset reset: %d!\n", reason);
 }
 
 test_mockable void chipset_throttle_cpu(int throttle)
@@ -26,12 +26,17 @@ test_mockable void chipset_throttle_cpu(int throttle)
 	/* Do nothing */
 }
 
-test_mockable void chipset_force_shutdown(void)
+test_mockable void chipset_force_shutdown(enum chipset_shutdown_reason reason)
 {
 	/* Do nothing */
 }
 
 test_mockable int chipset_in_state(int state_mask)
+{
+	return state_mask & chipset_state;
+}
+
+test_mockable int chipset_in_or_transitioning_to_state(int state_mask)
 {
 	return state_mask & chipset_state;
 }
@@ -66,5 +71,6 @@ test_mockable void chipset_task(void)
 		power_off_req = 0;
 		chipset_state = CHIPSET_STATE_SOFT_OFF;
 		hook_notify(HOOK_CHIPSET_SHUTDOWN);
+		hook_notify(HOOK_CHIPSET_SHUTDOWN_COMPLETE);
 	}
 }

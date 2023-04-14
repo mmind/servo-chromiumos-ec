@@ -5,7 +5,9 @@
 #ifndef __EC_INCLUDE_TRNG_H
 #define __EC_INCLUDE_TRNG_H
 
+#include <common.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /**
  * Initialize the true random number generator.
@@ -15,11 +17,23 @@
 void init_trng(void);
 
 /**
+ * Shutdown the true random number generator.
+ *
+ * The opposite operation of init_trng(), disable the hardware resources
+ * used by the TRNG to save power.
+ *
+ * Not supported by all platforms.
+ **/
+void exit_trng(void);
+
+/**
  * Retrieve a 32 bit random value.
  *
  * Not supported on all platforms.
  **/
+#ifndef HIDE_EC_STDLIB
 uint32_t rand(void);
+#endif
 
 /**
  * Output len random bytes into buffer.
