@@ -1,0 +1,12 @@
+diff --git a/util/ec3po/__init__.py b/util/ec3po/__init__.py
+index 9bebfa5842..1e1f240cae 100644
+--- a/util/ec3po/__init__.py
++++ b/util/ec3po/__init__.py
+@@ -21,5 +21,5 @@ stopgap until all commands are communicated via host commands.
+ """
+ 
+ import console
+-import interpreter
+-import threadproc_shim
++from . import interpreter
++from . import threadproc_shim
