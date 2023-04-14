@@ -2,13 +2,13 @@ Source: chromiumos-ec
 Section: python
 Priority: optional
 Maintainer: Heiko Stuebner <mmind@debian.org>
-Build-Depends: debhelper (>=9), dh-python, python-all, python-setuptools
+Build-Depends: debhelper (>=9), dh-python, python3-all, python3-setuptools, python3-usb
 Standards-Version: 3.9.8
 Homepage: https://chromium.googlesource.com/chromiumos/platform/ec
 
-Package: python-ec3po
+Package: python3-ec3po
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${python3:Depends}, ${misc:Depends}, python3-usb
 Description: The ChromeOS EC console interpreter
  EC-3PO is a console interpreter which migrates the rich debug console from the
  EC itself to the host. This allows for a rich debug console without impacting
